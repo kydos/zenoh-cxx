@@ -1,0 +1,106 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "clang",
+      "displayName": "macOS clang (dev, ASan+UBSan)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ZENOH_SANITIZE": "ON",
+        "CMAKE_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
+        "CMAKE_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_CXX_COMPILER_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
+        "CMAKE_CXX_COMPILER_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib"
+      }
+    },
+    {
+      "name": "clang-release",
+      "displayName": "macOS clang release (native tuning + ThinLTO, fastest)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang-release",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "Release",
+        "ZENOH_NATIVE": "ON",
+        "CMAKE_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
+        "CMAKE_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_CXX_COMPILER_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
+        "CMAKE_CXX_COMPILER_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib"
+      }
+    },
+    {
+      "name": "gcc",
+      "displayName": "macOS gcc-15 (note: blocked by macOS SDK libstdc++ bug)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/gcc",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++-15",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "linux-clang",
+      "displayName": "Linux clang + libstdc++ (Docker, primary, ASan+UBSan)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-clang",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ZENOH_SANITIZE": "ON"
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "displayName": "Linux g++ (Docker) - BLOCKED: gcc module + libstdc++ bug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-gcc",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "linux-clang-release",
+      "displayName": "Linux clang + libstdc++ release (CI primary, Linux-optimized)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-clang-release",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "Release",
+        "ZENOH_NATIVE": "ON"
+      }
+    },
+    {
+      "name": "linux-fuzz",
+      "displayName": "Linux clang libFuzzer (decode fuzzing)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-fuzz",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ZENOH_FUZZ": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "clang", "configurePreset": "clang" },
+    { "name": "clang-release", "configurePreset": "clang-release" },
+    { "name": "gcc", "configurePreset": "gcc" },
+    { "name": "linux-clang", "configurePreset": "linux-clang" },
+    { "name": "linux-gcc", "configurePreset": "linux-gcc" },
+    { "name": "linux-clang-release", "configurePreset": "linux-clang-release" },
+    { "name": "linux-fuzz", "configurePreset": "linux-fuzz" }
+  ],
+  "testPresets": [
+    { "name": "clang", "configurePreset": "clang", "output": { "outputOnFailure": true } },
+    { "name": "clang-release", "configurePreset": "clang-release", "output": { "outputOnFailure": true } },
+    { "name": "gcc", "configurePreset": "gcc", "output": { "outputOnFailure": true } },
+    { "name": "linux-clang", "configurePreset": "linux-clang", "output": { "outputOnFailure": true } },
+    { "name": "linux-clang-release", "configurePreset": "linux-clang-release", "output": { "outputOnFailure": true } },
+    { "name": "linux-gcc", "configurePreset": "linux-gcc", "output": { "outputOnFailure": true } }
+  ]
+}

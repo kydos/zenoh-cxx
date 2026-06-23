@@ -1,0 +1,25 @@
+# Convenience wrapper for the Linux CI image.
+#
+#   docker compose run --rm ci                 # linux-clang + linux-gcc
+#   docker compose run --rm ci scripts/ci.sh linux-clang
+#   docker compose run --rm dev                # interactive shell in the toolchain
+services:
+  ci:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: zenoh-linux-ci
+    volumes:
+      - .:/work
+    working_dir: /work
+    command: scripts/ci.sh
+
+  dev:
+    image: zenoh-linux-ci
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    volumes:
+      - .:/work
+    working_dir: /work
+    command: bash

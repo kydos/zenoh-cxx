@@ -39,3 +39,11 @@
 
 # debug information files
 *.dwo
+build/
+
+# Rust vector-gen tool
+tools/vector-gen/target/
+tools/vector-gen/Cargo.lock
+
+# JetBrains IDE
+.idea/

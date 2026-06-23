@@ -1,0 +1,64 @@
+module;
+
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <span>
+#include <string_view>
+
+export module zenoh.runtime.tcp;
+
+// A thin, blocking-or-non-blocking POSIX TCP link (Linux/macOS). This is the I/O
+// seam of the vertically-integrated runtime (PLAN.md D8): the session owns one of
+// these and drives encode->send / recv->decode directly. POSIX headers stay in the
+// implementation unit (tcp.cpp) — none leak through this interface.
+export namespace zenoh {
+
+/// Low-level transport I/O outcome.
+enum class IoError : std::uint8_t {
+    would_block, ///< Non-blocking op cannot proceed right now (EAGAIN/EWOULDBLOCK).
+    closed,      ///< Peer closed the connection (EOF) or pipe broken.
+    failed,      ///< A syscall failed (connect/resolve/socket error).
+};
+
+/// Owning RAII handle for a connected TCP socket. Move-only.
+class TcpLink {
+public:
+    TcpLink() noexcept = default;
+    TcpLink(const TcpLink&) = delete;
+    auto operator=(const TcpLink&) -> TcpLink& = delete;
+    TcpLink(TcpLink&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+    auto operator=(TcpLink&& other) noexcept -> TcpLink&;
+    ~TcpLink();
+
+    /// Resolve `host` and connect to `host:port` (blocking). TCP_NODELAY is set.
+    [[nodiscard]] static auto connect(std::string_view host, std::uint16_t port) noexcept
+        -> std::expected<TcpLink, IoError>;
+
+    /// Switch the socket to non-blocking mode (used after the handshake).
+    [[nodiscard]] auto set_nonblocking() noexcept -> std::expected<void, IoError>;
+
+    /// Write all of `data`, blocking as needed (polls POLLOUT on EAGAIN). Suitable
+    /// for the handshake and for the blocking `put`.
+    [[nodiscard]] auto write_all(std::span<const std::byte> data) noexcept
+        -> std::expected<void, IoError>;
+
+    /// Write as much of `data` as the socket accepts right now without blocking;
+    /// returns the number of bytes written (may be 0..data.size()). Returns
+    /// `would_block` only when nothing at all can be written. For the non-blocking
+    /// `try_put` flush path.
+    [[nodiscard]] auto write_some(std::span<const std::byte> data) noexcept
+        -> std::expected<std::size_t, IoError>;
+
+    /// Read exactly `out.size()` bytes, blocking as needed (polls POLLIN on EAGAIN).
+    [[nodiscard]] auto read_exact(std::span<std::byte> out) noexcept
+        -> std::expected<void, IoError>;
+
+    [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
+
+private:
+    explicit TcpLink(int fd) noexcept : fd_(fd) {}
+    int fd_ = -1;
+};
+
+} // namespace zenoh

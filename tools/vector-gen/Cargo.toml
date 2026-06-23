@@ -1,0 +1,17 @@
+[package]
+name = "vector-gen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Generates golden wire vectors from the authoritative zenoh-rust implementation
+# (commons/zenoh-protocol + zenoh-codec), emitted as a C++ header consumed by the
+# differential tests. The `test` feature exposes the `rand()` constructors.
+[dependencies]
+zenoh-protocol = { path = "../../../zenoh-rust/commons/zenoh-protocol", features = ["test"] }
+zenoh-codec = { path = "../../../zenoh-rust/commons/zenoh-codec" }
+zenoh-buffers = { path = "../../../zenoh-rust/commons/zenoh-buffers" }
+
+[[bin]]
+name = "vector-gen"
+path = "src/main.rs"

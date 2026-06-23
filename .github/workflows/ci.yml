@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux build & test (clang + gcc, Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds the toolchain image and runs configure/build/ctest for both the
+      # linux-clang (libc++, ASan+UBSan) and linux-gcc presets. Same path as local
+      # `scripts/docker-ci.sh`, so CI and dev are identical.
+      - name: Build and test in Docker
+        run: scripts/docker-ci.sh
