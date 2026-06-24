@@ -18,8 +18,7 @@ using namespace zenoh;
 
 namespace {
 
-template <class T>
-auto roundtrip(const T& value) -> void {
+template <class T> auto roundtrip(const T& value) -> void {
     std::array<std::byte, 512> buf{};
     ByteWriter w{buf};
     CHECK(value.encode(w).has_value());
@@ -34,12 +33,11 @@ auto roundtrip(const T& value) -> void {
 }
 
 auto we(std::string_view suffix, bool sender) -> WireExpr {
-    return WireExpr{.scope = 0, .mapping = sender ? Mapping::sender : Mapping::receiver,
-                    .suffix = suffix};
+    return WireExpr{
+        .scope = 0, .mapping = sender ? Mapping::sender : Mapping::receiver, .suffix = suffix};
 }
 
-template <class Body>
-auto declare_with(Body b) -> Declare {
+template <class Body> auto declare_with(Body b) -> Declare {
     Declare d{};
     d.body.body = b;
     return d;
@@ -52,9 +50,10 @@ TEST("Declare bodies round-trip via the Declare wrapper") {
     roundtrip(declare_with(UndeclareKeyExpr{.id = 5}));
     roundtrip(declare_with(DeclareSubscriber{.id = 10, .wire_expr = we("a/b", false)}));
     roundtrip(declare_with(UndeclareSubscriber{.id = 10, .wire_expr = we("x", true)}));
-    roundtrip(declare_with(
-        DeclareQueryable{.id = 7, .wire_expr = we("q", false),
-                         .qinfo = QueryableInfo{.complete = true, .distance = 5}}));
+    roundtrip(
+        declare_with(DeclareQueryable{.id = 7,
+                                      .wire_expr = we("q", false),
+                                      .qinfo = QueryableInfo{.complete = true, .distance = 5}}));
     roundtrip(declare_with(UndeclareQueryable{.id = 7, .wire_expr = std::nullopt}));
     roundtrip(declare_with(DeclareToken{.id = 3, .wire_expr = we("t", true)}));
     roundtrip(declare_with(UndeclareToken{.id = 3, .wire_expr = we("t", false)}));

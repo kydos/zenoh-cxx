@@ -13,8 +13,8 @@ import zenoh.proto.exts;
 import zenoh.buffer;
 import zenoh.util;
 
-#include "ztest.hpp"
 #include "diff_vectors.hpp"
+#include "ztest.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -34,8 +34,7 @@ auto dump(const char* label, std::span<const std::byte> s) -> void {
 }
 
 // Decode `g` as T and assert it re-encodes byte-identically (and consumed it all).
-template <class T>
-auto check(std::string_view name, std::span<const std::byte> g) -> bool {
+template <class T> auto check(std::string_view name, std::span<const std::byte> g) -> bool {
     ByteReader r{g};
     auto decoded = T::decode(r);
     if (!decoded) {

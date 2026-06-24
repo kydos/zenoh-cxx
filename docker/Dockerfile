@@ -29,6 +29,7 @@ RUN wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
     && /tmp/llvm.sh ${LLVM_VERSION} \
     && apt-get update && apt-get install -y --no-install-recommends \
         clang-${LLVM_VERSION} clang-tools-${LLVM_VERSION} llvm-${LLVM_VERSION} \
+        clang-format-${LLVM_VERSION} clang-tidy-${LLVM_VERSION} \
         libc++-${LLVM_VERSION}-dev libc++abi-${LLVM_VERSION}-dev \
     && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
 
@@ -37,6 +38,8 @@ RUN update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-${LLVM
     && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${LLVM_VERSION} 100 \
     && update-alternatives --install /usr/bin/llvm-cov      llvm-cov      /usr/bin/llvm-cov-${LLVM_VERSION}      100 \
     && update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-${LLVM_VERSION} 100 \
+    && update-alternatives --install /usr/bin/clang-format  clang-format  /usr/bin/clang-format-${LLVM_VERSION}  100 \
+    && update-alternatives --install /usr/bin/clang-tidy    clang-tidy    /usr/bin/clang-tidy-${LLVM_VERSION}    100 \
     && update-alternatives --install /usr/bin/gcc    gcc     /usr/bin/gcc-14                  100 \
     && update-alternatives --install /usr/bin/g++    g++     /usr/bin/g++-14                  100
 

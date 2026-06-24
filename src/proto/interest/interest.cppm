@@ -31,11 +31,13 @@ struct InterestInner {
     static constexpr std::uint8_t flag_m = 0x40;          ///< wire_expr mapping
 
     auto operator==(const InterestInner& o) const noexcept -> bool {
-        return (options & opt_mask) == (o.options & opt_mask) && wire_expr_eq(wire_expr, o.wire_expr);
+        return (options & opt_mask) == (o.options & opt_mask) &&
+               wire_expr_eq(wire_expr, o.wire_expr);
     }
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<InterestInner, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<InterestInner, CodecError>;
 };
 
 /// `Interest` (0x19, MODE != 0): subscribe to declarations. Wire:
@@ -69,7 +71,8 @@ struct InterestFinal {
     auto operator==(const InterestFinal&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<InterestFinal, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<InterestFinal, CodecError>;
 };
 
 } // namespace zenoh

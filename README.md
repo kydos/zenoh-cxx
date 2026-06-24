@@ -1,5 +1,11 @@
 # zenoh
 
+[![CI](https://github.com/kydos/zenoh/actions/workflows/ci.yml/badge.svg)](https://github.com/kydos/zenoh/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/kydos/zenoh/branch/main/graph/badge.svg)](https://codecov.io/gh/kydos/zenoh)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
+[![code style: clang-format](https://img.shields.io/badge/code%20style-clang--format-blue.svg)](.clang-format)
+
 The specification and a modern C++23 implementation of the Zenoh protocol.
 
 ## Prerequisites
@@ -78,6 +84,23 @@ wipe a stale cache (e.g. when a flag was removed from a preset), reconfigure fre
 ```sh
 cmake --preset <preset> --fresh
 ```
+
+## Formatting & linting
+
+Style is enforced with **clang-format** (`.clang-format`) and **clang-tidy**
+(`.clang-tidy`); CI runs both. Locally:
+
+```sh
+scripts/format.sh          # check formatting (CI mode)
+scripts/format.sh --fix    # reformat in place
+
+# clang-tidy needs a built tree for its compile database (and the module BMIs):
+cmake --preset clang && cmake --build build/clang
+scripts/tidy.sh build/clang
+```
+
+The generated `tests/diff_vectors.hpp` is excluded from formatting
+(`.clang-format-ignore`).
 
 ## Examples
 

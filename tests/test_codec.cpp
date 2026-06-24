@@ -20,8 +20,7 @@ using namespace zenoh;
 namespace {
 
 // Encode via `fn` into an owned buffer, returning the written bytes.
-template <class Fn>
-auto encode_into(Fn&& fn, std::size_t cap = 64) -> std::vector<std::byte> {
+template <class Fn> auto encode_into(Fn&& fn, std::size_t cap = 64) -> std::vector<std::byte> {
     std::vector<std::byte> buf(cap);
     ByteWriter w{buf};
     CHECK(fn(w).has_value());

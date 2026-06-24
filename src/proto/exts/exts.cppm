@@ -44,7 +44,9 @@ struct SourceInfo {
     auto operator==(const SourceInfo&) const -> bool = default;
 
     /// Encoded body length.
-    [[nodiscard]] auto body_len() const noexcept -> std::size_t { return id.body_len() + len_uint(sn); }
+    [[nodiscard]] auto body_len() const noexcept -> std::size_t {
+        return id.body_len() + len_uint(sn);
+    }
     /// Encode: entity id ++ VLE(sn).
     [[nodiscard]] auto encode_body(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
     /// Decode the above.
@@ -81,7 +83,8 @@ struct Value {
     /// Encode: encoding ++ raw payload.
     [[nodiscard]] auto encode_body(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
     /// Decode the above (payload is the remainder of the ext slice).
-    [[nodiscard]] static auto decode_body(ByteReader& r) noexcept -> std::expected<Value, CodecError>;
+    [[nodiscard]] static auto decode_body(ByteReader& r) noexcept
+        -> std::expected<Value, CodecError>;
 };
 
 /// Queryable advertisement info (U64 extension): `complete` flag in bit 0,

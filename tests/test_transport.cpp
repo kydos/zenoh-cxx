@@ -15,8 +15,7 @@ using namespace zenoh;
 
 namespace {
 
-template <class T>
-auto roundtrip(const T& value) -> void {
+template <class T> auto roundtrip(const T& value) -> void {
     std::array<std::byte, 512> buf{};
     ByteWriter w{buf};
     CHECK(value.encode(w).has_value());
@@ -45,14 +44,12 @@ TEST("Close round-trips for both behaviours") {
     roundtrip(Close{.reason = 1, .behaviour = CloseBehaviour::session});
 }
 
-TEST("KeepAlive round-trips") {
-    roundtrip(KeepAlive{});
-}
+TEST("KeepAlive round-trips") { roundtrip(KeepAlive{}); }
 
 TEST("FrameHeader round-trips (default and with QoS)") {
     roundtrip(FrameHeader{.reliability = Reliability::reliable, .sn = 42, .qos = QoS{}});
-    roundtrip(FrameHeader{
-        .reliability = Reliability::best_effort, .sn = 1000, .qos = QoS{0b0001'0101}});
+    roundtrip(
+        FrameHeader{.reliability = Reliability::best_effort, .sn = 1000, .qos = QoS{0b0001'0101}});
 }
 
 TEST("InitSyn round-trips (minimal and with extensions)") {

@@ -19,8 +19,7 @@ using namespace zenoh;
 
 namespace {
 
-template <class Fn>
-auto encode_into(Fn&& fn, std::size_t cap = 64) -> std::vector<std::byte> {
+template <class Fn> auto encode_into(Fn&& fn, std::size_t cap = 64) -> std::vector<std::byte> {
     std::vector<std::byte> buf(cap);
     ByteWriter w{buf};
     CHECK(fn(w).has_value());
@@ -62,7 +61,8 @@ TEST("peek_ext_header reports exhaustion on empty input") {
 }
 
 TEST("Unit extension: write then read consumes exactly the header") {
-    auto const bytes = encode_into([&](ByteWriter& w) { return put_ext_unit(w, 0x1, false, true); });
+    auto const bytes =
+        encode_into([&](ByteWriter& w) { return put_ext_unit(w, 0x1, false, true); });
     CHECK(bytes.size() == 1);
     ByteReader r{bytes};
     auto eh = peek_ext_header(r);
@@ -83,13 +83,15 @@ TEST("U64 extension: write then read the value") {
 }
 
 TEST("read_ext_uint narrows and rejects overflow") {
-    auto const ok = encode_into([&](ByteWriter& w) { return put_ext_u64(w, 0x1, false, false, 250); });
+    auto const ok =
+        encode_into([&](ByteWriter& w) { return put_ext_u64(w, 0x1, false, false, 250); });
     {
         ByteReader r{ok};
         auto v = read_ext_uint<std::uint8_t>(r);
         CHECK(v.has_value() && *v == 250);
     }
-    auto const over = encode_into([&](ByteWriter& w) { return put_ext_u64(w, 0x1, false, false, 300); });
+    auto const over =
+        encode_into([&](ByteWriter& w) { return put_ext_u64(w, 0x1, false, false, 300); });
     {
         ByteReader r{over};
         auto v = read_ext_uint<std::uint8_t>(r);
@@ -122,14 +124,16 @@ TEST("read_ext_zstruct rejects a body length that overruns") {
 TEST("skip_ext consumes each kind's body") {
     // Unit.
     {
-        auto const e = encode_into([&](ByteWriter& w) { return put_ext_unit(w, 0x1, false, false); });
+        auto const e =
+            encode_into([&](ByteWriter& w) { return put_ext_unit(w, 0x1, false, false); });
         ByteReader r{e};
         CHECK(skip_ext(r, ExtKind::unit).has_value());
         CHECK(r.remaining() == 0);
     }
     // U64.
     {
-        auto const e = encode_into([&](ByteWriter& w) { return put_ext_u64(w, 0x1, false, false, 99999); });
+        auto const e =
+            encode_into([&](ByteWriter& w) { return put_ext_u64(w, 0x1, false, false, 99999); });
         ByteReader r{e};
         CHECK(skip_ext(r, ExtKind::u64).has_value());
         CHECK(r.remaining() == 0);
@@ -149,8 +153,10 @@ TEST("skip_ext consumes each kind's body") {
 
 TEST("a chain of extensions decodes via the more bit") {
     auto const bytes = encode_into([&](ByteWriter& w) -> std::expected<void, CodecError> {
-        if (!put_ext_unit(w, 0x1, false, /*more=*/true)) return std::unexpected(CodecError::dst_full);
-        if (!put_ext_u64(w, 0x2, false, /*more=*/true, 42)) return std::unexpected(CodecError::dst_full);
+        if (!put_ext_unit(w, 0x1, false, /*more=*/true))
+            return std::unexpected(CodecError::dst_full);
+        if (!put_ext_u64(w, 0x2, false, /*more=*/true, 42))
+            return std::unexpected(CodecError::dst_full);
         return put_ext_unit(w, 0x3, false, /*more=*/false);
     });
     ByteReader r{bytes};

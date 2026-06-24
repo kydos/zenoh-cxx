@@ -15,8 +15,7 @@ using namespace zenoh;
 
 namespace {
 
-template <class T>
-auto roundtrip(const T& value) -> void {
+template <class T> auto roundtrip(const T& value) -> void {
     std::array<std::byte, 512> buf{};
     ByteWriter w{buf};
     CHECK(value.encode(w).has_value());
@@ -76,9 +75,9 @@ TEST("InitAck with same-id (U64) + zstruct + unit + patch exts round-trips") {
     static constexpr std::array<std::byte, 2> auth_payload{std::byte{0xDE}, std::byte{0xAD}};
     InitAck a{};
     a.version = 9;
-    a.identifier = InitIdentifier{
-        .whatami = WhatAmI::client,
-        .zid = make_zid({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})};
+    a.identifier =
+        InitIdentifier{.whatami = WhatAmI::client,
+                       .zid = make_zid({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})};
     a.cookie = cookie;
     a.qos_link = QoSLink{0x1234};
     a.auth = Auth{auth_payload};

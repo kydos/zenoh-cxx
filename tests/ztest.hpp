@@ -48,12 +48,12 @@ inline auto run() -> int {
         if (failures() == before) {
             ++passed;
         } else {
-            std::fprintf(stderr, "  ^ in test \"%.*s\"\n",
-                         static_cast<int>(c.name.size()), c.name.data());
+            std::fprintf(stderr, "  ^ in test \"%.*s\"\n", static_cast<int>(c.name.size()),
+                         c.name.data());
         }
     }
-    std::fprintf(stderr, "%d/%zu tests passed; %d checks failed\n",
-                 passed, registry().size(), failures());
+    std::fprintf(stderr, "%d/%zu tests passed; %d checks failed\n", passed, registry().size(),
+                 failures());
     return failures() == 0 ? 0 : 1;
 }
 
@@ -62,10 +62,9 @@ inline auto run() -> int {
 #define ZTEST_CAT2(a, b) a##b
 #define ZTEST_CAT(a, b) ZTEST_CAT2(a, b)
 
-#define TEST(name)                                                                        \
-    static auto ZTEST_CAT(ztest_fn_, __LINE__)()->void;                                   \
-    static ::ztest::Reg ZTEST_CAT(ztest_reg_, __LINE__){name,                             \
-                                                        &ZTEST_CAT(ztest_fn_, __LINE__)}; \
-    static auto ZTEST_CAT(ztest_fn_, __LINE__)()->void
+#define TEST(name)                                                                                 \
+    static auto ZTEST_CAT(ztest_fn_, __LINE__)()->void;                                            \
+    static ::ztest::Reg ZTEST_CAT(ztest_reg_, __LINE__){name, &ZTEST_CAT(ztest_fn_, __LINE__)};    \
+    static auto ZTEST_CAT(ztest_fn_, __LINE__)() -> void
 
 #define CHECK(cond) ::ztest::check((cond), #cond, __FILE__, __LINE__)

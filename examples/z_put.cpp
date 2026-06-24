@@ -80,7 +80,8 @@ auto main(int argc, char** argv) -> int {
 
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
-        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(), error_name(session.error()));
+        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
+                     error_name(session.error()));
         return 1;
     }
     std::printf("Connected to %s\n", endpoint.c_str());
@@ -105,11 +106,12 @@ auto main(int argc, char** argv) -> int {
             auto result = use_try ? session->try_put(key, as_bytes(payload))
                                   : session->put(key, as_bytes(payload));
             if (!result) {
-                std::fprintf(stderr, "%s('%s') failed: %s\n", use_try ? "try_put" : "put", key.c_str(),
-                             error_name(result.error()));
+                std::fprintf(stderr, "%s('%s') failed: %s\n", use_try ? "try_put" : "put",
+                             key.c_str(), error_name(result.error()));
                 return result.error() == zenoh::ZError::would_block ? 2 : 1;
             }
-            // std::printf("%s('%s') = '%s'\n", use_try ? "try_put" : "put", key.c_str(), payload.c_str());
+            // std::printf("%s('%s') = '%s'\n", use_try ? "try_put" : "put", key.c_str(),
+            // payload.c_str());
         }
     }
 

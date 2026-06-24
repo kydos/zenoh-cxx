@@ -18,7 +18,7 @@ import zenoh.proto.fields;
 
 // Transport-handshake messages and their field/extension types. Message and
 // identifier `encode`/`decode` bodies live in transport.cpp; data-only types and
-// `operator==`/`encoded_len` stay inline here.   
+// `operator==`/`encoded_len` stay inline here.
 export namespace zenoh {
 
 // --- transport-handshake field/extension types ---
@@ -77,7 +77,9 @@ struct Patch {
 /// Opaque authentication payload (ZStruct extension, body = slice).
 struct Auth {
     std::span<const std::byte> payload{};
-    auto operator==(const Auth& o) const noexcept -> bool { return std::ranges::equal(payload, o.payload); }
+    auto operator==(const Auth& o) const noexcept -> bool {
+        return std::ranges::equal(payload, o.payload);
+    }
 };
 /// Multilink payload (ZStruct extension, body = slice).
 struct MultiLink {
@@ -183,7 +185,8 @@ struct KeepAlive {
     auto operator==(const KeepAlive&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<KeepAlive, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<KeepAlive, CodecError>;
 };
 
 /// `FrameHeader` (0x05): precedes a batch of network messages. Reliability rides
@@ -199,7 +202,8 @@ struct FrameHeader {
     auto operator==(const FrameHeader&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<FrameHeader, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<FrameHeader, CodecError>;
 };
 
 /// `OpenSyn` (0x02, A=0): completes the handshake from the initiator. Lease is a
@@ -225,7 +229,8 @@ struct OpenSyn {
     auto operator==(const OpenSyn& o) const noexcept -> bool {
         return lease == o.lease && sn == o.sn && std::ranges::equal(cookie, o.cookie) &&
                qos == o.qos && auth == o.auth && mlink_syn == o.mlink_syn &&
-               mlink_ack == o.mlink_ack && lowlatency == o.lowlatency && compression == o.compression;
+               mlink_ack == o.mlink_ack && lowlatency == o.lowlatency &&
+               compression == o.compression;
     }
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;

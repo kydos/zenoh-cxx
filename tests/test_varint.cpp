@@ -41,8 +41,8 @@ TEST("vle_len matches the 7-bit-per-byte thresholds") {
 
 TEST("vle round-trips representative values with minimal length") {
     const std::uint64_t values[] = {
-        0ull, 1ull, 127ull, 128ull, 300ull, 16384ull,
-        (1ull << 35), (1ull << 56) - 1, (1ull << 56), UINT64_MAX,
+        0ull,     1ull,         127ull,           128ull,       300ull,
+        16384ull, (1ull << 35), (1ull << 56) - 1, (1ull << 56), UINT64_MAX,
     };
     for (std::uint64_t x : values) {
         std::size_t len = 0;

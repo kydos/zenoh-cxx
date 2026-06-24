@@ -305,7 +305,8 @@ auto Session::try_put(std::string_view key_expr, std::span<const std::byte> payl
     }
 
     if (auto e = encode_put(key_expr, payload); !e) return std::unexpected(e.error());
-    std::size_t const framed = static_cast<std::size_t>(load_le<std::uint16_t>(tx_scratch_.data())) + 2;
+    std::size_t const framed =
+        static_cast<std::size_t>(load_le<std::uint16_t>(tx_scratch_.data())) + 2;
     auto const batch = std::span(tx_scratch_).first(framed);
 
     auto n = link_.write_some(batch);
@@ -611,7 +612,7 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
 }
 
 auto Session::pump_step() -> std::expected<void, ZError> {
-    if (fault_) return std::unexpected(*fault_); // sticky terminal fault — never resync
+    if (fault_) return std::unexpected(*fault_);     // sticky terminal fault — never resync
     if (rx_pos_ < rx_end_) return dispatch_cursor(); // resume an in-progress frame
 
     auto ready = link_.poll_readable(keepalive_ms_);
@@ -650,8 +651,8 @@ auto Session::pump_step() -> std::expected<void, ZError> {
         rx_end_ = *len;
         return dispatch_cursor();
     }
-    if (mid == KeepAlive::id) return {};                  // router keepalive — ignore
-    if (mid == Close::id) {                               // router closed the session
+    if (mid == KeepAlive::id) return {}; // router keepalive — ignore
+    if (mid == Close::id) {              // router closed the session
         fault_ = ZError::connection_closed;
         return std::unexpected(*fault_);
     }

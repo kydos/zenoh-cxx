@@ -19,10 +19,10 @@ export namespace zenoh {
 enum class CodecError : std::uint8_t {
     // Buffer-level (cursor under/overflow).
     src_exhausted = 10, ///< Tried to read past the end of the source buffer.
-    dst_full      = 11, ///< Tried to write past the end of the destination buffer.
+    dst_full = 11,      ///< Tried to write past the end of the destination buffer.
 
     // Codec-level (well-formed bytes, ill-formed message).
-    malformed     = 20, ///< Bytes do not form a valid value for the target type.
+    malformed = 20,     ///< Bytes do not form a valid value for the target type.
     invalid_field = 21, ///< A field failed validation (e.g. non-UTF-8 text).
 };
 
@@ -65,8 +65,7 @@ template <std::unsigned_integral T>
 }
 
 /// Store an unsigned integer little-endian at `p` (sizeof(T) bytes).
-template <std::unsigned_integral T>
-inline auto store_le(std::byte* p, T v) noexcept -> void {
+template <std::unsigned_integral T> inline auto store_le(std::byte* p, T v) noexcept -> void {
     if constexpr (std::endian::native == std::endian::big) {
         v = std::byteswap(v);
     }

@@ -7,16 +7,25 @@ on:
 
 jobs:
   linux:
-    name: Linux build, test & coverage (Docker)
+    name: Linux build, test, lint & coverage (Docker)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # Builds the toolchain image and runs configure/build/ctest for the
       # linux-clang preset (ASan+UBSan). Same path as local `scripts/docker-ci.sh`,
-      # so CI and dev are identical.
+      # so CI and dev are identical. Leaves build/linux-clang built (with a compile
+      # database) for the lint step.
       - name: Build and test in Docker
         run: scripts/docker-ci.sh
+
+      # clang-format (check) + clang-tidy, reusing the toolchain image and the
+      # build/linux-clang compile database from the previous step.
+      - name: Lint (clang-format + clang-tidy)
+        run: |
+          docker run --rm -v "$PWD":/work -w /work \
+            -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            zenoh-linux-ci scripts/lint.sh build/linux-clang
 
       # Re-uses the toolchain image to produce build/linux-coverage/coverage.lcov
       # (LLVM source-based coverage of the library, tests/examples excluded).

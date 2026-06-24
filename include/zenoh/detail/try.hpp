@@ -16,10 +16,10 @@
 #include <expected>
 #include <utility>
 
-#define ZTRY(expr)                                                       \
-    ({                                                                   \
-        auto&& _ztry_result = (expr);                                    \
-        if (!_ztry_result) [[unlikely]]                                  \
-            return ::std::unexpected(::std::move(_ztry_result).error()); \
-        ::std::move(_ztry_result).value();                              \
+#define ZTRY(expr)                                                                                 \
+    ({                                                                                             \
+        auto&& _ztry_result = (expr);                                                              \
+        if (!_ztry_result) [[unlikely]]                                                            \
+            return ::std::unexpected(::std::move(_ztry_result).error());                           \
+        ::std::move(_ztry_result).value();                                                         \
     })

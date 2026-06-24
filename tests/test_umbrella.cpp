@@ -13,12 +13,12 @@ using namespace zenoh;
 
 TEST("zenoh.proto umbrella exposes messages + buffers + error type") {
     std::array<std::byte, 3> pl{std::byte{1}, std::byte{2}, std::byte{3}};
-    Push p{};                  // from zenoh.proto.network
-    p.payload.body = Put{};    // Put + PushBody variant
+    Push p{};               // from zenoh.proto.network
+    p.payload.body = Put{}; // Put + PushBody variant
     std::get<Put>(p.payload.body).payload = pl;
 
     std::array<std::byte, 64> buf{};
-    ByteWriter w{buf};         // from zenoh.buffer (re-exported)
+    ByteWriter w{buf}; // from zenoh.buffer (re-exported)
     CHECK(p.encode(w).has_value());
 
     ByteReader r{std::span<const std::byte>{buf.data(), w.written()}};

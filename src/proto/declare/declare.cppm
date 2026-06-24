@@ -39,7 +39,8 @@ struct DeclareKeyExpr {
     auto operator==(const DeclareKeyExpr&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<DeclareKeyExpr, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<DeclareKeyExpr, CodecError>;
 };
 
 /// 0x01 — release a previously declared key-expression id.
@@ -49,7 +50,8 @@ struct UndeclareKeyExpr {
     auto operator==(const UndeclareKeyExpr&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<UndeclareKeyExpr, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<UndeclareKeyExpr, CodecError>;
 };
 
 /// 0x02 — declare a subscriber on a key expression.
@@ -60,7 +62,8 @@ struct DeclareSubscriber {
     auto operator==(const DeclareSubscriber&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<DeclareSubscriber, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<DeclareSubscriber, CodecError>;
 };
 
 /// 0x03 — undeclare a subscriber (optionally echoing its key expression, ext 0x0f).
@@ -73,7 +76,8 @@ struct UndeclareSubscriber {
     }
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<UndeclareSubscriber, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<UndeclareSubscriber, CodecError>;
 };
 
 /// 0x04 — declare a queryable on a key expression (with completeness/distance info).
@@ -85,7 +89,8 @@ struct DeclareQueryable {
     auto operator==(const DeclareQueryable&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<DeclareQueryable, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<DeclareQueryable, CodecError>;
 };
 
 /// 0x05 — undeclare a queryable (optionally echoing its key expression, ext 0x0f).
@@ -98,7 +103,8 @@ struct UndeclareQueryable {
     }
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<UndeclareQueryable, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<UndeclareQueryable, CodecError>;
 };
 
 /// 0x06 — declare a liveliness token on a key expression.
@@ -109,7 +115,8 @@ struct DeclareToken {
     auto operator==(const DeclareToken&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<DeclareToken, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<DeclareToken, CodecError>;
 };
 
 /// 0x07 — undeclare a token (optionally echoing its key expression, ext 0x0f).
@@ -122,7 +129,8 @@ struct UndeclareToken {
     }
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<UndeclareToken, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<UndeclareToken, CodecError>;
 };
 
 /// 0x1a — marks the end of a declare exchange.
@@ -131,7 +139,8 @@ struct DeclareFinal {
     auto operator==(const DeclareFinal&) const -> bool = default;
 
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<DeclareFinal, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<DeclareFinal, CodecError>;
 };
 
 /// The declaration carried by a Declare, dispatched by the inner message id.
@@ -153,20 +162,40 @@ struct DeclareBody {
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
         return std::visit([&](auto const& m) { return m.encode(w); }, body);
     }
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<DeclareBody, CodecError> {
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<DeclareBody, CodecError> {
         std::uint8_t const mid = std::to_integer<std::uint8_t>(ZTRY(r.peek())) & mid_mask;
         DeclareBody b{};
         switch (mid) {
-            case DeclareKeyExpr::mid: b.body = ZTRY(DeclareKeyExpr::decode(r)); break;
-            case UndeclareKeyExpr::mid: b.body = ZTRY(UndeclareKeyExpr::decode(r)); break;
-            case DeclareSubscriber::mid: b.body = ZTRY(DeclareSubscriber::decode(r)); break;
-            case UndeclareSubscriber::mid: b.body = ZTRY(UndeclareSubscriber::decode(r)); break;
-            case DeclareQueryable::mid: b.body = ZTRY(DeclareQueryable::decode(r)); break;
-            case UndeclareQueryable::mid: b.body = ZTRY(UndeclareQueryable::decode(r)); break;
-            case DeclareToken::mid: b.body = ZTRY(DeclareToken::decode(r)); break;
-            case UndeclareToken::mid: b.body = ZTRY(UndeclareToken::decode(r)); break;
-            case DeclareFinal::mid: b.body = ZTRY(DeclareFinal::decode(r)); break;
-            default: return std::unexpected(CodecError::malformed);
+        case DeclareKeyExpr::mid:
+            b.body = ZTRY(DeclareKeyExpr::decode(r));
+            break;
+        case UndeclareKeyExpr::mid:
+            b.body = ZTRY(UndeclareKeyExpr::decode(r));
+            break;
+        case DeclareSubscriber::mid:
+            b.body = ZTRY(DeclareSubscriber::decode(r));
+            break;
+        case UndeclareSubscriber::mid:
+            b.body = ZTRY(UndeclareSubscriber::decode(r));
+            break;
+        case DeclareQueryable::mid:
+            b.body = ZTRY(DeclareQueryable::decode(r));
+            break;
+        case UndeclareQueryable::mid:
+            b.body = ZTRY(UndeclareQueryable::decode(r));
+            break;
+        case DeclareToken::mid:
+            b.body = ZTRY(DeclareToken::decode(r));
+            break;
+        case UndeclareToken::mid:
+            b.body = ZTRY(UndeclareToken::decode(r));
+            break;
+        case DeclareFinal::mid:
+            b.body = ZTRY(DeclareFinal::decode(r));
+            break;
+        default:
+            return std::unexpected(CodecError::malformed);
         }
         return b;
     }

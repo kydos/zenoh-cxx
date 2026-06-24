@@ -24,8 +24,7 @@ namespace {
 // Scratch big enough that re-encoding never fails for fuzzer-sized inputs.
 std::byte g_scratch[1u << 20];
 
-template <class T>
-auto exercise(std::span<const std::byte> in) -> void {
+template <class T> auto exercise(std::span<const std::byte> in) -> void {
     ByteReader r{in};
     auto decoded = T::decode(r);
     if (!decoded) return;

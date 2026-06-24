@@ -36,9 +36,7 @@ export namespace zenoh {
 }
 
 /// Encoded length of `v` as VLE.
-[[nodiscard]] inline auto len_uint(std::uint64_t v) noexcept -> std::size_t {
-    return vle_len(v);
-}
+[[nodiscard]] inline auto len_uint(std::uint64_t v) noexcept -> std::size_t { return vle_len(v); }
 
 /// Decode a VLE integer into a narrower unsigned type, rejecting (as `malformed`)
 /// any wire value that does not fit. Protocol `zint` fields are semantically
@@ -131,9 +129,9 @@ template <std::unsigned_integral T>
             cp = (cp << 6) | (bk & 0x3Fu);
         }
         if (len == 3 && cp < 0x800) return false;       // overlong 3-byte
-        if (len == 4 && cp < 0x10000) return false;      // overlong 4-byte
-        if (cp >= 0xD800 && cp <= 0xDFFF) return false;  // surrogate
-        if (cp > 0x10FFFF) return false;                 // out of range
+        if (len == 4 && cp < 0x10000) return false;     // overlong 4-byte
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false; // surrogate
+        if (cp > 0x10FFFF) return false;                // out of range
         i += len;
     }
     return true;

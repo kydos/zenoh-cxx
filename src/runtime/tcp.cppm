@@ -23,7 +23,7 @@ enum class IoError : std::uint8_t {
 
 /// Owning RAII handle for a connected TCP socket. Move-only.
 class TcpLink {
-public:
+  public:
     TcpLink() noexcept = default;
     TcpLink(const TcpLink&) = delete;
     auto operator=(const TcpLink&) -> TcpLink& = delete;
@@ -69,7 +69,7 @@ public:
 
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
 
-private:
+  private:
     explicit TcpLink(int fd) noexcept : fd_(fd) {}
     int fd_ = -1;
 };

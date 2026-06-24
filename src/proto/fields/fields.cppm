@@ -98,7 +98,9 @@ struct ZenohId {
     std::array<std::byte, 16> bytes{};
     std::uint8_t len = 0;
     /// The significant `len` bytes.
-    [[nodiscard]] auto view() const noexcept -> std::span<const std::byte> { return {bytes.data(), len}; }
+    [[nodiscard]] auto view() const noexcept -> std::span<const std::byte> {
+        return {bytes.data(), len};
+    }
     auto operator==(const ZenohId&) const -> bool = default;
 };
 
@@ -116,7 +118,8 @@ struct Timestamp {
     /// Encode: VLE(time) ++ VLE(id_len) ++ id bytes.
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
     /// Decode the above; rejects `id_len > 16` as malformed.
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<Timestamp, CodecError>;
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<Timestamp, CodecError>;
 };
 
 /// Payload encoding: a 13-bit-ish id plus an optional schema. On the wire the id
@@ -133,7 +136,8 @@ struct Encoding {
 
     /// Encoded length (hot path: used to size the parent before writing).
     [[nodiscard]] auto encoded_len() const noexcept -> std::size_t {
-        std::uint64_t const combined = (static_cast<std::uint64_t>(id) << 1) | (has_schema ? 1u : 0u);
+        std::uint64_t const combined =
+            (static_cast<std::uint64_t>(id) << 1) | (has_schema ? 1u : 0u);
         return len_uint(combined) + (has_schema ? len_prefixed(schema) : 0);
     }
     /// Encode the `(id<<1)|has_schema` word, then the length-prefixed schema if any.
