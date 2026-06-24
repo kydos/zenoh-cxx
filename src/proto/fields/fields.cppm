@@ -67,8 +67,11 @@ struct Duration {
     /// The VLE body value (seconds or milliseconds per `seconds`).
     [[nodiscard]] auto wire_value() const noexcept -> std::uint64_t { return value; }
     /// Milliseconds, truncated to u64 (matching the reference's `as_millis() as u64`).
+    /// The seconds->millis scale is computed in 128-bit so a large second count
+    /// truncates like the reference rather than wrapping mid-multiply in u64.
     [[nodiscard]] auto millis() const noexcept -> std::uint64_t {
-        return seconds ? value * 1000 : value;
+        return seconds ? static_cast<std::uint64_t>(static_cast<unsigned __int128>(value) * 1000)
+                       : value;
     }
     /// Decode a flattened lease body, with `secs` taken from the parent T flag.
     [[nodiscard]] static auto decode_value(ByteReader& r, bool secs) noexcept

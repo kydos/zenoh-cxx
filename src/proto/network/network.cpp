@@ -24,7 +24,7 @@ namespace zenoh {
 
 // --- Put ---
 
-auto Put::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+auto Put::encode_head(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     bool const t = timestamp.has_value();
     bool const e = !(encoding == Encoding{});
     bool const has_si = sinfo.has_value();
@@ -45,7 +45,13 @@ auto Put::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError
         ZTRY(put_ext_zstruct(w, 0x3, false, /*more=*/false, attachment->body_len(),
                              [&](auto& ww) { return attachment->encode_body(ww); }));
 
-    return put_prefixed(w, payload);
+    // Payload length prefix only; bytes are appended by encode (or by a gather caller).
+    return put_uint(w, payload.size());
+}
+
+auto Put::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+    ZTRY(encode_head(w));
+    return put_raw(w, payload);
 }
 
 auto Put::decode(ByteReader& r) noexcept -> std::expected<Put, CodecError> {
@@ -127,7 +133,7 @@ auto Del::decode(ByteReader& r) noexcept -> std::expected<Del, CodecError> {
 
 // --- Push ---
 
-auto Push::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+auto Push::encode_head(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     bool const n = wire_expr.has_suffix();
     bool const m = wire_expr.is_sender();
     bool const q = !(qos == QoS{});
@@ -146,7 +152,12 @@ auto Push::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecErro
                              [&](auto& ww) { return timestamp->encode(ww); }));
     if (nid) ZTRY(put_ext_u64(w, 0x3, /*mandatory=*/true, /*more=*/false, nodeid.node_id));
 
-    return payload.encode(w);
+    return payload.encode_head(w);
+}
+
+auto Push::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+    ZTRY(encode_head(w));
+    return put_raw(w, payload.trailing_payload());
 }
 
 auto Push::decode(ByteReader& r) noexcept -> std::expected<Push, CodecError> {

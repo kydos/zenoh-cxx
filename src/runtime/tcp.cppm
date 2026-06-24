@@ -4,7 +4,7 @@ module;
 #include <cstdint>
 #include <expected>
 #include <span>
-#include <string_view>
+#include <string>
 
 export module zenoh.runtime.tcp;
 
@@ -32,7 +32,7 @@ public:
     ~TcpLink();
 
     /// Resolve `host` and connect to `host:port` (blocking). TCP_NODELAY is set.
-    [[nodiscard]] static auto connect(std::string_view host, std::uint16_t port) noexcept
+    [[nodiscard]] static auto connect(const std::string& host, std::uint16_t port) noexcept
         -> std::expected<TcpLink, IoError>;
 
     /// Switch the socket to non-blocking mode (used after the handshake).
@@ -41,6 +41,13 @@ public:
     /// Write all of `data`, blocking as needed (polls POLLOUT on EAGAIN). Suitable
     /// for the handshake and for the blocking `put`.
     [[nodiscard]] auto write_all(std::span<const std::byte> data) noexcept
+        -> std::expected<void, IoError>;
+
+    /// Write all of `first` then `second` as one scatter-gather sequence (`writev`),
+    /// blocking as needed. Lets a caller emit a header plus a borrowed payload without
+    /// first copying them into one contiguous buffer.
+    [[nodiscard]] auto writev_all(std::span<const std::byte> first,
+                                  std::span<const std::byte> second) noexcept
         -> std::expected<void, IoError>;
 
     /// Write as much of `data` as the socket accepts right now without blocking;

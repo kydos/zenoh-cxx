@@ -7,7 +7,6 @@ module;
 #include <expected>
 #include <span>
 #include <string>
-#include <string_view>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -17,6 +16,7 @@ module;
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 module zenoh.runtime.tcp;
@@ -68,9 +68,8 @@ TcpLink::~TcpLink() {
     if (fd_ >= 0) ::close(fd_);
 }
 
-auto TcpLink::connect(std::string_view host, std::uint16_t port) noexcept
+auto TcpLink::connect(const std::string& host, std::uint16_t port) noexcept
     -> std::expected<TcpLink, IoError> {
-    std::string const host_s(host);
     std::string const port_s = std::to_string(port);
 
     ::addrinfo hints{};
@@ -79,7 +78,7 @@ auto TcpLink::connect(std::string_view host, std::uint16_t port) noexcept
     hints.ai_protocol = IPPROTO_TCP;
 
     ::addrinfo* res = nullptr;
-    if (::getaddrinfo(host_s.c_str(), port_s.c_str(), &hints, &res) != 0 || res == nullptr) {
+    if (::getaddrinfo(host.c_str(), port_s.c_str(), &hints, &res) != 0 || res == nullptr) {
         return std::unexpected(IoError::failed);
     }
 
@@ -114,6 +113,43 @@ auto TcpLink::write_all(std::span<const std::byte> data) noexcept -> std::expect
         ssize_t const n = ::send(fd_, data.data() + off, data.size() - off, MSG_NOSIGNAL);
         if (n > 0) {
             off += static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n == 0) return std::unexpected(IoError::closed);
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (auto r = wait_ready(fd_, POLLOUT); !r) return std::unexpected(r.error());
+            continue;
+        }
+        return std::unexpected(errno_to_io(errno));
+    }
+    return {};
+}
+
+auto TcpLink::writev_all(std::span<const std::byte> first,
+                         std::span<const std::byte> second) noexcept
+    -> std::expected<void, IoError> {
+    // Degenerate cases: nothing to gather, fall back to a plain contiguous write.
+    if (second.empty()) return write_all(first);
+    if (first.empty()) return write_all(second);
+
+    ::iovec iov[2];
+    iov[0] = {const_cast<std::byte*>(first.data()), first.size()};
+    iov[1] = {const_cast<std::byte*>(second.data()), second.size()};
+    int idx = 0; // index of the first not-yet-fully-written iovec
+
+    while (idx < 2) {
+        ssize_t const n = ::writev(fd_, &iov[idx], 2 - idx);
+        if (n > 0) {
+            auto left = static_cast<std::size_t>(n);
+            while (idx < 2 && left >= iov[idx].iov_len) {
+                left -= iov[idx].iov_len;
+                ++idx;
+            }
+            if (idx < 2 && left > 0) {
+                iov[idx].iov_base = static_cast<std::byte*>(iov[idx].iov_base) + left;
+                iov[idx].iov_len -= left;
+            }
             continue;
         }
         if (n == 0) return std::unexpected(IoError::closed);

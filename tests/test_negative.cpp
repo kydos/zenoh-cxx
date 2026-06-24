@@ -168,3 +168,26 @@ TEST("truncation sweeps never crash or read out of bounds") {
 
     CHECK(true); // reaching here without an ASan/UBSan abort is the assertion
 }
+
+TEST("encode rejects an empty zid (would underflow the length nibble)") {
+    std::array<std::byte, 64> buf{};
+    // InitIdentifier and EntityGlobalId both pack zid length as len-1 in a nibble; a
+    // default (len 0) id must be rejected, not silently encoded as length 16.
+    {
+        ByteWriter w{buf};
+        InitIdentifier id{}; // zid.len == 0
+        CHECK(!id.encode(w).has_value());
+    }
+    {
+        ByteWriter w{buf};
+        EntityGlobalId g{}; // zid.len == 0
+        CHECK(!g.encode_body(w).has_value());
+    }
+    // A valid 16-byte id still encodes.
+    {
+        ByteWriter w{buf};
+        InitIdentifier id{};
+        id.zid.len = 16;
+        CHECK(id.encode(w).has_value());
+    }
+}
