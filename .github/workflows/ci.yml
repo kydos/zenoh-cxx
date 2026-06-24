@@ -7,13 +7,26 @@ on:
 
 jobs:
   linux:
-    name: Linux build & test (clang + gcc, Docker)
+    name: Linux build, test & coverage (Docker)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Builds the toolchain image and runs configure/build/ctest for both the
-      # linux-clang (libc++, ASan+UBSan) and linux-gcc presets. Same path as local
-      # `scripts/docker-ci.sh`, so CI and dev are identical.
+      # Builds the toolchain image and runs configure/build/ctest for the
+      # linux-clang preset (ASan+UBSan). Same path as local `scripts/docker-ci.sh`,
+      # so CI and dev are identical.
       - name: Build and test in Docker
         run: scripts/docker-ci.sh
+
+      # Re-uses the toolchain image to produce build/linux-coverage/coverage.lcov
+      # (LLVM source-based coverage of the library, tests/examples excluded).
+      - name: Coverage in Docker
+        run: scripts/docker-coverage.sh
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: kydos/zenoh
+          files: build/linux-coverage/coverage.lcov
+          fail_ci_if_error: false

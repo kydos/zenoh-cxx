@@ -28,13 +28,15 @@ RUN wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
     && chmod +x /tmp/llvm.sh \
     && /tmp/llvm.sh ${LLVM_VERSION} \
     && apt-get update && apt-get install -y --no-install-recommends \
-        clang-${LLVM_VERSION} clang-tools-${LLVM_VERSION} \
+        clang-${LLVM_VERSION} clang-tools-${LLVM_VERSION} llvm-${LLVM_VERSION} \
         libc++-${LLVM_VERSION}-dev libc++abi-${LLVM_VERSION}-dev \
     && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
 
 # Stable, unversioned compiler names that the CMake presets reference.
 RUN update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-${LLVM_VERSION}   100 \
     && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${LLVM_VERSION} 100 \
+    && update-alternatives --install /usr/bin/llvm-cov      llvm-cov      /usr/bin/llvm-cov-${LLVM_VERSION}      100 \
+    && update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-${LLVM_VERSION} 100 \
     && update-alternatives --install /usr/bin/gcc    gcc     /usr/bin/gcc-14                  100 \
     && update-alternatives --install /usr/bin/g++    g++     /usr/bin/g++-14                  100
 
