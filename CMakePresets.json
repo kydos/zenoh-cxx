@@ -33,6 +33,21 @@
       }
     },
     {
+      "name": "clang-coverage",
+      "displayName": "macOS clang coverage (LLVM source-based)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang-coverage",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ZENOH_COVERAGE": "ON",
+        "CMAKE_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
+        "CMAKE_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_CXX_COMPILER_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
+        "CMAKE_CXX_COMPILER_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib"
+      }
+    },
+    {
       "name": "gcc",
       "displayName": "macOS gcc-15 (note: blocked by macOS SDK libstdc++ bug)",
       "generator": "Ninja",
@@ -75,6 +90,17 @@
       }
     },
     {
+      "name": "linux-coverage",
+      "displayName": "Linux clang coverage (LLVM source-based, CI)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-coverage",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ZENOH_COVERAGE": "ON"
+      }
+    },
+    {
       "name": "linux-fuzz",
       "displayName": "Linux clang libFuzzer (decode fuzzing)",
       "generator": "Ninja",
@@ -89,18 +115,22 @@
   "buildPresets": [
     { "name": "clang", "configurePreset": "clang" },
     { "name": "clang-release", "configurePreset": "clang-release" },
+    { "name": "clang-coverage", "configurePreset": "clang-coverage" },
     { "name": "gcc", "configurePreset": "gcc" },
     { "name": "linux-clang", "configurePreset": "linux-clang" },
     { "name": "linux-gcc", "configurePreset": "linux-gcc" },
     { "name": "linux-clang-release", "configurePreset": "linux-clang-release" },
+    { "name": "linux-coverage", "configurePreset": "linux-coverage" },
     { "name": "linux-fuzz", "configurePreset": "linux-fuzz" }
   ],
   "testPresets": [
     { "name": "clang", "configurePreset": "clang", "output": { "outputOnFailure": true } },
     { "name": "clang-release", "configurePreset": "clang-release", "output": { "outputOnFailure": true } },
+    { "name": "clang-coverage", "configurePreset": "clang-coverage", "output": { "outputOnFailure": true } },
     { "name": "gcc", "configurePreset": "gcc", "output": { "outputOnFailure": true } },
     { "name": "linux-clang", "configurePreset": "linux-clang", "output": { "outputOnFailure": true } },
     { "name": "linux-clang-release", "configurePreset": "linux-clang-release", "output": { "outputOnFailure": true } },
+    { "name": "linux-coverage", "configurePreset": "linux-coverage", "output": { "outputOnFailure": true } },
     { "name": "linux-gcc", "configurePreset": "linux-gcc", "output": { "outputOnFailure": true } }
   ]
 }

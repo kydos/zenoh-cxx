@@ -54,6 +54,16 @@ if(ZENOH_SANITIZE)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
+# LLVM source-based code coverage (clang only). Instruments every target; running
+# the test binary then emits .profraw which scripts/coverage.sh merges into an lcov
+# report. Use a dedicated, un-optimized, sanitizer-free build (the `*-coverage`
+# presets) for accurate line mapping.
+option(ZENOH_COVERAGE "Instrument for LLVM source-based coverage (clang)" OFF)
+if(ZENOH_COVERAGE)
+    add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
+    add_link_options(-fprofile-instr-generate -fcoverage-mapping)
+endif()
+
 # The codec/proto layer as a standalone static library, unit-testable in isolation
 # from any I/O. Module interface units (.cppm) carry the public, documented API;
 # message-layer implementation units (.cpp) carry the encode/decode bodies, while
