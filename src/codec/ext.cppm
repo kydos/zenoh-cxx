@@ -23,8 +23,8 @@ export namespace zenoh {
 
 /// Extension wire encoding, in header bits 6:5.
 enum class ExtKind : std::uint8_t {
-    unit    = 0b00 << 5, ///< 0x00 - presence flag, no body
-    u64     = 0b01 << 5, ///< 0x20 - VLE u64 body
+    unit = 0b00 << 5,    ///< 0x00 - presence flag, no body
+    u64 = 0b01 << 5,     ///< 0x20 - VLE u64 body
     zstruct = 0b10 << 5, ///< 0x40 - VLE(len)-prefixed structured body
 };
 
@@ -42,9 +42,10 @@ inline constexpr std::uint8_t ext_flag_mandatory = 1u << 4;
 inline constexpr std::uint8_t ext_flag_more = 1u << 7;
 
 /// Build an extension header byte from its fields.
-[[nodiscard]] inline auto
-ext_header_byte(std::uint8_t id, ExtKind kind, bool mandatory, bool more) noexcept -> std::byte {
-    std::uint8_t h = static_cast<std::uint8_t>((id & ext_id_mask) | static_cast<std::uint8_t>(kind));
+[[nodiscard]] inline auto ext_header_byte(std::uint8_t id, ExtKind kind, bool mandatory,
+                                          bool more) noexcept -> std::byte {
+    std::uint8_t h =
+        static_cast<std::uint8_t>((id & ext_id_mask) | static_cast<std::uint8_t>(kind));
     if (mandatory) h |= ext_flag_mandatory;
     if (more) h |= ext_flag_more;
     return static_cast<std::byte>(h);
@@ -59,10 +60,17 @@ ext_header_byte(std::uint8_t id, ExtKind kind, bool mandatory, bool more) noexce
     ExtHeader eh{};
     eh.id = h & ext_id_mask;
     switch (h & ext_kind_mask) {
-        case static_cast<std::uint8_t>(ExtKind::unit): eh.kind = ExtKind::unit; break;
-        case static_cast<std::uint8_t>(ExtKind::u64): eh.kind = ExtKind::u64; break;
-        case static_cast<std::uint8_t>(ExtKind::zstruct): eh.kind = ExtKind::zstruct; break;
-        default: return std::unexpected(CodecError::malformed);
+    case static_cast<std::uint8_t>(ExtKind::unit):
+        eh.kind = ExtKind::unit;
+        break;
+    case static_cast<std::uint8_t>(ExtKind::u64):
+        eh.kind = ExtKind::u64;
+        break;
+    case static_cast<std::uint8_t>(ExtKind::zstruct):
+        eh.kind = ExtKind::zstruct;
+        break;
+    default:
+        return std::unexpected(CodecError::malformed);
     }
     eh.mandatory = (h & ext_flag_mandatory) != 0;
     eh.more = (h & ext_flag_more) != 0;
@@ -117,8 +125,7 @@ template <std::unsigned_integral T>
 }
 
 /// Consume a Unit extension's header.
-[[nodiscard]] inline auto read_ext_unit(ByteReader& r) noexcept
-    -> std::expected<void, CodecError> {
+[[nodiscard]] inline auto read_ext_unit(ByteReader& r) noexcept -> std::expected<void, CodecError> {
     ZTRY(r.read_byte());
     return {};
 }
@@ -137,16 +144,16 @@ template <std::unsigned_integral T>
     -> std::expected<void, CodecError> {
     ZTRY(r.read_byte()); // discard header
     switch (kind) {
-        case ExtKind::unit:
-            break;
-        case ExtKind::u64:
-            ZTRY(decode_vle(r));
-            break;
-        case ExtKind::zstruct: {
-            auto const n = ZTRY(decode_vle(r));
-            ZTRY(r.read_slice(static_cast<std::size_t>(n)));
-            break;
-        }
+    case ExtKind::unit:
+        break;
+    case ExtKind::u64:
+        ZTRY(decode_vle(r));
+        break;
+    case ExtKind::zstruct: {
+        auto const n = ZTRY(decode_vle(r));
+        ZTRY(r.read_slice(static_cast<std::size_t>(n)));
+        break;
+    }
     }
     return {};
 }

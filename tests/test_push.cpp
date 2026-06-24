@@ -17,8 +17,7 @@ using namespace zenoh;
 
 namespace {
 
-template <class T>
-auto roundtrip(const T& value) -> void {
+template <class T> auto roundtrip(const T& value) -> void {
     std::array<std::byte, 512> buf{};
     ByteWriter w{buf};
     CHECK(value.encode(w).has_value());
@@ -86,9 +85,9 @@ TEST("Push carries a Del payload round-trip") {
 
 TEST("Push header carries the right message id and flags") {
     Push p{};
-    p.wire_expr.mapping = Mapping::sender; // M
+    p.wire_expr.mapping = Mapping::sender;      // M
     p.wire_expr.suffix = std::string_view{"x"}; // N
-    p.nodeid.node_id = 1; // Z (an extension present)
+    p.nodeid.node_id = 1;                       // Z (an extension present)
 
     std::array<std::byte, 64> buf{};
     ByteWriter w{buf};

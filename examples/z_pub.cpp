@@ -77,7 +77,8 @@ auto main(int argc, char** argv) -> int {
     std::printf("Opening session...\n");
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
-        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(), error_name(session.error()));
+        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
+                     error_name(session.error()));
         return 1;
     }
 

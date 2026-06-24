@@ -96,7 +96,8 @@ struct PushBody {
     /// Encode the body up to (but not including) the trailing payload bytes; pair with
     /// `trailing_payload()` for scatter-gather. Only `Put` defers a payload — `Del`
     /// has none, so its `encode_head` is a full encode.
-    [[nodiscard]] auto encode_head(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+    [[nodiscard]] auto encode_head(ByteWriter& w) const noexcept
+        -> std::expected<void, CodecError> {
         if (auto const* p = std::get_if<Put>(&body)) return p->encode_head(w);
         return std::visit([&](auto const& m) { return m.encode(w); }, body);
     }
@@ -105,7 +106,8 @@ struct PushBody {
         if (auto const* p = std::get_if<Put>(&body)) return p->payload;
         return {};
     }
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<PushBody, CodecError> {
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<PushBody, CodecError> {
         std::uint8_t const mid = std::to_integer<std::uint8_t>(ZTRY(r.peek())) & mid_mask;
         PushBody b{};
         if (mid == Put::id) {
@@ -192,7 +194,8 @@ struct RequestBody {
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
         return query.encode(w);
     }
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<RequestBody, CodecError> {
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<RequestBody, CodecError> {
         RequestBody b{};
         b.query = ZTRY(Query::decode(r));
         return b;
@@ -208,7 +211,8 @@ struct ResponseBody {
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
         return std::visit([&](auto const& m) { return m.encode(w); }, body);
     }
-    [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<ResponseBody, CodecError> {
+    [[nodiscard]] static auto decode(ByteReader& r) noexcept
+        -> std::expected<ResponseBody, CodecError> {
         std::uint8_t const mid = std::to_integer<std::uint8_t>(ZTRY(r.peek())) & mid_mask;
         ResponseBody b{};
         if (mid == Err::id) {
@@ -227,9 +231,9 @@ struct ResponseBody {
 struct Request {
     std::uint32_t id = 0;
     WireExpr wire_expr{};
-    QoS qos{};                            ///< ext 0x1 (U64), default-elided
-    std::optional<Timestamp> timestamp{}; ///< ext 0x2 (ZStruct)
-    NodeId nodeid{};                      ///< ext 0x3 (U64, mandatory), default-elided
+    QoS qos{};                                       ///< ext 0x1 (U64), default-elided
+    std::optional<Timestamp> timestamp{};            ///< ext 0x2 (ZStruct)
+    NodeId nodeid{};                                 ///< ext 0x3 (U64, mandatory), default-elided
     QueryTarget target = QueryTarget::best_matching; ///< ext 0x4 (U64, mandatory), default-elided
     std::optional<std::uint32_t> budget{};           ///< ext 0x5 (U64)
     std::optional<Duration> timeout{};               ///< ext 0x6 (U64, millis)

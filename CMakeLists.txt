@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # GNU extensions are required for the statement-expression form of ZTRY (PLAN.md D1).
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
+# Emit compile_commands.json so clang-tidy (scripts/tidy.sh) can replay the exact
+# per-translation-unit module flags.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Release/RelWithDebInfo keep CMake's default optimization flags, which include
 # `-O3 -DNDEBUG` (Release) / `-O2 -g -DNDEBUG` (RelWithDebInfo). Do NOT override

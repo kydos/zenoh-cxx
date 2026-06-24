@@ -13,8 +13,8 @@ import zenoh.proto; // messages + ByteReader/ByteWriter + load_le/store_le
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <optional>
 #include <span>
@@ -117,7 +117,7 @@ auto del_msg(ByteWriter& w, std::string_view key) {
 // In-process router for one subscriber client: handshake, capture the client's
 // DeclareSubscriber key, then hand the connected fd to a per-test `script`.
 class SubRouter {
-public:
+  public:
     explicit SubRouter(std::function<void(int)> script, std::uint16_t batch_size = 8192)
         : script_(std::move(script)), batch_size_(batch_size) {
         std::signal(SIGPIPE, SIG_IGN);
@@ -145,7 +145,7 @@ public:
         if (thread_.joinable()) thread_.join();
     }
 
-private:
+  private:
     auto run() -> void {
         pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
         if (::poll(&pfd, 1, 5000) <= 0) return;
@@ -154,7 +154,10 @@ private:
         timeval tv{.tv_sec = 6, .tv_usec = 0};
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        if (!recv_batch(fd)) { ::close(fd); return; } // InitSyn
+        if (!recv_batch(fd)) {
+            ::close(fd);
+            return;
+        } // InitSyn
         InitAck ack{};
         ack.version = 9;
         ack.identifier.whatami = WhatAmI::router;
@@ -164,12 +167,21 @@ private:
         ack.resolution.batch_size = batch_size_;
         std::array<std::byte, 4> cookie{std::byte{9}, std::byte{8}, std::byte{7}, std::byte{6}};
         ack.cookie = cookie;
-        if (!send_batch(fd, encode_body(ack))) { ::close(fd); return; }
-        if (!recv_batch(fd)) { ::close(fd); return; } // OpenSyn
+        if (!send_batch(fd, encode_body(ack))) {
+            ::close(fd);
+            return;
+        }
+        if (!recv_batch(fd)) {
+            ::close(fd);
+            return;
+        } // OpenSyn
         OpenAck oack{};
         oack.lease = Duration::from_millis(10000);
         oack.sn = 0;
-        if (!send_batch(fd, encode_body(oack))) { ::close(fd); return; }
+        if (!send_batch(fd, encode_body(oack))) {
+            ::close(fd);
+            return;
+        }
 
         // The first data-phase batch from the client is the DeclareSubscriber.
         if (auto b = recv_batch(fd)) {
@@ -203,9 +215,7 @@ private:
     std::thread thread_;
 };
 
-auto endpoint(std::uint16_t port) -> std::string {
-    return "tcp/127.0.0.1:" + std::to_string(port);
-}
+auto endpoint(std::uint16_t port) -> std::string { return "tcp/127.0.0.1:" + std::to_string(port); }
 
 } // namespace
 
@@ -221,10 +231,16 @@ TEST("Subscriber::recv delivers pushed PUT samples in order and reports the key"
 
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber("demo/**");
     CHECK(sub.has_value());
-    if (!sub) { router.join(); return; }
+    if (!sub) {
+        router.join();
+        return;
+    }
 
     std::vector<std::string> keys;
     std::vector<std::string> vals;
@@ -250,11 +266,15 @@ TEST("Subscriber::recv delivers pushed PUT samples in order and reports the key"
 }
 
 TEST("Subscriber::recv surfaces a DELETE sample") {
-    SubRouter router(
-        [](int fd) { send_batch(fd, build_frame(7, [](ByteWriter& w) { del_msg(w, "demo/gone"); })); });
+    SubRouter router([](int fd) {
+        send_batch(fd, build_frame(7, [](ByteWriter& w) { del_msg(w, "demo/gone"); }));
+    });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber("demo/**");
     CHECK(sub.has_value());
 
@@ -279,7 +299,10 @@ TEST("run()/run_once() drive a callback subscriber") {
     });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
 
     std::vector<std::string> seen;
     auto sub = sess->declare_subscriber(
@@ -306,8 +329,8 @@ TEST("the resmap resolves a router-declared numeric keyexpr id") {
                        Declare d{};
                        DeclareKeyExpr dk{};
                        dk.id = 7;
-                       dk.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::receiver,
-                                               .suffix = "demo/x"};
+                       dk.wire_expr =
+                           WireExpr{.scope = 0, .mapping = Mapping::receiver, .suffix = "demo/x"};
                        d.body = DeclareBody{.body = dk};
                        (void)d.encode(w);
                    }));
@@ -315,7 +338,10 @@ TEST("the resmap resolves a router-declared numeric keyexpr id") {
     });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber("demo/**");
     CHECK(sub.has_value());
 
@@ -340,7 +366,10 @@ TEST("a small strand resumes mid-frame across recv() (backpressure)") {
     });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber("demo/**", SubscriberOptions{.capacity = 1});
     CHECK(sub.has_value());
 
@@ -367,7 +396,10 @@ TEST("a last_value subscriber conflates same-key samples under backpressure") {
     });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber(
         "demo/**", SubscriberOptions{.capacity = 2, .mode = StrandMode::last_value});
     CHECK(sub.has_value());
@@ -394,7 +426,10 @@ TEST("a malformed frame faults the subscriber permanently (sticky)") {
     });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber("demo/**");
     CHECK(sub.has_value());
 
@@ -410,7 +445,10 @@ TEST("Subscriber::recv reports connection_closed on EOF") {
     SubRouter router([](int) { /* push nothing, just close */ });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber("demo/**");
     CHECK(sub.has_value());
     auto s = sub->recv();
@@ -422,7 +460,10 @@ TEST("a second subscriber on one session is rejected") {
     SubRouter router([](int) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto s1 = sess->declare_subscriber("a/**");
     CHECK(s1.has_value());
     auto s2 = sess->declare_subscriber("b/**");
@@ -443,7 +484,10 @@ TEST("an idle subscriber emits a KeepAlive within the lease") {
     });
     auto sess = Session::open(endpoint(router.port()));
     CHECK(sess.has_value());
-    if (!sess) { router.join(); return; }
+    if (!sess) {
+        router.join();
+        return;
+    }
     auto sub = sess->declare_subscriber("demo/**");
     CHECK(sub.has_value());
 

@@ -1,0 +1,14 @@
+# Code style for the zenoh C++23 codebase: LLVM as the base, with a 4-space indent
+# and a 100-column limit, matching the project's hand-written conventions (left-
+# aligned pointers/references, short single-statement `if`/loops kept on one line).
+Language: Cpp
+Standard: Latest
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+PointerAlignment: Left
+ReferenceAlignment: Left
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: All
+SpaceAfterCStyleCast: false

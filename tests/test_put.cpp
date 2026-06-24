@@ -18,8 +18,7 @@ namespace {
 
 // Encode `value`, decode it back, and check structural equality + that decode
 // consumed exactly the bytes encode produced.
-template <class T>
-auto roundtrip(const T& value) -> void {
+template <class T> auto roundtrip(const T& value) -> void {
     std::array<std::byte, 512> buf{};
     ByteWriter w{buf};
     CHECK(value.encode(w).has_value());
@@ -75,7 +74,8 @@ TEST("Put with timestamp + encoding round-trips") {
 }
 
 TEST("Put with source-info and attachment extensions round-trips") {
-    std::array<std::byte, 5> att{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}, std::byte{5}};
+    std::array<std::byte, 5> att{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4},
+                                 std::byte{5}};
     std::array<std::byte, 1> pl{std::byte{0x42}};
 
     SourceInfo si{};

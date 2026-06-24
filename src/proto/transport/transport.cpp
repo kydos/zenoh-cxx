@@ -82,12 +82,15 @@ auto InitAck::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
 
     // Extensions, ascending id; `more` = any later extension is present.
     if (e_qos)
-        ZTRY(put_ext_unit(w, 0x1, false, e_qoslink || e_auth || e_mlink || e_lowlat || e_comp || e_patch));
+        ZTRY(put_ext_unit(w, 0x1, false,
+                          e_qoslink || e_auth || e_mlink || e_lowlat || e_comp || e_patch));
     if (e_qoslink)
-        ZTRY(put_ext_u64(w, 0x1, false, e_auth || e_mlink || e_lowlat || e_comp || e_patch, qos_link->qos));
+        ZTRY(put_ext_u64(w, 0x1, false, e_auth || e_mlink || e_lowlat || e_comp || e_patch,
+                         qos_link->qos));
     if (e_auth)
         ZTRY(put_ext_zstruct(w, 0x3, false, e_mlink || e_lowlat || e_comp || e_patch,
-                             auth->payload.size(), [&](auto& ww) { return put_raw(ww, auth->payload); }));
+                             auth->payload.size(),
+                             [&](auto& ww) { return put_raw(ww, auth->payload); }));
     if (e_mlink)
         ZTRY(put_ext_zstruct(w, 0x4, false, e_lowlat || e_comp || e_patch, mlink->payload.size(),
                              [&](auto& ww) { return put_raw(ww, mlink->payload); }));
@@ -113,24 +116,36 @@ auto InitAck::decode(ByteReader& r) noexcept -> std::expected<InitAck, CodecErro
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1: // qos (Unit) and qos_link (U64) share this id
-                if (eh.kind == ExtKind::unit) {
-                    ZTRY(read_ext_unit(r));
-                    a.qos = HasQoS{};
-                } else if (eh.kind == ExtKind::u64) {
-                    a.qos_link = QoSLink{ZTRY(read_ext_u64(r))};
-                } else {
-                    ZTRY(skip_ext(r, eh.kind));
-                }
-                break;
-            case 0x3: a.auth = Auth{ZTRY(read_ext_zstruct(r))}; break;
-            case 0x4: a.mlink = MultiLink{ZTRY(read_ext_zstruct(r))}; break;
-            case 0x5: ZTRY(read_ext_unit(r)); a.lowlatency = HasLowLatency{}; break;
-            case 0x6: ZTRY(read_ext_unit(r)); a.compression = HasCompression{}; break;
-            case 0x7: a.patch.value = ZTRY(read_ext_uint<std::uint8_t>(r)); break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
+        case 0x1: // qos (Unit) and qos_link (U64) share this id
+            if (eh.kind == ExtKind::unit) {
+                ZTRY(read_ext_unit(r));
+                a.qos = HasQoS{};
+            } else if (eh.kind == ExtKind::u64) {
+                a.qos_link = QoSLink{ZTRY(read_ext_u64(r))};
+            } else {
                 ZTRY(skip_ext(r, eh.kind));
+            }
+            break;
+        case 0x3:
+            a.auth = Auth{ZTRY(read_ext_zstruct(r))};
+            break;
+        case 0x4:
+            a.mlink = MultiLink{ZTRY(read_ext_zstruct(r))};
+            break;
+        case 0x5:
+            ZTRY(read_ext_unit(r));
+            a.lowlatency = HasLowLatency{};
+            break;
+        case 0x6:
+            ZTRY(read_ext_unit(r));
+            a.compression = HasCompression{};
+            break;
+        case 0x7:
+            a.patch.value = ZTRY(read_ext_uint<std::uint8_t>(r));
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }
@@ -157,12 +172,15 @@ auto InitSyn::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     if (s) ZTRY(resolution.encode(w));
 
     if (e_qos)
-        ZTRY(put_ext_unit(w, 0x1, false, e_qoslink || e_auth || e_mlink || e_lowlat || e_comp || e_patch));
+        ZTRY(put_ext_unit(w, 0x1, false,
+                          e_qoslink || e_auth || e_mlink || e_lowlat || e_comp || e_patch));
     if (e_qoslink)
-        ZTRY(put_ext_u64(w, 0x1, false, e_auth || e_mlink || e_lowlat || e_comp || e_patch, qos_link->qos));
+        ZTRY(put_ext_u64(w, 0x1, false, e_auth || e_mlink || e_lowlat || e_comp || e_patch,
+                         qos_link->qos));
     if (e_auth)
         ZTRY(put_ext_zstruct(w, 0x3, false, e_mlink || e_lowlat || e_comp || e_patch,
-                             auth->payload.size(), [&](auto& ww) { return put_raw(ww, auth->payload); }));
+                             auth->payload.size(),
+                             [&](auto& ww) { return put_raw(ww, auth->payload); }));
     if (e_mlink)
         ZTRY(put_ext_zstruct(w, 0x4, false, e_lowlat || e_comp || e_patch, mlink->payload.size(),
                              [&](auto& ww) { return put_raw(ww, mlink->payload); }));
@@ -186,24 +204,36 @@ auto InitSyn::decode(ByteReader& r) noexcept -> std::expected<InitSyn, CodecErro
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1:
-                if (eh.kind == ExtKind::unit) {
-                    ZTRY(read_ext_unit(r));
-                    a.qos = HasQoS{};
-                } else if (eh.kind == ExtKind::u64) {
-                    a.qos_link = QoSLink{ZTRY(read_ext_u64(r))};
-                } else {
-                    ZTRY(skip_ext(r, eh.kind));
-                }
-                break;
-            case 0x3: a.auth = Auth{ZTRY(read_ext_zstruct(r))}; break;
-            case 0x4: a.mlink = MultiLink{ZTRY(read_ext_zstruct(r))}; break;
-            case 0x5: ZTRY(read_ext_unit(r)); a.lowlatency = HasLowLatency{}; break;
-            case 0x6: ZTRY(read_ext_unit(r)); a.compression = HasCompression{}; break;
-            case 0x7: a.patch.value = ZTRY(read_ext_uint<std::uint8_t>(r)); break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
+        case 0x1:
+            if (eh.kind == ExtKind::unit) {
+                ZTRY(read_ext_unit(r));
+                a.qos = HasQoS{};
+            } else if (eh.kind == ExtKind::u64) {
+                a.qos_link = QoSLink{ZTRY(read_ext_u64(r))};
+            } else {
                 ZTRY(skip_ext(r, eh.kind));
+            }
+            break;
+        case 0x3:
+            a.auth = Auth{ZTRY(read_ext_zstruct(r))};
+            break;
+        case 0x4:
+            a.mlink = MultiLink{ZTRY(read_ext_zstruct(r))};
+            break;
+        case 0x5:
+            ZTRY(read_ext_unit(r));
+            a.lowlatency = HasLowLatency{};
+            break;
+        case 0x6:
+            ZTRY(read_ext_unit(r));
+            a.compression = HasCompression{};
+            break;
+        case 0x7:
+            a.patch.value = ZTRY(read_ext_uint<std::uint8_t>(r));
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }
@@ -213,7 +243,8 @@ auto InitSyn::decode(ByteReader& r) noexcept -> std::expected<InitSyn, CodecErro
 // --- Close / KeepAlive ---
 
 auto Close::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
-    auto const h = static_cast<std::uint8_t>(id | (behaviour == CloseBehaviour::session ? flag_s : 0));
+    auto const h =
+        static_cast<std::uint8_t>(id | (behaviour == CloseBehaviour::session ? flag_s : 0));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     return w.write_byte(static_cast<std::byte>(reason));
 }
@@ -259,10 +290,12 @@ auto FrameHeader::decode(ByteReader& r) noexcept -> std::expected<FrameHeader, C
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1: f.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r)); break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
-                ZTRY(skip_ext(r, eh.kind));
+        case 0x1:
+            f.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r));
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }
@@ -290,7 +323,8 @@ auto OpenSyn::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     if (e_qos) ZTRY(put_ext_unit(w, 0x1, false, e_auth || e_msyn || e_mack || e_lowlat || e_comp));
     if (e_auth)
         ZTRY(put_ext_zstruct(w, 0x3, false, e_msyn || e_mack || e_lowlat || e_comp,
-                             auth->payload.size(), [&](auto& ww) { return put_raw(ww, auth->payload); }));
+                             auth->payload.size(),
+                             [&](auto& ww) { return put_raw(ww, auth->payload); }));
     if (e_msyn)
         ZTRY(put_ext_zstruct(w, 0x4, false, e_mack || e_lowlat || e_comp, mlink_syn->payload.size(),
                              [&](auto& ww) { return put_raw(ww, mlink_syn->payload); }));
@@ -314,23 +348,34 @@ auto OpenSyn::decode(ByteReader& r) noexcept -> std::expected<OpenSyn, CodecErro
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1: ZTRY(read_ext_unit(r)); o.qos = HasQoS{}; break;
-            case 0x3: o.auth = Auth{ZTRY(read_ext_zstruct(r))}; break;
-            case 0x4: // mlink_syn (ZStruct) vs mlink_ack (Unit)
-                if (eh.kind == ExtKind::zstruct) {
-                    o.mlink_syn = MultiLinkSyn{ZTRY(read_ext_zstruct(r))};
-                } else if (eh.kind == ExtKind::unit) {
-                    ZTRY(read_ext_unit(r));
-                    o.mlink_ack = HasMultiLinkAck{};
-                } else {
-                    ZTRY(skip_ext(r, eh.kind));
-                }
-                break;
-            case 0x5: ZTRY(read_ext_unit(r)); o.lowlatency = HasLowLatency{}; break;
-            case 0x6: ZTRY(read_ext_unit(r)); o.compression = HasCompression{}; break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
+        case 0x1:
+            ZTRY(read_ext_unit(r));
+            o.qos = HasQoS{};
+            break;
+        case 0x3:
+            o.auth = Auth{ZTRY(read_ext_zstruct(r))};
+            break;
+        case 0x4: // mlink_syn (ZStruct) vs mlink_ack (Unit)
+            if (eh.kind == ExtKind::zstruct) {
+                o.mlink_syn = MultiLinkSyn{ZTRY(read_ext_zstruct(r))};
+            } else if (eh.kind == ExtKind::unit) {
+                ZTRY(read_ext_unit(r));
+                o.mlink_ack = HasMultiLinkAck{};
+            } else {
                 ZTRY(skip_ext(r, eh.kind));
+            }
+            break;
+        case 0x5:
+            ZTRY(read_ext_unit(r));
+            o.lowlatency = HasLowLatency{};
+            break;
+        case 0x6:
+            ZTRY(read_ext_unit(r));
+            o.compression = HasCompression{};
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }
@@ -355,7 +400,8 @@ auto OpenAck::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     if (e_qos) ZTRY(put_ext_unit(w, 0x1, false, e_auth || e_msyn || e_mack || e_lowlat || e_comp));
     if (e_auth)
         ZTRY(put_ext_zstruct(w, 0x3, false, e_msyn || e_mack || e_lowlat || e_comp,
-                             auth->payload.size(), [&](auto& ww) { return put_raw(ww, auth->payload); }));
+                             auth->payload.size(),
+                             [&](auto& ww) { return put_raw(ww, auth->payload); }));
     if (e_msyn)
         ZTRY(put_ext_zstruct(w, 0x4, false, e_mack || e_lowlat || e_comp, mlink_syn->payload.size(),
                              [&](auto& ww) { return put_raw(ww, mlink_syn->payload); }));
@@ -378,23 +424,34 @@ auto OpenAck::decode(ByteReader& r) noexcept -> std::expected<OpenAck, CodecErro
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1: ZTRY(read_ext_unit(r)); o.qos = HasQoS{}; break;
-            case 0x3: o.auth = Auth{ZTRY(read_ext_zstruct(r))}; break;
-            case 0x4:
-                if (eh.kind == ExtKind::zstruct) {
-                    o.mlink_syn = MultiLinkSyn{ZTRY(read_ext_zstruct(r))};
-                } else if (eh.kind == ExtKind::unit) {
-                    ZTRY(read_ext_unit(r));
-                    o.mlink_ack = HasMultiLinkAck{};
-                } else {
-                    ZTRY(skip_ext(r, eh.kind));
-                }
-                break;
-            case 0x5: ZTRY(read_ext_unit(r)); o.lowlatency = HasLowLatency{}; break;
-            case 0x6: ZTRY(read_ext_unit(r)); o.compression = HasCompression{}; break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
+        case 0x1:
+            ZTRY(read_ext_unit(r));
+            o.qos = HasQoS{};
+            break;
+        case 0x3:
+            o.auth = Auth{ZTRY(read_ext_zstruct(r))};
+            break;
+        case 0x4:
+            if (eh.kind == ExtKind::zstruct) {
+                o.mlink_syn = MultiLinkSyn{ZTRY(read_ext_zstruct(r))};
+            } else if (eh.kind == ExtKind::unit) {
+                ZTRY(read_ext_unit(r));
+                o.mlink_ack = HasMultiLinkAck{};
+            } else {
                 ZTRY(skip_ext(r, eh.kind));
+            }
+            break;
+        case 0x5:
+            ZTRY(read_ext_unit(r));
+            o.lowlatency = HasLowLatency{};
+            break;
+        case 0x6:
+            ZTRY(read_ext_unit(r));
+            o.compression = HasCompression{};
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }

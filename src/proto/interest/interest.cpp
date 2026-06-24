@@ -73,16 +73,20 @@ auto Interest::decode(ByteReader& r) noexcept -> std::expected<Interest, CodecEr
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1: it.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r)); break;
-            case 0x2: {
-                ByteReader sub{ZTRY(read_ext_zstruct(r))};
-                it.timestamp = ZTRY(Timestamp::decode(sub));
-                break;
-            }
-            case 0x3: it.nodeid.node_id = ZTRY(read_ext_uint<std::uint16_t>(r)); break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
-                ZTRY(skip_ext(r, eh.kind));
+        case 0x1:
+            it.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r));
+            break;
+        case 0x2: {
+            ByteReader sub{ZTRY(read_ext_zstruct(r))};
+            it.timestamp = ZTRY(Timestamp::decode(sub));
+            break;
+        }
+        case 0x3:
+            it.nodeid.node_id = ZTRY(read_ext_uint<std::uint16_t>(r));
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }
@@ -109,7 +113,8 @@ auto InterestFinal::encode(ByteWriter& w) const noexcept -> std::expected<void, 
 
 auto InterestFinal::decode(ByteReader& r) noexcept -> std::expected<InterestFinal, CodecError> {
     std::uint8_t const h = std::to_integer<std::uint8_t>(ZTRY(r.read_byte()));
-    if ((h & mid_mask) != mid || (h & mode_mask) != 0) return std::unexpected(CodecError::malformed);
+    if ((h & mid_mask) != mid || (h & mode_mask) != 0)
+        return std::unexpected(CodecError::malformed);
     bool has_ext = (h & flag_z) != 0;
 
     InterestFinal it{};
@@ -117,16 +122,20 @@ auto InterestFinal::decode(ByteReader& r) noexcept -> std::expected<InterestFina
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1: it.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r)); break;
-            case 0x2: {
-                ByteReader sub{ZTRY(read_ext_zstruct(r))};
-                it.timestamp = ZTRY(Timestamp::decode(sub));
-                break;
-            }
-            case 0x3: it.nodeid.node_id = ZTRY(read_ext_uint<std::uint16_t>(r)); break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
-                ZTRY(skip_ext(r, eh.kind));
+        case 0x1:
+            it.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r));
+            break;
+        case 0x2: {
+            ByteReader sub{ZTRY(read_ext_zstruct(r))};
+            it.timestamp = ZTRY(Timestamp::decode(sub));
+            break;
+        }
+        case 0x3:
+            it.nodeid.node_id = ZTRY(read_ext_uint<std::uint16_t>(r));
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }

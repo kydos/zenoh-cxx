@@ -73,7 +73,8 @@ auto DeclareKeyExpr::decode(ByteReader& r) noexcept -> std::expected<DeclareKeyE
     if ((h & mid_mask) != mid) return std::unexpected(CodecError::malformed);
     DeclareKeyExpr d{};
     d.id = ZTRY(get_uint_as<std::uint16_t>(r));
-    d.wire_expr = ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
+    d.wire_expr =
+        ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
     return d;
 }
 
@@ -82,7 +83,8 @@ auto UndeclareKeyExpr::encode(ByteWriter& w) const noexcept -> std::expected<voi
     return put_uint(w, id);
 }
 
-auto UndeclareKeyExpr::decode(ByteReader& r) noexcept -> std::expected<UndeclareKeyExpr, CodecError> {
+auto UndeclareKeyExpr::decode(ByteReader& r) noexcept
+    -> std::expected<UndeclareKeyExpr, CodecError> {
     std::uint8_t const h = std::to_integer<std::uint8_t>(ZTRY(r.read_byte()));
     if ((h & mid_mask) != mid) return std::unexpected(CodecError::malformed);
     UndeclareKeyExpr d{};
@@ -98,12 +100,14 @@ auto DeclareSubscriber::encode(ByteWriter& w) const noexcept -> std::expected<vo
     return wire_expr.encode_body(w);
 }
 
-auto DeclareSubscriber::decode(ByteReader& r) noexcept -> std::expected<DeclareSubscriber, CodecError> {
+auto DeclareSubscriber::decode(ByteReader& r) noexcept
+    -> std::expected<DeclareSubscriber, CodecError> {
     std::uint8_t const h = std::to_integer<std::uint8_t>(ZTRY(r.read_byte()));
     if ((h & mid_mask) != mid) return std::unexpected(CodecError::malformed);
     DeclareSubscriber d{};
     d.id = ZTRY(get_uint_as<std::uint32_t>(r));
-    d.wire_expr = ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
+    d.wire_expr =
+        ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
     return d;
 }
 
@@ -111,7 +115,8 @@ auto UndeclareSubscriber::encode(ByteWriter& w) const noexcept -> std::expected<
     return put_optional_wire_expr_ext(w, mid, id, wire_expr);
 }
 
-auto UndeclareSubscriber::decode(ByteReader& r) noexcept -> std::expected<UndeclareSubscriber, CodecError> {
+auto UndeclareSubscriber::decode(ByteReader& r) noexcept
+    -> std::expected<UndeclareSubscriber, CodecError> {
     auto const [id, we] = ZTRY(get_id_and_optional_wire_expr(r, mid));
     return UndeclareSubscriber{.id = id, .wire_expr = we};
 }
@@ -128,13 +133,15 @@ auto DeclareQueryable::encode(ByteWriter& w) const noexcept -> std::expected<voi
     return {};
 }
 
-auto DeclareQueryable::decode(ByteReader& r) noexcept -> std::expected<DeclareQueryable, CodecError> {
+auto DeclareQueryable::decode(ByteReader& r) noexcept
+    -> std::expected<DeclareQueryable, CodecError> {
     std::uint8_t const h = std::to_integer<std::uint8_t>(ZTRY(r.read_byte()));
     if ((h & mid_mask) != mid) return std::unexpected(CodecError::malformed);
     bool has_ext = (h & declare_flag::z) != 0;
     DeclareQueryable d{};
     d.id = ZTRY(get_uint_as<std::uint32_t>(r));
-    d.wire_expr = ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
+    d.wire_expr =
+        ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         if (eh.id == 0x1) {
@@ -153,7 +160,8 @@ auto UndeclareQueryable::encode(ByteWriter& w) const noexcept -> std::expected<v
     return put_optional_wire_expr_ext(w, mid, id, wire_expr);
 }
 
-auto UndeclareQueryable::decode(ByteReader& r) noexcept -> std::expected<UndeclareQueryable, CodecError> {
+auto UndeclareQueryable::decode(ByteReader& r) noexcept
+    -> std::expected<UndeclareQueryable, CodecError> {
     auto const [id, we] = ZTRY(get_id_and_optional_wire_expr(r, mid));
     return UndeclareQueryable{.id = id, .wire_expr = we};
 }
@@ -171,7 +179,8 @@ auto DeclareToken::decode(ByteReader& r) noexcept -> std::expected<DeclareToken,
     if ((h & mid_mask) != mid) return std::unexpected(CodecError::malformed);
     DeclareToken d{};
     d.id = ZTRY(get_uint_as<std::uint32_t>(r));
-    d.wire_expr = ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
+    d.wire_expr =
+        ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
     return d;
 }
 
@@ -201,8 +210,8 @@ auto Declare::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_nid = !(nodeid == NodeId{});
     bool const z = e_qos || e_ts || e_nid;
 
-    auto const h = static_cast<std::uint8_t>(mid | (z ? declare_flag::z : 0) |
-                                             (has_id ? declare_flag::i : 0));
+    auto const h =
+        static_cast<std::uint8_t>(mid | (z ? declare_flag::z : 0) | (has_id ? declare_flag::i : 0));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     if (has_id) ZTRY(put_uint(w, *id));
 
@@ -226,16 +235,20 @@ auto Declare::decode(ByteReader& r) noexcept -> std::expected<Declare, CodecErro
     while (has_ext) {
         auto const eh = ZTRY(peek_ext_header(r));
         switch (eh.id) {
-            case 0x1: d.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r)); break;
-            case 0x2: {
-                ByteReader sub{ZTRY(read_ext_zstruct(r))};
-                d.timestamp = ZTRY(Timestamp::decode(sub));
-                break;
-            }
-            case 0x3: d.nodeid.node_id = ZTRY(read_ext_uint<std::uint16_t>(r)); break;
-            default:
-                if (eh.mandatory) return std::unexpected(CodecError::malformed);
-                ZTRY(skip_ext(r, eh.kind));
+        case 0x1:
+            d.qos.inner = ZTRY(read_ext_uint<std::uint8_t>(r));
+            break;
+        case 0x2: {
+            ByteReader sub{ZTRY(read_ext_zstruct(r))};
+            d.timestamp = ZTRY(Timestamp::decode(sub));
+            break;
+        }
+        case 0x3:
+            d.nodeid.node_id = ZTRY(read_ext_uint<std::uint16_t>(r));
+            break;
+        default:
+            if (eh.mandatory) return std::unexpected(CodecError::malformed);
+            ZTRY(skip_ext(r, eh.kind));
         }
         has_ext = eh.more;
     }

@@ -29,10 +29,12 @@ auto EntityGlobalId::encode_body(ByteWriter& w) const noexcept -> std::expected<
     return put_uint(w, eid);
 }
 
-auto EntityGlobalId::decode_body(ByteReader& r) noexcept -> std::expected<EntityGlobalId, CodecError> {
+auto EntityGlobalId::decode_body(ByteReader& r) noexcept
+    -> std::expected<EntityGlobalId, CodecError> {
     EntityGlobalId g{};
     auto const h = ZTRY(r.read_byte());
-    std::uint8_t const zlen = static_cast<std::uint8_t>((std::to_integer<std::uint8_t>(h) >> 4) + 1);
+    std::uint8_t const zlen =
+        static_cast<std::uint8_t>((std::to_integer<std::uint8_t>(h) >> 4) + 1);
     auto const s = ZTRY(r.read_slice(zlen));
     g.zid.len = zlen;
     std::ranges::copy(s, g.zid.bytes.begin());

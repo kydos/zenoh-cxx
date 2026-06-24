@@ -45,7 +45,7 @@ enum class PostResult : std::uint8_t {
 
 /// A bounded, optionally key-conflating FIFO for one subscriber. Move-only.
 template <class T> class Strand {
-public:
+  public:
     /// Build a strand holding at most `capacity` entries (clamped to ≥1) with the given
     /// delivery `mode`.
     explicit Strand(std::size_t capacity, StrandMode mode = StrandMode::ordered)
@@ -107,7 +107,7 @@ public:
     [[nodiscard]] auto capacity() const noexcept -> std::size_t { return capacity_; }
     [[nodiscard]] auto mode() const noexcept -> StrandMode { return mode_; }
 
-private:
+  private:
     struct Node {
         T value;
         std::string key; ///< populated only in last_value mode (else empty, no alloc)

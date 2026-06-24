@@ -22,15 +22,13 @@ using namespace zenoh;
 
 namespace {
 
-template <class T>
-auto rejects(std::span<const std::byte> bytes) -> bool {
+template <class T> auto rejects(std::span<const std::byte> bytes) -> bool {
     ByteReader r{bytes};
     return !T::decode(r).has_value();
 }
 
 // Encode a value into an owned byte vector (oversized scratch, trimmed to written).
-template <class T>
-auto encoded(const T& value) -> std::vector<std::byte> {
+template <class T> auto encoded(const T& value) -> std::vector<std::byte> {
     std::array<std::byte, 512> buf{};
     ByteWriter w{buf};
     auto const ok = value.encode(w).has_value();
@@ -40,8 +38,7 @@ auto encoded(const T& value) -> std::vector<std::byte> {
 
 // Decode every prefix of `bytes` as T. Any result is fine; the point is that none
 // of them crash or read past the end (ASan/UBSan enforce that).
-template <class T>
-auto truncation_sweep(std::span<const std::byte> bytes) -> void {
+template <class T> auto truncation_sweep(std::span<const std::byte> bytes) -> void {
     for (std::size_t n = 0; n <= bytes.size(); ++n) {
         ByteReader r{bytes.subspan(0, n)};
         auto result = T::decode(r);
@@ -122,8 +119,8 @@ TEST("decoders reject non-UTF-8 text fields") {
 
 TEST("truncation sweeps never crash or read out of bounds") {
     // A Put carrying timestamp, encoding, source-info, attachment and payload.
-    static constexpr std::array<std::byte, 4> schema{std::byte{'j'}, std::byte{'s'},
-                                                     std::byte{'o'}, std::byte{'n'}};
+    static constexpr std::array<std::byte, 4> schema{std::byte{'j'}, std::byte{'s'}, std::byte{'o'},
+                                                     std::byte{'n'}};
     static constexpr std::array<std::byte, 3> att{std::byte{1}, std::byte{2}, std::byte{3}};
     static constexpr std::array<std::byte, 2> pl{std::byte{0xAA}, std::byte{0xBB}};
     Put put{};

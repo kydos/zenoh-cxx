@@ -46,7 +46,7 @@ enum class SampleKind : std::uint8_t { put, del };
 /// borrow-only views — PLAN.md D2), so a `Sample` is valid independently of the
 /// session and outlives the next `recv`/`run`. Value type (copyable, movable).
 class Sample {
-public:
+  public:
     Sample() = default;
     Sample(std::string key, std::vector<std::byte> payload, SampleKind kind)
         : key_(std::move(key)), payload_(std::move(payload)), kind_(kind) {}
@@ -58,7 +58,7 @@ public:
     /// Whether this is a put or a delete.
     [[nodiscard]] auto kind() const noexcept -> SampleKind { return kind_; }
 
-private:
+  private:
     std::string key_;
     std::vector<std::byte> payload_;
     SampleKind kind_ = SampleKind::put;
@@ -86,7 +86,7 @@ struct SubReg; // defined in session.cpp (holds the non-movable Strand + handler
 /// Move-only. NOTE (first cut): the receive path is single-threaded — do not pump from
 /// one thread while another publishes; serialize calls.
 class Session {
-public:
+  public:
     Session(const Session&) = delete;
     auto operator=(const Session&) -> Session& = delete;
     Session(Session&&) noexcept;
@@ -143,7 +143,7 @@ public:
     /// Send a Close and tear down the link. Idempotent.
     auto close() -> void;
 
-private:
+  private:
     friend class Batch;
     friend class Subscriber;
     Session() = default;
@@ -188,14 +188,14 @@ private:
     std::vector<std::byte> tx_pending_{}; ///< bytes encoded but not yet fully written
     std::size_t pending_off_ = 0;         ///< how much of tx_pending_ is already sent
 
-    std::vector<std::byte> rx_buf_{};     ///< current received TCP batch
-    std::size_t rx_pos_ = 0;              ///< dispatch cursor into rx_buf_ (frame body)
-    std::size_t rx_end_ = 0;              ///< end of the in-progress frame body (==pos: none)
+    std::vector<std::byte> rx_buf_{}; ///< current received TCP batch
+    std::size_t rx_pos_ = 0;          ///< dispatch cursor into rx_buf_ (frame body)
+    std::size_t rx_end_ = 0;          ///< end of the in-progress frame body (==pos: none)
     std::unordered_map<std::uint16_t, std::string> resmap_; ///< router keyexpr id -> key
-    std::optional<ZError> fault_{};       ///< sticky terminal fault (stream desynced)
-    std::uint32_t next_entity_id_ = 0;    ///< monotonic subscriber/entity id
-    std::int32_t keepalive_ms_ = 2500;    ///< idle keepalive cadence (negotiated lease / 4)
-    std::unique_ptr<SubReg> sub_{};       ///< the single active subscriber (first cut)
+    std::optional<ZError> fault_{};    ///< sticky terminal fault (stream desynced)
+    std::uint32_t next_entity_id_ = 0; ///< monotonic subscriber/entity id
+    std::int32_t keepalive_ms_ = 2500; ///< idle keepalive cadence (negotiated lease / 4)
+    std::unique_ptr<SubReg> sub_{};    ///< the single active subscriber (first cut)
 };
 
 /// An API-level publish batch: accumulates `put`s into a single Frame (one SN, many
@@ -208,7 +208,7 @@ private:
 /// remaining messages best-effort (errors are swallowed — call `flush()` explicitly
 /// if you need to observe them).
 class Batch {
-public:
+  public:
     Batch(const Batch&) = delete;
     auto operator=(const Batch&) -> Batch& = delete;
     Batch(Batch&& other) noexcept;
@@ -229,7 +229,7 @@ public:
     /// Whether nothing is buffered.
     [[nodiscard]] auto empty() const noexcept -> bool { return count_ == 0; }
 
-private:
+  private:
     friend class Session;
     explicit Batch(Session* session) noexcept : session_(session) {}
 
@@ -244,7 +244,7 @@ private:
 /// best-effort. Pull samples with `recv()` (pull-based subscribers), or let the
 /// session's `run()`/`run_once()` invoke the handler (callback subscribers).
 class Subscriber {
-public:
+  public:
     Subscriber(const Subscriber&) = delete;
     auto operator=(const Subscriber&) -> Subscriber& = delete;
     Subscriber(Subscriber&& other) noexcept;
@@ -263,7 +263,7 @@ public:
     /// The key expression this subscriber was declared on.
     [[nodiscard]] auto key_expr() const noexcept -> std::string_view;
 
-private:
+  private:
     friend class Session;
     explicit Subscriber(Session* session) noexcept : session_(session) {}
 

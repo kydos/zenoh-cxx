@@ -11,9 +11,9 @@ import zenoh.proto; // messages + ByteReader/ByteWriter + load_le/store_le
 #include "ztest.hpp"
 
 #include <array>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
-#include <csignal>
 #include <optional>
 #include <span>
 #include <string>
@@ -23,12 +23,12 @@ import zenoh.proto; // messages + ByteReader/ByteWriter + load_le/store_le
 #include <vector>
 
 #include <arpa/inet.h>
+#include <cerrno>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <cerrno>
 
 using namespace zenoh;
 
@@ -39,8 +39,7 @@ auto bytes(std::string_view s) -> std::span<const std::byte> {
 }
 
 // Encode a message body (no batch length prefix) into an owned buffer.
-template <class Msg>
-auto encode_body(const Msg& m) -> std::vector<std::byte> {
+template <class Msg> auto encode_body(const Msg& m) -> std::vector<std::byte> {
     std::vector<std::byte> buf(512);
     ByteWriter w{buf};
     (void)m.encode(w);
@@ -98,7 +97,7 @@ struct Sample {
 
 // A minimal in-process Zenoh router for one client connection.
 class FakeRouter {
-public:
+  public:
     explicit FakeRouter(std::uint16_t batch_size = 64) : batch_size_(batch_size) {
         std::signal(SIGPIPE, SIG_IGN);
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -129,7 +128,7 @@ public:
 
     [[nodiscard]] auto samples() const -> const std::vector<Sample>& { return samples_; }
 
-private:
+  private:
     auto run() -> void {
         pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
         if (::poll(&pfd, 1, 5000) <= 0) return; // no client connected
@@ -139,25 +138,38 @@ private:
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         // --- handshake ---
-        if (!recv_batch(fd)) { ::close(fd); return; } // InitSyn (consume)
+        if (!recv_batch(fd)) {
+            ::close(fd);
+            return;
+        } // InitSyn (consume)
 
         InitAck ack{};
         ack.version = 9;
         ack.identifier.whatami = WhatAmI::router;
         ack.identifier.zid.len = 4;
-        ack.identifier.zid.bytes = {std::byte{0xA1}, std::byte{0xA2}, std::byte{0xA3}, std::byte{0xA4}};
+        ack.identifier.zid.bytes = {std::byte{0xA1}, std::byte{0xA2}, std::byte{0xA3},
+                                    std::byte{0xA4}};
         ack.resolution.resolution = 0x0a;
         ack.resolution.batch_size = batch_size_;
         std::array<std::byte, 4> cookie{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
         ack.cookie = cookie;
-        if (!send_batch(fd, encode_body(ack))) { ::close(fd); return; }
+        if (!send_batch(fd, encode_body(ack))) {
+            ::close(fd);
+            return;
+        }
 
-        if (!recv_batch(fd)) { ::close(fd); return; } // OpenSyn (consume)
+        if (!recv_batch(fd)) {
+            ::close(fd);
+            return;
+        } // OpenSyn (consume)
 
         OpenAck oack{};
         oack.lease = Duration::from_millis(10000);
         oack.sn = 0;
-        if (!send_batch(fd, encode_body(oack))) { ::close(fd); return; }
+        if (!send_batch(fd, encode_body(oack))) {
+            ::close(fd);
+            return;
+        }
 
         // --- data phase ---
         for (;;) {
@@ -194,9 +206,7 @@ private:
     std::vector<Sample> samples_;
 };
 
-auto endpoint(std::uint16_t port) -> std::string {
-    return "tcp/127.0.0.1:" + std::to_string(port);
-}
+auto endpoint(std::uint16_t port) -> std::string { return "tcp/127.0.0.1:" + std::to_string(port); }
 
 } // namespace
 

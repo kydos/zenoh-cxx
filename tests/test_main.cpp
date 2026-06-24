@@ -1,5 +1,3 @@
 #include "ztest.hpp"
 
-auto main() -> int {
-    return ztest::run();
-}
+auto main() -> int { return ztest::run(); }

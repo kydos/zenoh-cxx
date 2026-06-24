@@ -86,13 +86,13 @@ auto main(int argc, char** argv) -> int {
 
     // Payload of `payload_size` bytes: data[i] = i % 10 (matches the reference).
     std::vector<std::byte> data(static_cast<std::size_t>(payload_size));
-    for (std::size_t i = 0; i < data.size(); ++i)
-        data[i] = static_cast<std::byte>(i % 10);
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = static_cast<std::byte>(i % 10);
     std::span<const std::byte> const payload{data};
 
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
-        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(), error_name(session.error()));
+        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
+                     error_name(session.error()));
         return 1;
     }
 

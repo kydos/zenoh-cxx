@@ -35,7 +35,7 @@ concept Writable = requires(W w, std::byte b, std::span<const std::byte> src) {
 /// returns a contiguous view into the source (no copy); decoded message fields
 /// borrow from it, so the source must outlive them.
 class ByteReader {
-public:
+  public:
     explicit ByteReader(std::span<const std::byte> data) noexcept
         : cur_(data.data()), end_(data.data() + data.size()) {}
 
@@ -82,14 +82,14 @@ public:
         return {};
     }
 
-private:
+  private:
     const std::byte* cur_;
     const std::byte* end_;
 };
 
 /// Writer over a borrowed `std::span<std::byte>` destination buffer.
 class ByteWriter {
-public:
+  public:
     explicit ByteWriter(std::span<std::byte> buf) noexcept
         : begin_(buf.data()), cur_(buf.data()), end_(buf.data() + buf.size()) {}
 
@@ -123,7 +123,7 @@ public:
         return {};
     }
 
-private:
+  private:
     std::byte* begin_;
     std::byte* cur_;
     std::byte* end_;
