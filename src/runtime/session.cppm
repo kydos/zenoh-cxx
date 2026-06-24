@@ -88,6 +88,14 @@ private:
     [[nodiscard]] auto encode_put(std::string_view key_expr, std::span<const std::byte> payload)
         -> std::expected<void, ZError>;
 
+    /// Like `encode_put` but writes only the frame *header* (FrameHeader + Push head +
+    /// payload length prefix) into `tx_scratch_`, with the batch length prefix already
+    /// sized for header + payload. The payload bytes are NOT copied — the caller emits
+    /// them via scatter-gather. Returns the framed header length within `tx_scratch_`.
+    [[nodiscard]] auto encode_put_head(std::string_view key_expr,
+                                       std::span<const std::byte> payload)
+        -> std::expected<std::size_t, ZError>;
+
     /// Try to drain `tx_pending_` without blocking. Returns `would_block` if bytes
     /// remain after the attempt.
     [[nodiscard]] auto flush_pending() -> std::expected<void, ZError>;

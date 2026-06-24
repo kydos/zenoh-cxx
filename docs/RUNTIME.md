@@ -59,6 +59,9 @@ cannot accept the bytes right now:
 
 - **`put`** blocks until the whole message is handed to the transport (polling
   `POLLOUT` on `EAGAIN`). Any bytes a prior `try_put` left buffered are flushed first.
+  It encodes only the frame header into a staging buffer and writes it together with
+  the borrowed payload via `writev` scatter-gather, so the payload is never copied
+  (see `Put::encode_head` / `Push::encode_head` in the codec).
 - **`try_put`** never blocks. It returns `ZError::would_block` only when the socket
   could not accept *any* bytes of the message (nothing sent), leaving the decision
   (drop, retry, back off) to the caller.

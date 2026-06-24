@@ -20,7 +20,9 @@ namespace zenoh {
 
 auto EntityGlobalId::encode_body(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     // The zid length (1..16) is stored as len-1 in the header's high nibble, so a
-    // 16-byte id fits in 4 bits. zid is never empty.
+    // 16-byte id fits in 4 bits. An empty id would underflow len-1 to 0xf (decoding
+    // back as 16) and silently corrupt the stream, so reject it.
+    if (zid.len == 0 || zid.len > 16) return std::unexpected(CodecError::malformed);
     std::uint8_t const nibble = static_cast<std::uint8_t>((zid.len - 1) & 0x0f);
     ZTRY(w.write_byte(static_cast<std::byte>(static_cast<std::uint8_t>(nibble << 4))));
     ZTRY(put_raw(w, zid.view()));

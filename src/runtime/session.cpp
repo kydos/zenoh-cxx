@@ -135,7 +135,10 @@ auto Session::open(std::string_view endpoint) -> std::expected<Session, ZError> 
         return std::unexpected(framed.error());
     }
 
-    std::vector<std::byte> cookie;
+    // The cookie is a view into rxbuf, which is not touched again until the OpenAck
+    // recv_batch below — and OpenSyn (which copies the cookie bytes out) is framed
+    // before that — so we can borrow it here instead of copying it into a vector.
+    std::span<const std::byte> cookie;
     if (auto len = recv_batch(s.link_, rxbuf); len) {
         ByteReader r{std::span(rxbuf).first(*len)};
         auto ack = InitAck::decode(r);
@@ -143,7 +146,7 @@ auto Session::open(std::string_view endpoint) -> std::expected<Session, ZError> 
         // Honor the router's batch size (it advertises an MTU below u16::MAX, e.g.
         // 65328): our batches, length prefix included, must not exceed it.
         s.batch_size_ = ack->resolution.batch_size;
-        cookie.assign(ack->cookie.begin(), ack->cookie.end());
+        cookie = ack->cookie;
     } else {
         return std::unexpected(len.error());
     }
@@ -200,6 +203,32 @@ auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> p
     return {};
 }
 
+auto Session::encode_put_head(std::string_view key_expr, std::span<const std::byte> payload)
+    -> std::expected<std::size_t, ZError> {
+    Push push{};
+    push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    Put put{};
+    put.payload = payload; // present only so the encoded length prefix is correct
+    push.payload = PushBody{.body = std::move(put)};
+
+    FrameHeader fh{};
+    fh.reliability = Reliability::reliable;
+    fh.sn = frame_sn_;
+
+    // Header only — no room reserved for the payload, which is sent via writev.
+    std::size_t const cap = 2 + key_expr.size() + 64;
+    if (tx_scratch_.size() < cap) tx_scratch_.resize(cap);
+
+    ByteWriter w{std::span(tx_scratch_).subspan(2)};
+    if (!fh.encode(w) || !push.encode_head(w)) return std::unexpected(ZError::encode_error);
+    std::size_t const head = w.written();
+    std::size_t const content = head + payload.size();
+    if (2 + content > batch_size_) return std::unexpected(ZError::encode_error);
+    // The batch length prefix covers the header *and* the not-yet-written payload.
+    store_le<std::uint16_t>(tx_scratch_.data(), static_cast<std::uint16_t>(content));
+    return 2 + head;
+}
+
 auto Session::flush_pending() -> std::expected<void, ZError> {
     if (pending_off_ >= tx_pending_.size()) {
         tx_pending_.clear();
@@ -228,10 +257,12 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload)
     tx_pending_.clear();
     pending_off_ = 0;
 
-    if (auto e = encode_put(key_expr, payload); !e) return std::unexpected(e.error());
-    std::size_t const framed = static_cast<std::size_t>(load_le<std::uint16_t>(tx_scratch_.data())) + 2;
+    // Scatter-gather: encode just the header into tx_scratch_ and write it together
+    // with the borrowed payload, so the payload is never copied into a staging buffer.
+    auto const head = encode_put_head(key_expr, payload);
+    if (!head) return std::unexpected(head.error());
 
-    if (auto r = link_.write_all(std::span(tx_scratch_).first(framed)); !r)
+    if (auto r = link_.writev_all(std::span(tx_scratch_).first(*head), payload); !r)
         return std::unexpected(io_to_zerr(r.error()));
     frame_sn_ = (frame_sn_ + 1) & sn_mask;
     return {};

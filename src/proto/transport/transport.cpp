@@ -23,6 +23,9 @@ namespace zenoh {
 // --- InitIdentifier / InitResolution ---
 
 auto InitIdentifier::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+    // zid length is 1..16, stored as len-1 in the high nibble; an empty id would
+    // underflow to 0xf (decoding back as 16) and corrupt the stream, so reject it.
+    if (zid.len == 0 || zid.len > 16) return std::unexpected(CodecError::malformed);
     std::uint8_t const nibble = static_cast<std::uint8_t>((zid.len - 1) & 0x0f);
     std::uint8_t const h =
         static_cast<std::uint8_t>((nibble << 4) | (static_cast<std::uint8_t>(whatami) & 0x03));

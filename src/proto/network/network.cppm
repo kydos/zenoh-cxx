@@ -51,6 +51,11 @@ struct Put {
                attachment == o.attachment && std::ranges::equal(payload, o.payload);
     }
 
+    /// Encode everything except the trailing payload *bytes* — i.e. the header,
+    /// extensions, and the payload length prefix. Lets a caller append the (borrowed)
+    /// payload separately (e.g. scatter-gather I/O) instead of copying it into the
+    /// encode buffer. `encode` == `encode_head` followed by the raw payload.
+    [[nodiscard]] auto encode_head(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
     [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<Put, CodecError>;
 };
@@ -88,6 +93,18 @@ struct PushBody {
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
         return std::visit([&](auto const& m) { return m.encode(w); }, body);
     }
+    /// Encode the body up to (but not including) the trailing payload bytes; pair with
+    /// `trailing_payload()` for scatter-gather. Only `Put` defers a payload — `Del`
+    /// has none, so its `encode_head` is a full encode.
+    [[nodiscard]] auto encode_head(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+        if (auto const* p = std::get_if<Put>(&body)) return p->encode_head(w);
+        return std::visit([&](auto const& m) { return m.encode(w); }, body);
+    }
+    /// The deferred trailing payload bytes (empty for bodies that have none).
+    [[nodiscard]] auto trailing_payload() const noexcept -> std::span<const std::byte> {
+        if (auto const* p = std::get_if<Put>(&body)) return p->payload;
+        return {};
+    }
     [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<PushBody, CodecError> {
         std::uint8_t const mid = std::to_integer<std::uint8_t>(ZTRY(r.peek())) & mid_mask;
         PushBody b{};
@@ -115,6 +132,9 @@ struct Push {
     static constexpr std::uint8_t id = 0x1d;
     auto operator==(const Push&) const -> bool = default;
 
+    /// Encode everything except the trailing PushBody payload bytes (see
+    /// `Put::encode_head`); the payload is `payload.trailing_payload()`.
+    [[nodiscard]] auto encode_head(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
     [[nodiscard]] static auto decode(ByteReader& r) noexcept -> std::expected<Push, CodecError>;
 };
