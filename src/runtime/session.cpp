@@ -5,17 +5,23 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 module zenoh.session;
 
 import zenoh.proto;
 import zenoh.runtime.tcp;
+import zenoh.runtime.strand;
 
 // Implementation unit for zenoh.session: endpoint parsing, the 4-way transport
 // handshake, and the put / try_put publish paths.
@@ -32,6 +38,11 @@ constexpr std::size_t max_batch = 0xffff;
 /// default-QoS FrameHeader (1 header byte + up to a 4-byte SN varint). Used to decide
 /// when an API batch is full before the real header is encoded.
 constexpr std::size_t frame_overhead = 8;
+/// Upper bound on a resolved key expression (one TCP batch); rejects attacker-driven
+/// oversized keys on the receive path.
+constexpr std::size_t max_key_len = 0xffff;
+/// Cap on distinct router-declared keyexpr ids we cache (bounds resmap memory).
+constexpr std::size_t max_resmap_entries = 4096;
 
 [[nodiscard]] auto io_to_zerr(IoError e) noexcept -> ZError {
     switch (e) {
@@ -99,6 +110,22 @@ template <class Msg>
 }
 
 } // namespace
+
+// The active subscriber registration (one per session, first cut). Holds the bounded
+// strand and the optional callback; defined here so the non-movable Strand stays
+// behind the session's `unique_ptr<SubReg>` and the Session itself remains movable.
+struct SubReg {
+    std::uint32_t id;
+    std::string key;
+    Strand<Sample> strand;
+    SampleHandler handler; ///< empty for a pull-based (recv) subscriber
+    SubReg(std::uint32_t i, std::string k, std::size_t cap, StrandMode m, SampleHandler h)
+        : id(i), key(std::move(k)), strand(cap, m), handler(std::move(h)) {}
+};
+
+Session::Session(Session&&) noexcept = default;
+auto Session::operator=(Session&&) noexcept -> Session& = default;
+Session::~Session() = default;
 
 auto Session::open(std::string_view endpoint) -> std::expected<Session, ZError> {
     std::string host;
@@ -175,6 +202,8 @@ auto Session::open(std::string_view endpoint) -> std::expected<Session, ZError> 
     // Data phase runs non-blocking so try_put can detect backpressure.
     if (auto r = s.link_.set_nonblocking(); !r) return std::unexpected(io_to_zerr(r.error()));
     s.frame_sn_ = 0;
+    // Keepalive cadence = our declared lease / 4 (four keepalives per lease window).
+    s.keepalive_ms_ = static_cast<std::int32_t>(default_lease_ms / 4);
     return s;
 }
 
@@ -429,6 +458,262 @@ auto Batch::flush() -> std::expected<void, ZError> {
     body_len_ = 0;
     count_ = 0;
     return r;
+}
+
+// --- Subscriber declaration / teardown ---
+
+auto Session::write_declare_subscriber(std::uint32_t id, std::string_view key)
+    -> std::expected<void, ZError> {
+    Declare d{};
+    DeclareSubscriber ds{};
+    ds.id = id;
+    ds.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key};
+    d.body = DeclareBody{.body = ds};
+
+    std::vector<std::byte> tmp(key.size() + 64);
+    ByteWriter w{tmp};
+    if (!d.encode(w)) return std::unexpected(ZError::encode_error);
+    return write_frame(std::span(tmp).first(w.written())); // wraps in a FrameHeader, advances SN
+}
+
+auto Session::write_undeclare_subscriber(std::uint32_t id) -> void {
+    if (!link_.valid()) return;
+    Declare d{};
+    UndeclareSubscriber us{};
+    us.id = id;
+    d.body = DeclareBody{.body = us};
+
+    std::vector<std::byte> tmp(64);
+    ByteWriter w{tmp};
+    if (!d.encode(w)) return;
+    (void)write_frame(std::span(tmp).first(w.written())); // best-effort
+}
+
+auto Session::declare_subscriber(std::string_view key_expr, SubscriberOptions opts)
+    -> std::expected<Subscriber, ZError> {
+    return declare_subscriber(key_expr, SampleHandler{}, opts);
+}
+
+auto Session::declare_subscriber(std::string_view key_expr, SampleHandler on_sample,
+                                 SubscriberOptions opts) -> std::expected<Subscriber, ZError> {
+    if (sub_) return std::unexpected(ZError::already_subscribed);
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
+    std::uint32_t const id = next_entity_id_++;
+    if (auto r = write_declare_subscriber(id, key_expr); !r) return std::unexpected(r.error());
+    sub_ = std::make_unique<SubReg>(id, std::string(key_expr), opts.capacity, opts.mode,
+                                    std::move(on_sample));
+    return Subscriber{this};
+}
+
+auto Session::sub_drop() -> void {
+    if (sub_) {
+        write_undeclare_subscriber(sub_->id);
+        sub_.reset();
+    }
+}
+
+// --- Receive pump ---
+
+auto Session::send_keepalive() -> std::expected<void, ZError> {
+    // Flush any try_put backlog first so the keepalive doesn't jump the byte stream.
+    if (pending_off_ < tx_pending_.size()) {
+        if (auto r = link_.write_all(std::span(tx_pending_).subspan(pending_off_)); !r)
+            return std::unexpected(io_to_zerr(r.error()));
+        tx_pending_.clear();
+        pending_off_ = 0;
+    }
+    KeepAlive ka{};
+    std::vector<std::byte> buf(16);
+    auto framed = frame_message(buf, ka); // SN-less transport message, its own batch
+    if (!framed) return std::unexpected(framed.error());
+    if (auto r = link_.write_all(std::span(buf).first(*framed)); !r)
+        return std::unexpected(io_to_zerr(r.error()));
+    return {};
+}
+
+auto Session::resolve_key(const WireExpr& we) -> std::expected<std::string, ZError> {
+    if (we.scope == 0) { // literal suffix — the common case (router pushes scope 0)
+        if (we.suffix.size() > max_key_len) return std::unexpected(ZError::protocol_error);
+        return std::string(we.suffix);
+    }
+    // Numeric keyexpr id bound by a router DeclareKeyExpr; never operator[] (no insert).
+    auto it = resmap_.find(we.scope);
+    if (it == resmap_.end()) return std::unexpected(ZError::protocol_error);
+    if (it->second.size() + we.suffix.size() > max_key_len)
+        return std::unexpected(ZError::protocol_error);
+    std::string out = it->second;
+    out.append(we.suffix);
+    return out;
+}
+
+auto Session::dispatch_cursor() -> std::expected<void, ZError> {
+    while (rx_pos_ < rx_end_) {
+        std::span<const std::byte> const body{rx_buf_.data() + rx_pos_, rx_end_ - rx_pos_};
+        ByteReader r{body};
+        auto pk = r.peek();
+        if (!pk) {
+            fault_ = ZError::protocol_error;
+            return std::unexpected(*fault_);
+        }
+        std::uint8_t const mid = std::to_integer<std::uint8_t>(*pk) & mid_mask;
+
+        if (mid == Push::id) {
+            auto push = Push::decode(r);
+            if (!push) {
+                fault_ = ZError::protocol_error;
+                return std::unexpected(*fault_);
+            }
+            auto key = resolve_key(push->wire_expr);
+            if (!key) {
+                fault_ = key.error();
+                return std::unexpected(*fault_);
+            }
+            SampleKind kind = SampleKind::del;
+            std::vector<std::byte> payload;
+            if (auto const* put = std::get_if<Put>(&push->payload.body)) {
+                kind = SampleKind::put;
+                payload.assign(put->payload.begin(), put->payload.end()); // copy out of rx_buf_
+            }
+            if (sub_) {
+                // `*key` is a stable local; the strand may copy it, so keep it alive
+                // independently of the moved-in Sample.
+                Sample sample{*key, std::move(payload), kind};
+                if (sub_->strand.post(*key, std::move(sample)) == PostResult::full) {
+                    // Strand full: leave the cursor; the consumer drains, then we retry.
+                    return {};
+                }
+            }
+            rx_pos_ = rx_end_ - r.remaining(); // committed: advance past this message
+        } else if (mid == Declare::mid) {
+            auto dec = Declare::decode(r);
+            if (!dec) {
+                fault_ = ZError::protocol_error;
+                return std::unexpected(*fault_);
+            }
+            // Maintain the resmap from router keyexpr (un)declarations; ignore the rest.
+            if (auto const* dk = std::get_if<DeclareKeyExpr>(&dec->body.body)) {
+                if (auto k = resolve_key(dk->wire_expr); k && k->size() <= max_key_len) {
+                    if (resmap_.size() < max_resmap_entries || resmap_.contains(dk->id))
+                        resmap_[dk->id] = std::move(*k);
+                }
+            } else if (auto const* uk = std::get_if<UndeclareKeyExpr>(&dec->body.body)) {
+                resmap_.erase(uk->id);
+            }
+            rx_pos_ = rx_end_ - r.remaining();
+        } else {
+            // Unknown network message mid-frame: cannot be length-skipped safely.
+            fault_ = ZError::protocol_error;
+            return std::unexpected(*fault_);
+        }
+    }
+    rx_pos_ = rx_end_ = 0; // frame fully consumed
+    return {};
+}
+
+auto Session::pump_step() -> std::expected<void, ZError> {
+    if (fault_) return std::unexpected(*fault_); // sticky terminal fault — never resync
+    if (rx_pos_ < rx_end_) return dispatch_cursor(); // resume an in-progress frame
+
+    auto ready = link_.poll_readable(keepalive_ms_);
+    if (!ready) {
+        fault_ = io_to_zerr(ready.error());
+        return std::unexpected(*fault_);
+    }
+    if (!*ready) { // idle: keepalive timer fired
+        if (auto r = send_keepalive(); !r) {
+            fault_ = r.error();
+            return std::unexpected(*fault_);
+        }
+        return {};
+    }
+
+    auto len = recv_batch(link_, rx_buf_);
+    if (!len) {
+        fault_ = len.error();
+        return std::unexpected(*fault_);
+    }
+    if (*len == 0) return {};
+
+    ByteReader r{std::span(rx_buf_).first(*len)};
+    auto pk = r.peek();
+    if (!pk) {
+        fault_ = ZError::protocol_error;
+        return std::unexpected(*fault_);
+    }
+    std::uint8_t const mid = std::to_integer<std::uint8_t>(*pk) & mid_mask;
+    if (mid == FrameHeader::id) {
+        if (!FrameHeader::decode(r)) {
+            fault_ = ZError::protocol_error;
+            return std::unexpected(*fault_);
+        }
+        rx_pos_ = *len - r.remaining(); // body starts just after the frame header
+        rx_end_ = *len;
+        return dispatch_cursor();
+    }
+    if (mid == KeepAlive::id) return {};                  // router keepalive — ignore
+    if (mid == Close::id) {                               // router closed the session
+        fault_ = ZError::connection_closed;
+        return std::unexpected(*fault_);
+    }
+    return {}; // unknown top-level batch: tolerate for forward-compat
+}
+
+auto Session::sub_recv() -> std::expected<Sample, ZError> {
+    for (;;) {
+        if (!sub_) return std::unexpected(ZError::connection_closed);
+        if (auto s = sub_->strand.pop()) return std::move(*s);
+        if (auto r = pump_step(); !r) return std::unexpected(r.error());
+    }
+}
+
+auto Session::run_once() -> std::expected<void, ZError> {
+    if (auto r = pump_step(); !r) return std::unexpected(r.error());
+    if (sub_ && sub_->handler) {
+        while (auto s = sub_->strand.pop()) sub_->handler(*s); // deliver to the callback
+    }
+    return {};
+}
+
+auto Session::run() -> std::expected<void, ZError> {
+    for (;;) {
+        if (auto r = run_once(); !r) return std::unexpected(r.error());
+    }
+}
+
+// --- Subscriber handle ---
+
+Subscriber::Subscriber(Subscriber&& other) noexcept : session_(other.session_) {
+    other.session_ = nullptr;
+}
+
+auto Subscriber::operator=(Subscriber&& other) noexcept -> Subscriber& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->sub_drop(); // undeclare our own first
+        session_ = other.session_;
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+Subscriber::~Subscriber() {
+    if (session_ != nullptr) session_->sub_drop(); // best-effort undeclare
+}
+
+auto Subscriber::recv() -> std::expected<Sample, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->sub_recv();
+}
+
+auto Subscriber::undeclare() -> void {
+    if (session_ != nullptr) {
+        session_->sub_drop();
+        session_ = nullptr;
+    }
+}
+
+auto Subscriber::key_expr() const noexcept -> std::string_view {
+    if (session_ != nullptr && session_->sub_) return session_->sub_->key;
+    return {};
 }
 
 } // namespace zenoh

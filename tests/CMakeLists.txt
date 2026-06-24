@@ -16,6 +16,8 @@ add_executable(zenoh-tests
     test_diff.cpp
     test_session.cpp
     test_tcp.cpp
+    test_strand.cpp
+    test_subscriber.cpp
 )
 # Link the runtime (which transitively brings the proto codec) so the session/tcp
 # integration tests can drive a real Session and those sources show up in coverage.

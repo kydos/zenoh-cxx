@@ -43,6 +43,8 @@ auto error_name(zenoh::ZError e) -> const char* {
         return "encode_error";
     case zenoh::ZError::bad_endpoint:
         return "bad_endpoint";
+    case zenoh::ZError::already_subscribed:
+        return "already_subscribed";
     }
     return "unknown";
 }

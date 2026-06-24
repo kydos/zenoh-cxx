@@ -61,6 +61,12 @@ public:
     [[nodiscard]] auto read_exact(std::span<std::byte> out) noexcept
         -> std::expected<void, IoError>;
 
+    /// Wait up to `timeout_ms` for the socket to become readable. Returns `true` if it
+    /// is readable, `false` if the timeout elapsed first, or `closed`/`failed` on a
+    /// hangup/error. A negative `timeout_ms` waits indefinitely. The seam the receive
+    /// pump uses to interleave a keepalive timer with blocking reads.
+    [[nodiscard]] auto poll_readable(int timeout_ms) noexcept -> std::expected<bool, IoError>;
+
     [[nodiscard]] auto valid() const noexcept -> bool { return fd_ >= 0; }
 
 private:

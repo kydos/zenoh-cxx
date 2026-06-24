@@ -103,6 +103,7 @@ target_sources(zenoh
     PUBLIC
         FILE_SET CXX_MODULES FILES
             src/runtime/tcp.cppm
+            src/runtime/strand.cppm
             src/runtime/session.cppm
             src/zenoh.cppm
     PRIVATE

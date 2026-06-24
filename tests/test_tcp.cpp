@@ -169,3 +169,66 @@ TEST("TcpLink connect fails for an unresolvable host") {
     auto r = TcpLink::connect("no.such.host.invalid.", 7447);
     CHECK(!r.has_value() && r.error() == IoError::failed);
 }
+
+TEST("TcpLink::poll_readable times out when no data is available") {
+    std::uint16_t port = 0;
+    int const lf = make_listener(port);
+    auto link = TcpLink::connect("127.0.0.1", port);
+    CHECK(link.has_value());
+    int const peer = ::accept(lf, nullptr, nullptr);
+    CHECK(peer >= 0);
+
+    auto r = link->poll_readable(50); // nothing sent -> timeout
+    CHECK(r.has_value() && r.value() == false);
+
+    ::close(peer);
+    ::close(lf);
+}
+
+TEST("TcpLink::poll_readable reports readable once data arrives") {
+    std::uint16_t port = 0;
+    int const lf = make_listener(port);
+    auto link = TcpLink::connect("127.0.0.1", port);
+    CHECK(link.has_value());
+    int const peer = ::accept(lf, nullptr, nullptr);
+    CHECK(peer >= 0);
+
+    // Peer sends a byte after a short delay; poll must wait then report readable.
+    std::thread writer([peer] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        std::byte b = byte(0x7);
+        ::send(peer, &b, 1, 0);
+    });
+
+    auto r = link->poll_readable(2000);
+    CHECK(r.has_value() && r.value() == true);
+    // The byte is really there: a read does not block and returns it.
+    std::array<std::byte, 1> got{};
+    CHECK(link->read_exact(got).has_value());
+    CHECK(i(got[0]) == 7);
+
+    writer.join();
+    ::close(peer);
+    ::close(lf);
+}
+
+TEST("TcpLink::poll_readable does not time out on peer hangup") {
+    std::uint16_t port = 0;
+    int const lf = make_listener(port);
+    auto link = TcpLink::connect("127.0.0.1", port);
+    CHECK(link.has_value());
+    int const peer = ::accept(lf, nullptr, nullptr);
+    CHECK(peer >= 0);
+
+    ::close(peer); // hang up
+    // A hangup is reported as either readable (EOF) or closed — never a timeout.
+    auto r = link->poll_readable(2000);
+    bool const not_timeout = !r.has_value() || r.value() == true;
+    CHECK(not_timeout);
+    // Either way, the subsequent read surfaces the closure.
+    std::array<std::byte, 1> buf{};
+    auto rd = link->read_exact(buf);
+    CHECK(!rd.has_value() && rd.error() == IoError::closed);
+
+    ::close(lf);
+}

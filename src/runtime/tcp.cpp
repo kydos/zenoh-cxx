@@ -202,4 +202,23 @@ auto TcpLink::read_exact(std::span<std::byte> out) noexcept -> std::expected<voi
     return {};
 }
 
+auto TcpLink::poll_readable(int timeout_ms) noexcept -> std::expected<bool, IoError> {
+    for (;;) {
+        ::pollfd pfd{.fd = fd_, .events = POLLIN, .revents = 0};
+        int const n = ::poll(&pfd, 1, timeout_ms);
+        if (n < 0) {
+            if (errno == EINTR) continue; // restart the wait on signal interruption
+            return std::unexpected(IoError::failed);
+        }
+        if (n == 0) return false; // timed out, still no data
+        // POLLIN takes priority over POLLHUP: a half-closed peer (FIN) that also left
+        // buffered data sets both, and we must read the data before surfacing the EOF.
+        if ((pfd.revents & POLLIN) != 0) return true; // readable (EOF read_exact reports closed)
+        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            return std::unexpected(IoError::closed);
+        }
+        return true;
+    }
+}
+
 } // namespace zenoh

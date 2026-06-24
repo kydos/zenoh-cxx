@@ -14,8 +14,9 @@ subscriber (`../zenoh-rust`).
 
 | Module | Unit | Contents |
 | --- | --- | --- |
-| `zenoh.runtime.tcp` | `src/runtime/tcp.{cppm,cpp}` | `TcpLink` (RAII POSIX socket), `IoError`. Blocking `write_all`/`read_exact`, non-blocking `write_some`. POSIX headers stay in the `.cpp`. |
-| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`. Endpoint parsing, the 4-way handshake, `put`/`try_put`/`close`. |
+| `zenoh.runtime.tcp` | `src/runtime/tcp.{cppm,cpp}` | `TcpLink` (RAII POSIX socket), `IoError`. Blocking `write_all`/`read_exact`, non-blocking `write_some`, `poll_readable` (keepalive timer). POSIX headers stay in the `.cpp`. |
+| `zenoh.runtime.strand` | `src/runtime/strand.cppm` | `Strand<T>` — the per-subscriber bounded queue (`ordered` / `last_value` conflation), `StrandMode`. Header-only template. |
+| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`, `Sample`, `Subscriber`. Endpoint parsing, the 4-way handshake, `put`/`try_put`/`close`, and the subscriber receive pump (`declare_subscriber`, `run`/`run_once`, `Subscriber::recv`). |
 | `zenoh` | `src/zenoh.cppm` | Public umbrella; re-exports `zenoh.session`. **Import this for the client API.** |
 
 ## Connecting (the handshake)
@@ -103,13 +104,74 @@ b.flush();              // or let the Batch go out of scope
   counter and pending-buffer, so interleaving `session->put()` and batch puts stays
   wire-consistent. The session must outlive any batch created from it.
 
+## Subscribing
+
+`Session::declare_subscriber("demo/example/**")` sends a
+`Frame(Declare{DeclareSubscriber})` (reliable, on the session's frame SN) and returns a
+`Subscriber`. A bare `DeclareSubscriber` is sufficient for the router to start
+forwarding matching data — no `Interest` exchange is needed (verified against
+`zenohd`). First cut: **one subscriber per session** (a second returns
+`already_subscribed`); the router does the key-expression matching, so every forwarded
+sample is delivered to the subscriber.
+
+Two ways to consume, both driving the same decode pump (modeled on `io_context::run`):
+
+- **Pull** — `Subscriber::recv() -> expected<Sample, ZError>` blocks until the next
+  sample, pumping the receive loop itself (this is what `z_sub` uses):
+  ```cpp
+  auto sub = session->declare_subscriber("demo/example/**");
+  while (auto s = sub->recv()) {
+      // s->key_expr(), s->payload(), s->kind()  (SampleKind::put / del)
+  }
+  ```
+- **Callback** — `declare_subscriber(key, handler)` registers a
+  `void(const Sample&)`; `Session::run()` (loop) or `Session::run_once()` (one step)
+  invoke it for each sample. The number of threads pumping `run()` is the dispatch
+  concurrency (single-threaded in this cut).
+
+A `Sample` is an **owned** snapshot (key string + payload bytes + kind), copied out of
+the receive buffer at delivery time — it outlives the next `recv`/`run`.
+
+### Strands (per-subscriber buffering)
+
+Each subscriber has a bounded **strand** (`SubscriberOptions{capacity, mode}`):
+
+- `StrandMode::ordered` (default) — bounded FIFO; when full, the decoder applies
+  backpressure (it pauses mid-frame and resumes as the consumer drains — never drops).
+- `StrandMode::last_value` — under backpressure, conflates by key: a new value whose key
+  is already pending overwrites that key's most-recent entry and re-tails it, so delivery
+  stays an **ordered subsequence** of the arrival stream (intermediate same-key values
+  dropped only when full). A `Del` conflates the same way.
+
+### Keepalive
+
+A receive-only session is idle on TX, so the pump emits an SN-less `KeepAlive` whenever
+it has waited `lease/4` (2.5 s) with no data — the client must stay in `recv`/`run` (or
+call within the lease) to keep the session alive. Decode errors **fault the subscriber
+permanently** (a byte stream can't resync): every later `recv`/`run` returns
+`protocol_error`.
+
 ### `ZError`
 
-`would_block` (try_put backpressure), `connection_closed`, `io_error`,
-`protocol_error` (bad handshake reply), `encode_error` (message exceeds a batch),
-`bad_endpoint` (unparseable/unresolvable locator).
+`would_block` (try_put backpressure), `connection_closed` (EOF / router Close),
+`io_error`, `protocol_error` (malformed handshake or data stream), `encode_error`
+(message exceeds a batch), `bad_endpoint` (unparseable/unresolvable locator),
+`already_subscribed` (second subscriber on a session).
 
 ## Example & manual interop test
+
+`examples/z_sub.cpp` (`z_sub`) — the C++ equivalent of zenoh-rust's `z_sub`: declares a
+subscriber and prints every received sample in a blocking `recv` loop.
+`z_sub [-e endpoint] [-k key]` (default key `demo/example/**`). Verified against the
+reference router + publishers:
+
+```sh
+zenohd -l tcp/127.0.0.1:7447 &
+./build/clang/examples/z_sub -e tcp/127.0.0.1:7447 -k 'demo/example/**' &
+z_put -e tcp/127.0.0.1:7447 -k demo/example/test -p hello   # from ../zenoh-rust
+z_pub -e tcp/127.0.0.1:7447 -k demo/example/loop            # looping publisher
+z_delete -e tcp/127.0.0.1:7447 -k demo/example/test         # delivered as DELETE
+```
 
 `examples/z_put.cpp` (`z_put`):
 `z_put [endpoint] [key] [value] [--try] [--batch] [--count N]`. With `--batch` the
