@@ -98,6 +98,13 @@ ThinLTO); pass `-DZENOH_NATIVE=OFF` to drop host tuning explicitly.
 
 - **Round-trip** (`tests/test_*.cpp`): encode → decode → structural equality, and
   `decode` consumes exactly the encoded length.
+- **Primitive** (`tests/test_codec.cpp`, `tests/test_ext.cpp`): direct tests of the
+  VLE/length-prefixed/UTF-8/u16 codecs and the extension (Unit/U64/ZStruct) helpers,
+  including their error and overflow paths.
+- **Runtime integration** (`tests/test_session.cpp`): an in-process *fake router* on
+  a loopback socket drives a real `Session` through the handshake, `put`/`try_put`/
+  `batch`/`close`, and the error paths (bad endpoint, refused connect, oversize
+  payload) — no external `zenohd` required. Coverage: see below.
 - **Differential** (`tests/test_diff.cpp` + `tests/diff_vectors.hpp`): the oracle is
   the **authoritative zenoh-rust** codec (`../zenoh-rust/commons/zenoh-protocol` +
   `zenoh-codec`). `tools/vector-gen` uses zenoh-rust's `rand()` constructors (behind
@@ -117,3 +124,11 @@ ThinLTO); pass `-DZENOH_NATIVE=OFF` to drop host tuning explicitly.
   docker run --rm -v "$PWD":/work -w /work -u "$(id -u):$(id -g)" -e HOME=/tmp \
       zenoh-linux-ci scripts/fuzz.sh 60
   ```
+
+## Coverage
+
+`scripts/coverage.sh <preset>` (LLVM source-based coverage; tests/examples/fuzz
+excluded) emits `build/<preset>/coverage.lcov`, which CI uploads to Codecov. The
+library is at **~89% line coverage**; `codecov.yml` gates the project at 80%. The
+lowest-covered area is `src/runtime/tcp.cpp` (socket error branches — EINTR/EAGAIN/
+partial-write — that need fault injection to exercise).

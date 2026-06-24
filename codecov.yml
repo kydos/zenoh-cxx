@@ -1,0 +1,16 @@
+# Codecov configuration. The coverage report is produced by scripts/coverage.sh
+# (LLVM source-based coverage of the library; tests/examples/fuzz excluded) and
+# uploaded from CI.
+coverage:
+  status:
+    project:
+      default:
+        target: 80%      # the library must stay at or above 80% line coverage
+        threshold: 1%    # tolerate small fluctuations without failing the build
+    patch:
+      default:
+        informational: true   # report patch coverage but don't block PRs on it
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true
