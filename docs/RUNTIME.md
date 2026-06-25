@@ -174,7 +174,8 @@ z_delete -e tcp/127.0.0.1:7447 -k demo/example/test         # delivered as DELET
 ```
 
 `examples/z_put.cpp` (`z_put`):
-`z_put [endpoint] [key] [value] [--try] [--batch] [--count N]`. With `--batch` the
+`z_put [endpoint] [key] [value] [-e endpoint] [--try] [--batch] [--count N]` (the
+endpoint may be positional or given with `-e`/`--connect`). With `--batch` the
 puts are coalesced into API-level batches (one Frame per batch).
 
 `examples/z_pub.cpp` (`z_pub`) — the C++ equivalent of zenoh-rust's `z_pub`:

@@ -1,12 +1,13 @@
 // z_put: connect to a Zenoh router and publish a value to a key expression.
 //
-// Usage: z_put [endpoint] [key] [value] [--try]
-//   endpoint  router locator (default tcp/127.0.0.1:7447)
-//   key       key expression  (default demo/example/zenoh-cpp-put)
-//   value     payload string  (default "Hello from zenoh-cpp!")
-//   --try     use try_put (non-blocking) instead of put
-//   --batch   coalesce the puts into API-level batches (one Frame per batch)
-//   --count N publish N times on the one session (default 1)
+// Usage: z_put [endpoint] [key] [value] [-e endpoint] [--try]
+//   endpoint         router locator, positional (default tcp/127.0.0.1:7447)
+//   key              key expression  (default demo/example/zenoh-cpp-put)
+//   value            payload string  (default "Hello from zenoh-cpp!")
+//   -e, --connect E  router endpoint (same as the positional; overrides it)
+//   --try            use try_put (non-blocking) instead of put
+//   --batch          coalesce the puts into API-level batches (one Frame per batch)
+//   --count N        publish N times on the one session (default 1)
 //
 // Verify with the reference subscriber:
 //   zenohd -l tcp/127.0.0.1:7447 &
@@ -60,7 +61,10 @@ auto main(int argc, char** argv) -> int {
     int positional = 0;
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
-        if (arg == "--try") {
+        if ((arg == "-e" || arg == "--connect") && i + 1 < argc) {
+            endpoint = argv[++i];
+            if (positional == 0) positional = 1; // consume the positional endpoint slot
+        } else if (arg == "--try") {
             use_try = true;
         } else if (arg == "--batch") {
             use_batch = true;
