@@ -202,8 +202,16 @@ class SubRouter {
 
         script_(fd);
         // Half-close (FIN after the pushed data) so the client reads all samples before
-        // observing EOF, without an abrupt close() risking an RST.
+        // observing EOF. Then DRAIN the client's side before close(): a close() with
+        // unread inbound data (a client keepalive, or its Close on shutdown) yields a
+        // TCP RST that can race ahead of the client reading our pushed batches, which
+        // would surface as a spurious connection_closed. Draining first avoids the RST.
         ::shutdown(fd, SHUT_WR);
+        timeval drain{.tv_sec = 0, .tv_usec = 300'000};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &drain, sizeof(drain));
+        std::array<std::byte, 256> sink{};
+        while (::recv(fd, sink.data(), sink.size(), 0) > 0) {
+        }
         ::close(fd);
     }
 
@@ -468,6 +476,197 @@ TEST("a second subscriber on one session is rejected") {
     CHECK(s1.has_value());
     auto s2 = sess->declare_subscriber("b/**");
     CHECK(!s2.has_value() && s2.error() == ZError::already_subscribed);
+    sess->close();
+    router.join();
+}
+
+TEST("a router KeepAlive is ignored; a following PUT is still delivered") {
+    SubRouter router([](int fd) {
+        send_batch(fd, encode_body(KeepAlive{})); // top-level keepalive batch
+        send_batch(fd, build_frame(1, [](ByteWriter& w) { put_msg(w, "demo/a", "v"); }));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+    auto s = sub->recv();
+    CHECK(s.has_value() && s->key_expr() == "demo/a");
+    sess->close();
+    router.join();
+}
+
+TEST("a router Close ends the session with a sticky connection_closed") {
+    SubRouter router([](int fd) {
+        send_batch(fd, encode_body(Close{.reason = 0, .behaviour = CloseBehaviour::session}));
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(200)); // keep open: error from Close, not EOF
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+    auto a = sub->recv();
+    CHECK(!a.has_value() && a.error() == ZError::connection_closed);
+    auto b = sub->recv(); // sticky
+    CHECK(!b.has_value() && b.error() == ZError::connection_closed);
+    sess->close();
+    router.join();
+}
+
+TEST("an unknown top-level batch is tolerated (forward-compat)") {
+    SubRouter router([](int fd) {
+        send_batch(fd,
+                   std::vector<std::byte>{std::byte{0x10}}); // mid 0x10: not Frame/KeepAlive/Close
+        send_batch(fd, build_frame(1, [](ByteWriter& w) { put_msg(w, "demo/a", "v"); }));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+    auto s = sub->recv();
+    CHECK(s.has_value() && s->key_expr() == "demo/a");
+    sess->close();
+    router.join();
+}
+
+TEST("malformed top-level / in-frame messages fault the session") {
+    auto faults = [](std::vector<std::byte> bad) {
+        SubRouter router([bad](int fd) {
+            send_batch(fd, bad);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        });
+        auto sess = Session::open(endpoint(router.port()));
+        CHECK(sess.has_value());
+        if (!sess) {
+            router.join();
+            return;
+        }
+        auto sub = sess->declare_subscriber("demo/**");
+        CHECK(sub.has_value());
+        auto s = sub->recv();
+        CHECK(!s.has_value() && s.error() == ZError::protocol_error);
+        sess->close();
+        router.join();
+    };
+    faults(std::vector<std::byte>{std::byte{0x05}}); // FrameHeader, truncated sn
+    faults(build_frame(
+        1, [](ByteWriter& w) { (void)w.write_byte(std::byte{0x1d}); })); // Push hdr only
+    faults(build_frame(
+        1, [](ByteWriter& w) { (void)w.write_byte(std::byte{0x1e}); })); // Declare hdr only
+    faults(build_frame(
+        1, [](ByteWriter& w) { (void)w.write_byte(std::byte{0x1f}); })); // unknown mid in frame
+}
+
+TEST("a push on an unknown numeric keyexpr id faults") {
+    SubRouter router([](int fd) {
+        send_batch(fd, build_frame(1, [](ByteWriter& w) { put_msg(w, "/y", "v", /*scope=*/99); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+    auto s = sub->recv();
+    CHECK(!s.has_value() && s.error() == ZError::protocol_error);
+    sess->close();
+    router.join();
+}
+
+TEST("UndeclareKeyExpr drops the resmap binding") {
+    SubRouter router([](int fd) {
+        send_batch(fd, build_frame(1, [](ByteWriter& w) {
+                       Declare d{};
+                       d.body = DeclareBody{
+                           .body = DeclareKeyExpr{.id = 7,
+                                                  .wire_expr = {.scope = 0,
+                                                                .mapping = Mapping::receiver,
+                                                                .suffix = "demo/x"}}};
+                       (void)d.encode(w);
+                   }));
+        send_batch(fd, build_frame(2, [](ByteWriter& w) {
+                       Declare d{};
+                       d.body = DeclareBody{.body = UndeclareKeyExpr{.id = 7}};
+                       (void)d.encode(w);
+                   }));
+        send_batch(fd, build_frame(3, [](ByteWriter& w) { put_msg(w, "/y", "v", /*scope=*/7); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+    auto s = sub->recv(); // id 7 was undeclared -> resmap miss -> fault
+    CHECK(!s.has_value() && s.error() == ZError::protocol_error);
+    sess->close();
+    router.join();
+}
+
+TEST("run() drives a callback subscriber until the router closes") {
+    SubRouter router([](int fd) {
+        send_batch(fd, build_frame(1, [](ByteWriter& w) {
+                       put_msg(w, "k/1", "a");
+                       put_msg(w, "k/2", "b");
+                   }));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    std::vector<std::string> seen;
+    auto sub = sess->declare_subscriber(
+        "k/**", [&seen](const Sample& s) { seen.push_back(std::string(s.key_expr())); });
+    CHECK(sub.has_value());
+    auto r = sess->run(); // blocks pumping until EOF
+    CHECK(!r.has_value() && r.error() == ZError::connection_closed);
+    router.join();
+    CHECK(seen.size() == 2);
+}
+
+TEST("Subscriber key_expr / undeclare / move semantics") {
+    SubRouter router([](int) { std::this_thread::sleep_for(std::chrono::milliseconds(150)); });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    {
+        auto sub = sess->declare_subscriber("demo/**");
+        CHECK(sub.has_value());
+        if (sub) {
+            CHECK(sub->key_expr() == "demo/**");
+            Subscriber holder = std::move(*sub); // move ctor
+            CHECK(holder.key_expr() == "demo/**");
+            holder = std::move(*sub); // move-assign onto a live target: drops then adopts (null)
+            CHECK(holder.key_expr().empty());
+        }
+    }
+    // After the handle is gone the session has no subscriber: a fresh declare succeeds.
+    auto again = sess->declare_subscriber("x/**");
+    CHECK(again.has_value());
+    if (again) again->undeclare(); // explicit undeclare path
     sess->close();
     router.join();
 }

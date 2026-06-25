@@ -11,9 +11,11 @@ import zenoh.proto; // messages + ByteReader/ByteWriter + load_le/store_le
 #include "ztest.hpp"
 
 #include <array>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -208,6 +210,81 @@ class FakeRouter {
 
 auto endpoint(std::uint16_t port) -> std::string { return "tcp/127.0.0.1:" + std::to_string(port); }
 
+// A bare listener that hands the accepted fd to a per-test `script` (which performs
+// whatever handshake / abort / deaf behaviour the test needs). `rcvbuf`, if set,
+// shrinks the receive window so a non-reading script induces client backpressure.
+class RawRouter {
+  public:
+    explicit RawRouter(std::function<void(int)> script, int rcvbuf = 0)
+        : script_(std::move(script)) {
+        std::signal(SIGPIPE, SIG_IGN);
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        int one = 1;
+        ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (rcvbuf > 0) ::setsockopt(listen_fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        ::listen(listen_fd_, 1);
+        socklen_t len = sizeof(addr);
+        ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+        thread_ = std::thread([this] {
+            pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+            if (::poll(&pfd, 1, 5000) <= 0) return;
+            int const fd = ::accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) return;
+            timeval tv{.tv_sec = 5, .tv_usec = 0};
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            script_(fd);
+            ::shutdown(fd, SHUT_WR);
+            timeval drain{.tv_sec = 0, .tv_usec = 300'000};
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &drain, sizeof(drain));
+            std::array<std::byte, 256> sink{};
+            while (::recv(fd, sink.data(), sink.size(), 0) > 0) {
+            }
+            ::close(fd);
+        });
+    }
+    ~RawRouter() {
+        join();
+        if (listen_fd_ >= 0) ::close(listen_fd_);
+    }
+    [[nodiscard]] auto port() const -> std::uint16_t { return port_; }
+    auto join() -> void {
+        if (thread_.joinable()) thread_.join();
+    }
+
+  private:
+    std::function<void(int)> script_;
+    int listen_fd_ = -1;
+    std::uint16_t port_ = 0;
+    std::thread thread_;
+};
+
+// Complete the 4-way handshake on `fd` with a chosen batch size; returns false on I/O
+// failure (used by RawRouter scripts that then misbehave or go deaf).
+auto do_handshake(int fd, std::uint16_t batch_size) -> bool {
+    if (!recv_batch(fd)) return false; // InitSyn
+    InitAck ack{};
+    ack.version = 9;
+    ack.identifier.whatami = WhatAmI::router;
+    ack.identifier.zid.len = 4;
+    ack.identifier.zid.bytes = {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    ack.resolution.resolution = 0x0a;
+    ack.resolution.batch_size = batch_size;
+    std::array<std::byte, 4> cookie{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    ack.cookie = cookie;
+    if (!send_batch(fd, encode_body(ack))) return false;
+    if (!recv_batch(fd)) return false; // OpenSyn
+    OpenAck oack{};
+    oack.lease = Duration::from_millis(10000);
+    oack.sn = 0;
+    return send_batch(fd, encode_body(oack));
+}
+
 } // namespace
 
 TEST("Session::open handshakes and put/try_put/batch reach the router") {
@@ -341,4 +418,112 @@ TEST("a moved-from Session leaves the moved-to one usable") {
     router.join();
     CHECK(router.samples().size() == 1);
     if (!router.samples().empty()) CHECK(router.samples()[0].key == "demo/m");
+}
+
+TEST("Batch move-construction and an oversize put are handled") {
+    FakeRouter router; // batch_size 64
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    {
+        auto b1 = sess->batch();
+        CHECK(b1.put("demo/mc", bytes("v")).has_value());
+        Batch b2 = std::move(b1); // move-construction
+        CHECK(b2.size() == 1);
+        CHECK(b2.flush().has_value());
+    }
+    {
+        auto b = sess->batch();
+        std::vector<std::byte> big(200, std::byte{0x7}); // single put > batch_size 64
+        auto r = b.put("demo/big", big);
+        CHECK(!r.has_value() && r.error() == ZError::encode_error);
+    }
+    sess->close();
+    router.join();
+}
+
+TEST("Session move-assignment transfers the live connection") {
+    FakeRouter r1;
+    FakeRouter r2;
+    auto s1 = Session::open(endpoint(r1.port()));
+    auto s2 = Session::open(endpoint(r2.port()));
+    CHECK(s1.has_value() && s2.has_value());
+    if (!s1 || !s2) {
+        r1.join();
+        r2.join();
+        return;
+    }
+    *s1 = std::move(*s2); // closes s1's old link (r1), adopts s2's (r2)
+    CHECK(s1->put("demo/ma", bytes("v")).has_value());
+    s1->close();
+    r1.join();
+    r2.join();
+    CHECK(r2.samples().size() == 1);
+}
+
+TEST("Session::open parses a bracketed IPv6 endpoint") {
+    // Exercises the [ipv6]:port parse branch; the connect to ::1:1 then fails, which is
+    // fine — only the parse path is under test.
+    auto s = Session::open("tcp/[::1]:1");
+    CHECK(!s.has_value());
+}
+
+TEST("Session::open fails when the router aborts mid-handshake") {
+    { // close right after accept -> the client's InitAck read hits EOF
+        RawRouter r([](int) {});
+        auto s = Session::open(endpoint(r.port()));
+        CHECK(!s.has_value());
+        r.join();
+    }
+    { // send InitAck then close -> the client's OpenAck read hits EOF
+        RawRouter r([](int fd) {
+            if (!recv_batch(fd)) return; // InitSyn
+            InitAck ack{};
+            ack.version = 9;
+            ack.identifier.whatami = WhatAmI::router;
+            ack.identifier.zid.len = 4;
+            ack.identifier.zid.bytes = {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+            ack.resolution.resolution = 0x0a;
+            ack.resolution.batch_size = 4096;
+            std::array<std::byte, 4> cookie{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+            ack.cookie = cookie;
+            (void)send_batch(fd, encode_body(ack)); // then return -> no OpenAck
+        });
+        auto s = Session::open(endpoint(r.port()));
+        CHECK(!s.has_value());
+        r.join();
+    }
+}
+
+TEST("try_put buffers under backpressure and drains via flush_pending") {
+    // Handshake with a large batch size, then go deaf with a tiny receive window so the
+    // client's non-blocking writes can't fully drain: exercises the partial-write
+    // buffering (tx_pending_) and the flush_pending / would_block paths.
+    RawRouter router(
+        [](int fd) {
+            if (!do_handshake(fd, 0xffff)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(800)); // deaf
+        },
+        /*rcvbuf=*/2048);
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    std::vector<std::byte> payload(8192, std::byte{0xAB});
+    bool would_block = false;
+    for (int i = 0; i < 4096 && !would_block; ++i) {
+        auto r = sess->try_put("demo/bp", payload);
+        if (!r) {
+            CHECK(r.error() == ZError::would_block);
+            would_block = true;
+        }
+    }
+    CHECK(would_block); // window fills -> try_put eventually reports backpressure
+    sess->close();
+    router.join();
 }
