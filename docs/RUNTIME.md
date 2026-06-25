@@ -203,6 +203,18 @@ z_sub_thr -m client -e tcp/127.0.0.1:7447 &        # from ../zenoh-rust
 ./build/clang/examples/z_pub_thr -e tcp/127.0.0.1:7447 -t --batch 256 8  # batched
 ```
 
+`examples/z_sub_thr.cpp` (`z_sub_thr`) — the C++ equivalent of zenoh-rust's
+`z_sub_thr`: a callback subscriber on `test/thr` that counts messages in rounds of
+`-n N`, prints `msg/s` per round, and exits after `-s M` rounds (printing a final
+summary). `z_sub_thr [-e endpoint] [-s M] [-n N]`. Driven by `Session::run()` (the
+receive pump). Pair it with either publisher:
+
+```sh
+zenohd -l tcp/127.0.0.1:7447 &
+./build/clang/examples/z_sub_thr -e tcp/127.0.0.1:7447 &
+./build/clang/examples/z_pub_thr -e tcp/127.0.0.1:7447 8      # or zenoh-rust z_pub_thr
+```
+
 ```sh
 # Router + reference subscriber (from ../zenoh-rust):
 zenohd -l tcp/127.0.0.1:7447 &

@@ -105,6 +105,6 @@ The generated `tests/diff_vectors.hpp` is excluded from formatting
 ## Examples
 
 The release/debug builds produce runtime example programs under
-`build/<preset>/examples/` (`z_put`, `z_pub`, `z_put_float`, `z_pub_thr`, `z_sub`). See [`docs/RUNTIME.md`](docs/RUNTIME.md)
+`build/<preset>/examples/` (`z_put`, `z_pub`, `z_put_float`, `z_pub_thr`, `z_sub`, `z_sub_thr`). See [`docs/RUNTIME.md`](docs/RUNTIME.md)
 for how to run them against a Zenoh router. Protocol/codec internals are documented in
 [`docs/PROTO.md`](docs/PROTO.md).

@@ -19,3 +19,7 @@ target_compile_features(z_sub PRIVATE cxx_std_23)
 add_executable(z_pub_thr z_pub_thr.cpp)
 target_link_libraries(z_pub_thr PRIVATE zenoh)
 target_compile_features(z_pub_thr PRIVATE cxx_std_23)
+
+add_executable(z_sub_thr z_sub_thr.cpp)
+target_link_libraries(z_sub_thr PRIVATE zenoh)
+target_compile_features(z_sub_thr PRIVATE cxx_std_23)
