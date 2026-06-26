@@ -14,6 +14,7 @@ add_executable(zenoh-tests
     test_negative.cpp
     test_umbrella.cpp
     test_diff.cpp
+    test_coverage.cpp
     test_session.cpp
     test_tcp.cpp
     test_strand.cpp

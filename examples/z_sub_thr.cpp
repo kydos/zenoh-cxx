@@ -52,7 +52,7 @@ using Clock = std::chrono::steady_clock;
 // `round_size` samples; per round it prints `samples/elapsed` msg/s, and a final
 // summary over all rounds. `increment()` returns true once all rounds are done.
 class Stats {
-public:
+  public:
     Stats(std::size_t rounds, std::size_t round_size) : rounds_(rounds), round_size_(round_size) {}
 
     [[nodiscard]] auto increment() -> bool {
@@ -77,7 +77,7 @@ public:
                     static_cast<double>(total) / elapsed);
     }
 
-private:
+  private:
     auto print_round() const -> void {
         double const elapsed = std::chrono::duration<double>(Clock::now() - round_start_).count();
         std::printf("%f msg/s\n", static_cast<double>(round_size_) / elapsed);
@@ -114,7 +114,8 @@ auto main(int argc, char** argv) -> int {
 
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
-        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(), error_name(session.error()));
+        std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
+                     error_name(session.error()));
         return 1;
     }
 
