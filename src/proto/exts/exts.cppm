@@ -37,6 +37,29 @@ struct EntityGlobalId {
         -> std::expected<EntityGlobalId, CodecError>;
 };
 
+/// A zenoh-cxx-specific routing extension carried on `Push`/`Request`
+/// (ZStruct, project-local — not present in upstream zenoh-rust): narrows
+/// broker fan-out to the single peer whose zid matches, ANDed with normal
+/// key-expression-declaration matching (a filter, never a bypass — the
+/// target must still have a matching Subscriber/Queryable declared). Absent
+/// = today's unfiltered fan-out; the extension id is non-mandatory, so an
+/// older peer that doesn't know it simply skips it via `skip_ext`. Because
+/// it doesn't exist upstream, it cannot be differentially tested against the
+/// reference — round-trip/property tests carry that burden instead.
+struct DestinationId {
+    ZenohId zid{};
+    auto operator==(const DestinationId&) const -> bool = default;
+
+    /// Encoded body length: header byte + zid bytes (same shape as
+    /// `EntityGlobalId` minus the trailing `eid`).
+    [[nodiscard]] auto body_len() const noexcept -> std::size_t { return 1 + zid.len; }
+    /// Encode: header nibble (`zid.len - 1`) ++ zid bytes.
+    [[nodiscard]] auto encode_body(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
+    /// Decode the above (zid length = header nibble + 1).
+    [[nodiscard]] static auto decode_body(ByteReader& r) noexcept
+        -> std::expected<DestinationId, CodecError>;
+};
+
 /// Originating entity + sequence number (ZStruct extension).
 struct SourceInfo {
     EntityGlobalId id{};

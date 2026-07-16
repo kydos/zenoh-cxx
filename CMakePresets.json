@@ -110,6 +110,17 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "ZENOH_FUZZ": "ON"
       }
+    },
+    {
+      "name": "linux-tsan",
+      "displayName": "Linux clang ThreadSanitizer (broker concurrency stress gate)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-tsan",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "ZENOH_TSAN": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -121,7 +132,8 @@
     { "name": "linux-gcc", "configurePreset": "linux-gcc" },
     { "name": "linux-clang-release", "configurePreset": "linux-clang-release" },
     { "name": "linux-coverage", "configurePreset": "linux-coverage" },
-    { "name": "linux-fuzz", "configurePreset": "linux-fuzz" }
+    { "name": "linux-fuzz", "configurePreset": "linux-fuzz" },
+    { "name": "linux-tsan", "configurePreset": "linux-tsan" }
   ],
   "testPresets": [
     { "name": "clang", "configurePreset": "clang", "output": { "outputOnFailure": true } },
@@ -131,6 +143,7 @@
     { "name": "linux-clang", "configurePreset": "linux-clang", "output": { "outputOnFailure": true } },
     { "name": "linux-clang-release", "configurePreset": "linux-clang-release", "output": { "outputOnFailure": true } },
     { "name": "linux-coverage", "configurePreset": "linux-coverage", "output": { "outputOnFailure": true } },
-    { "name": "linux-gcc", "configurePreset": "linux-gcc", "output": { "outputOnFailure": true } }
+    { "name": "linux-gcc", "configurePreset": "linux-gcc", "output": { "outputOnFailure": true } },
+    { "name": "linux-tsan", "configurePreset": "linux-tsan", "output": { "outputOnFailure": true } }
   ]
 }

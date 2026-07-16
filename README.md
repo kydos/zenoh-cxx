@@ -8,6 +8,15 @@
 
 The specification and a modern C++23 implementation of the Zenoh protocol.
 
+Three static libraries, built from one CMake project:
+
+- **`zenoh-proto`** — the pure, I/O-free wire codec plus key-expression matching
+  (`zenoh.ke`). No sockets, no allocation surprises.
+- **`zenoh`** — the client runtime (`Session`): connects to a router, put/get,
+  subscribe/queryable. See [`docs/RUNTIME.md`](docs/RUNTIME.md).
+- **`zenoh-broker`** — `zenohb`, a multithreaded router built on standalone ASIO.
+  See [`docs/BROKER.md`](docs/BROKER.md).
+
 ## Prerequisites
 
 - **CMake 3.28+** (C++23 named-module support)
@@ -65,6 +74,7 @@ builds the image and runs configure + build + test; artifacts land in `build/lin
 ```sh
 scripts/docker-ci.sh                       # Debug  (linux-clang): build + test
 scripts/docker-ci.sh linux-clang-release   # Release (linux-clang-release): build + test
+scripts/docker-ci.sh linux-tsan            # ThreadSanitizer: the broker's concurrency gate
 ```
 
 If you already have Clang + libstdc++ on the host, you can use the presets directly
@@ -102,9 +112,38 @@ scripts/tidy.sh build/clang
 The generated `tests/diff_vectors.hpp` is excluded from formatting
 (`.clang-format-ignore`).
 
+## Running the broker
+
+`zenohb` is a multithreaded ASIO-based router — every preset builds it to
+`build/<preset>/zenohb`, no extra flag needed:
+
+```sh
+./build/clang-release/zenohb -l tcp/0.0.0.0:7447 --threads 4
+```
+
+- `-l`/`--listen tcp/host:port` — listen endpoint (default `0.0.0.0:7447`).
+- `--threads N` — size of the ASIO `io_context` thread pool (default:
+  `std::thread::hardware_concurrency()`; `--threads 1` is a valid single-threaded
+  configuration).
+
+Point any client (this project's own examples below, or a real `zenoh-rust`
+`z_pub`/`z_sub`/`z_get`/`z_queryable` — pass `-m client` to those, since their CLI
+defaults to peer mode) at that endpoint instead of a real `zenohd`. Full routing
+semantics, the concurrency model, and the wire extensions are documented in
+[`docs/BROKER.md`](docs/BROKER.md).
+
+**Use a Release build (`clang-release`/`linux-clang-release`) for anything
+throughput-sensitive.** The `clang`/`linux-clang` presets are ASan+UBSan-instrumented
+for correctness testing, not speed — running a real max-rate benchmark (e.g.
+`zenoh-rust`'s `z_pub_thr`/`z_sub_thr`) against the ASan build can fall behind and
+trip the peer's own timeout, which looks like a broker bug but isn't; see
+[`docs/BROKER.md`](docs/BROKER.md#performance-testing-use-a-release-build-not-the-asanubsan-dev-preset)
+for the full story.
+
 ## Examples
 
-The release/debug builds produce runtime example programs under
-`build/<preset>/examples/` (`z_put`, `z_pub`, `z_put_float`, `z_pub_thr`, `z_sub`, `z_sub_thr`). See [`docs/RUNTIME.md`](docs/RUNTIME.md)
-for how to run them against a Zenoh router. Protocol/codec internals are documented in
-[`docs/PROTO.md`](docs/PROTO.md).
+Every preset builds runtime example programs under `build/<preset>/examples/`:
+`z_put`, `z_pub`, `z_put_float`, `z_pub_thr`, `z_sub`, `z_sub_thr`. See
+[`docs/RUNTIME.md`](docs/RUNTIME.md) for how to run them against a Zenoh router (this
+project's own `zenohb`, above, or a real `zenohd`). Protocol/codec internals are
+documented in [`docs/PROTO.md`](docs/PROTO.md).

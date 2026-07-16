@@ -107,7 +107,24 @@ TEST("Request round-trips (minimal and with every extension)") {
     req2.target = QueryTarget::all;
     req2.budget = 100u;
     req2.timeout = Duration::from_millis(5000);
+    req2.dest = DestinationId{.zid = make_zid({0x01, 0x02, 0x03, 0x04})};
     roundtrip(req2);
+}
+
+TEST("Request dest (project-local zid-targeting ext) round-trips alone and is absent by default") {
+    Request req{};
+    req.id = 42;
+    req.wire_expr.suffix = std::string_view{"a/b"};
+    CHECK(!req.dest.has_value());
+    roundtrip(req); // default: no dest ext written/decoded
+
+    req.dest = DestinationId{.zid = make_zid({0xAA, 0xBB, 0xCC})};
+    roundtrip(req);
+
+    // A full 16-byte zid.
+    req.dest =
+        DestinationId{.zid = make_zid({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})};
+    roundtrip(req);
 }
 
 TEST("Response round-trips (Reply body and Err body)") {

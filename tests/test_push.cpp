@@ -31,10 +31,34 @@ template <class T> auto roundtrip(const T& value) -> void {
     }
 }
 
+auto make_zid(std::initializer_list<int> bytes) -> ZenohId {
+    ZenohId z{};
+    z.len = static_cast<std::uint8_t>(bytes.size());
+    std::size_t i = 0;
+    for (int b : bytes) z.bytes[i++] = static_cast<std::byte>(b);
+    return z;
+}
+
 } // namespace
 
 TEST("Push minimal (default fields) round-trips") {
     Push p{};
+    roundtrip(p);
+}
+
+TEST("Push dest (project-local zid-targeting ext) round-trips alone and is absent by default") {
+    Push p{};
+    p.wire_expr.suffix = std::string_view{"a/b"};
+    CHECK(!p.dest.has_value());
+    roundtrip(p); // default: no dest ext written/decoded
+
+    p.dest = DestinationId{.zid = make_zid({0xAA, 0xBB, 0xCC})};
+    roundtrip(p);
+
+    // A full 16-byte zid, combined with the other extensions.
+    p.qos.inner = 0b0001'0101;
+    p.nodeid.node_id = 7;
+    p.dest = DestinationId{.zid = make_zid({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})};
     roundtrip(p);
 }
 

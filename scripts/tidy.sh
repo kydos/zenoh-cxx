@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Run clang-tidy over the library translation units (src/*.cpp, src/*.cppm) using a
-# CMake build's compile database; headers under src/ and include/ are checked via the
-# HeaderFilterRegex in .clang-tidy. Any diagnostic fails the run.
+# Run clang-tidy over the library translation units (src/*.cpp, src/*.cppm,
+# broker/src/*.cpp, broker/src/*.cppm) using a CMake build's compile database;
+# headers under src/, include/, and broker/ are checked via the HeaderFilterRegex
+# in .clang-tidy. Any diagnostic fails the run.
 #
 # The build dir must already be configured and built (clang-tidy replays the compiled
 # module flags and needs the imported BMIs to exist).
@@ -28,7 +29,7 @@ status=0
 while IFS= read -r f; do
     echo "tidy: ${f}"
     "${TIDY}" -p "${BUILD}" --quiet --warnings-as-errors='*' "${f}" || status=1
-done < <(find src \( -name '*.cpp' -o -name '*.cppm' \) | sort)
+done < <(find src broker/src \( -name '*.cpp' -o -name '*.cppm' \) | sort)
 
 if [ "${status}" -eq 0 ]; then echo "clang-tidy: clean"; fi
 exit "${status}"

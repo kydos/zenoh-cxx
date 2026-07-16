@@ -42,6 +42,27 @@ auto EntityGlobalId::decode_body(ByteReader& r) noexcept
     return g;
 }
 
+auto DestinationId::encode_body(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+    // Same nibble-encoded-length shape as EntityGlobalId::encode_body, minus the
+    // trailing eid; see that function's comment for the len==0/len>16 rationale.
+    if (zid.len == 0 || zid.len > 16) return std::unexpected(CodecError::malformed);
+    std::uint8_t const nibble = static_cast<std::uint8_t>((zid.len - 1) & 0x0f);
+    ZTRY(w.write_byte(static_cast<std::byte>(static_cast<std::uint8_t>(nibble << 4))));
+    return put_raw(w, zid.view());
+}
+
+auto DestinationId::decode_body(ByteReader& r) noexcept
+    -> std::expected<DestinationId, CodecError> {
+    DestinationId d{};
+    auto const h = ZTRY(r.read_byte());
+    std::uint8_t const zlen =
+        static_cast<std::uint8_t>((std::to_integer<std::uint8_t>(h) >> 4) + 1);
+    auto const s = ZTRY(r.read_slice(zlen));
+    d.zid.len = zlen;
+    std::ranges::copy(s, d.zid.bytes.begin());
+    return d;
+}
+
 auto SourceInfo::encode_body(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     ZTRY(id.encode_body(w));
     return put_uint(w, sn);

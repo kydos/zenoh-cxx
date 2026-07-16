@@ -44,6 +44,10 @@ auto error_name(zenoh::ZError e) -> const char* {
         return "bad_endpoint";
     case zenoh::ZError::already_subscribed:
         return "already_subscribed";
+    case zenoh::ZError::already_queryable:
+        return "already_queryable";
+    case zenoh::ZError::query_timeout:
+        return "query_timeout";
     }
     return "unknown";
 }

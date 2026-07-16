@@ -57,6 +57,22 @@ if(ZENOH_SANITIZE)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
+# ThreadSanitizer, mutually exclusive with ASan+UBSan (ASan and TSan cannot be linked
+# into the same binary). This is the dynamic half of the broker's concurrency
+# verification story (see the broker plan's "Concurrency and thread safety" section):
+# paired with the strand-discipline `assert(strand_.running_in_this_thread())` checks
+# in broker/src/{tables,broker}.cpp, a clean TSan run over tests/test_broker.cpp's
+# multithreaded cases is the actual check that the two-tier strand design has no data
+# races, not just an assumption from the design.
+option(ZENOH_TSAN "Build with ThreadSanitizer (mutually exclusive with ZENOH_SANITIZE)" OFF)
+if(ZENOH_TSAN)
+    if(ZENOH_SANITIZE)
+        message(FATAL_ERROR "ZENOH_TSAN and ZENOH_SANITIZE cannot both be ON (ASan/TSan cannot be linked together)")
+    endif()
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+endif()
+
 # LLVM source-based code coverage (clang only). Instruments every target; running
 # the test binary then emits .profraw which scripts/coverage.sh merges into an lcov
 # report. Use a dedicated, un-optimized, sanitizer-free build (the `*-coverage`
@@ -80,6 +96,7 @@ target_sources(zenoh-proto
             src/codec/varint.cppm
             src/codec/codec.cppm
             src/codec/ext.cppm
+            src/ke/ke.cppm
             src/proto/fields/fields.cppm
             src/proto/exts/exts.cppm
             src/proto/network/network.cppm
@@ -88,6 +105,7 @@ target_sources(zenoh-proto
             src/proto/interest/interest.cppm
             src/proto/proto.cppm
     PRIVATE
+            src/ke/ke.cpp
             src/proto/fields/fields.cpp
             src/proto/exts/exts.cpp
             src/proto/network/network.cpp
@@ -116,6 +134,42 @@ target_sources(zenoh
 target_link_libraries(zenoh PUBLIC zenoh-proto)
 target_include_directories(zenoh PUBLIC include)
 target_compile_features(zenoh PUBLIC cxx_std_23)
+
+# Vendored standalone (non-Boost) Asio, broker-only (see third_party/asio/NOTICE.md
+# for the pinned version and vendoring rationale — header-only, checked into the
+# repo rather than fetched at configure time to keep the build hermetic/offline,
+# matching this project's existing "no network fetch" convention). Neither
+# zenoh-proto nor zenoh (the client) depend on this; only zenoh-broker/zenohb do.
+add_library(asio INTERFACE)
+target_include_directories(asio INTERFACE third_party/asio/asio/include)
+target_compile_definitions(asio INTERFACE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+target_link_libraries(asio INTERFACE $<$<PLATFORM_ID:Linux>:pthread>)
+
+# The broker: a multithreaded ASIO reactor over the pure zenoh-proto codec (see
+# the broker plan). Links zenoh-proto (codec + zenoh.ke), never zenoh (the
+# client runtime) or its blocking zenoh.runtime.tcp. Declared here at root,
+# like zenoh-proto/zenoh, rather than via add_subdirectory(broker) — no module
+# FILE_SET target in this repo is declared from a subdirectory, and there is no
+# reason to be the first (see the broker plan's M3 section).
+add_library(zenoh-broker STATIC)
+target_sources(zenoh-broker
+    PUBLIC
+        FILE_SET CXX_MODULES FILES
+            broker/src/resource.cppm
+            broker/src/tables.cppm
+            broker/src/broker.cppm
+    PRIVATE
+            broker/src/resource.cpp
+            broker/src/tables.cpp
+            broker/src/broker.cpp
+)
+target_link_libraries(zenoh-broker PUBLIC zenoh-proto PRIVATE asio)
+target_include_directories(zenoh-broker PUBLIC include)
+target_compile_features(zenoh-broker PUBLIC cxx_std_23)
+
+add_executable(zenohb broker/src/main.cpp)
+target_link_libraries(zenohb PRIVATE zenoh-broker)
+target_compile_features(zenohb PRIVATE cxx_std_23)
 
 option(ZENOH_EXAMPLES "Build the runtime example programs" ON)
 if(ZENOH_EXAMPLES)

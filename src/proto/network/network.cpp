@@ -143,18 +143,22 @@ auto Push::encode_head(ByteWriter& w) const noexcept -> std::expected<void, Code
     bool const q = !(qos == QoS{});
     bool const ts = timestamp.has_value();
     bool const nid = !(nodeid == NodeId{});
-    bool const z = q || ts || nid;
+    bool const dst = dest.has_value();
+    bool const z = q || ts || nid || dst;
 
     auto const h =
         static_cast<std::uint8_t>(id | (z ? flag_z : 0) | (m ? flag_x6 : 0) | (n ? flag_x5 : 0));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(wire_expr.encode_body(w));
 
-    if (q) ZTRY(put_ext_u64(w, 0x1, false, /*more=*/ts || nid, qos.inner));
+    if (q) ZTRY(put_ext_u64(w, 0x1, false, /*more=*/ts || nid || dst, qos.inner));
     if (ts)
-        ZTRY(put_ext_zstruct(w, 0x2, false, /*more=*/nid, timestamp->encoded_len(),
+        ZTRY(put_ext_zstruct(w, 0x2, false, /*more=*/nid || dst, timestamp->encoded_len(),
                              [&](auto& ww) { return timestamp->encode(ww); }));
-    if (nid) ZTRY(put_ext_u64(w, 0x3, /*mandatory=*/true, /*more=*/false, nodeid.node_id));
+    if (nid) ZTRY(put_ext_u64(w, 0x3, /*mandatory=*/true, /*more=*/dst, nodeid.node_id));
+    if (dst)
+        ZTRY(put_ext_zstruct(w, 0x4, /*mandatory=*/false, /*more=*/false, dest->body_len(),
+                             [&](auto& ww) { return dest->encode_body(ww); }));
 
     return payload.encode_head(w);
 }
@@ -188,6 +192,11 @@ auto Push::decode(ByteReader& r) noexcept -> std::expected<Push, CodecError> {
         case 0x3:
             p.nodeid.node_id = ZTRY(read_ext_uint<std::uint16_t>(r));
             break;
+        case 0x4: {
+            ByteReader sub{ZTRY(read_ext_zstruct(r))};
+            p.dest = ZTRY(DestinationId::decode_body(sub));
+            break;
+        }
         default:
             if (eh.mandatory) return std::unexpected(CodecError::malformed);
             ZTRY(skip_ext(r, eh.kind));
@@ -351,7 +360,8 @@ auto Request::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_tgt = target != QueryTarget::best_matching;
     bool const e_bud = budget.has_value();
     bool const e_to = timeout.has_value();
-    bool const z = e_qos || e_ts || e_nid || e_tgt || e_bud || e_to;
+    bool const e_dest = dest.has_value();
+    bool const z = e_qos || e_ts || e_nid || e_tgt || e_bud || e_to || e_dest;
 
     auto const h =
         static_cast<std::uint8_t>(mid | (z ? flag_z : 0) | (m ? flag_x6 : 0) | (n ? flag_x5 : 0));
@@ -359,16 +369,25 @@ auto Request::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     ZTRY(put_uint(w, id));
     ZTRY(wire_expr.encode_body(w));
 
-    // The reference writes nodeid (id 3) LAST, after target/budget/timeout.
-    if (e_qos) ZTRY(put_ext_u64(w, 0x1, false, e_ts || e_tgt || e_bud || e_to || e_nid, qos.inner));
+    // The reference writes nodeid (id 3) LAST, after target/budget/timeout. `dest`
+    // (0x7, project-local, not present in the reference) is placed right before
+    // nodeid — since no differential vector ever sets it, this ordering choice
+    // never perturbs a byte of any existing reference-matched encoding.
+    bool const more_qos = e_ts || e_tgt || e_bud || e_to || e_dest || e_nid;
+    bool const more_ts = e_tgt || e_bud || e_to || e_dest || e_nid;
+    bool const more_tgt = e_bud || e_to || e_dest || e_nid;
+    bool const more_bud = e_to || e_dest || e_nid;
+    bool const more_to = e_dest || e_nid;
+    if (e_qos) ZTRY(put_ext_u64(w, 0x1, false, more_qos, qos.inner));
     if (e_ts)
-        ZTRY(put_ext_zstruct(w, 0x2, false, e_tgt || e_bud || e_to || e_nid,
-                             timestamp->encoded_len(),
+        ZTRY(put_ext_zstruct(w, 0x2, false, more_ts, timestamp->encoded_len(),
                              [&](auto& ww) { return timestamp->encode(ww); }));
-    if (e_tgt)
-        ZTRY(put_ext_u64(w, 0x4, true, e_bud || e_to || e_nid, static_cast<std::uint8_t>(target)));
-    if (e_bud) ZTRY(put_ext_u64(w, 0x5, false, e_to || e_nid, *budget));
-    if (e_to) ZTRY(put_ext_u64(w, 0x6, false, e_nid, timeout->millis()));
+    if (e_tgt) ZTRY(put_ext_u64(w, 0x4, true, more_tgt, static_cast<std::uint8_t>(target)));
+    if (e_bud) ZTRY(put_ext_u64(w, 0x5, false, more_bud, *budget));
+    if (e_to) ZTRY(put_ext_u64(w, 0x6, false, more_to, timeout->millis()));
+    if (e_dest)
+        ZTRY(put_ext_zstruct(w, 0x7, /*mandatory=*/false, /*more=*/e_nid, dest->body_len(),
+                             [&](auto& ww) { return dest->encode_body(ww); }));
     if (e_nid) ZTRY(put_ext_u64(w, 0x3, true, false, nodeid.node_id));
 
     return payload.encode(w);
@@ -411,6 +430,11 @@ auto Request::decode(ByteReader& r) noexcept -> std::expected<Request, CodecErro
         case 0x6:
             req.timeout = Duration::from_millis(ZTRY(read_ext_u64(r)));
             break;
+        case 0x7: {
+            ByteReader sub{ZTRY(read_ext_zstruct(r))};
+            req.dest = ZTRY(DestinationId::decode_body(sub));
+            break;
+        }
         default:
             if (eh.mandatory) return std::unexpected(CodecError::malformed);
             ZTRY(skip_ext(r, eh.kind));

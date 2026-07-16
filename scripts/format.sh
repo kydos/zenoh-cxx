@@ -19,7 +19,7 @@ fi
 FMT="${CLANG_FORMAT:-${LLVM_BIN:+${LLVM_BIN}/}clang-format}"
 
 find_sources() {
-    find src include tests examples fuzz -type f \
+    find src include tests examples broker fuzz -type f \
         \( -name '*.cpp' -o -name '*.cppm' -o -name '*.hpp' -o -name '*.h' \) \
         -not -name 'diff_vectors.hpp'
 }

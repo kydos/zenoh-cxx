@@ -1,7 +1,9 @@
 module;
 
+#include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -24,12 +26,14 @@ import zenoh.runtime.tcp;
 import zenoh.runtime.strand;
 
 // Implementation unit for zenoh.session: endpoint parsing, the 4-way transport
-// handshake, and the put / try_put publish paths.
+// handshake, and the put / try_put / get publish/query paths.
 namespace zenoh {
 namespace {
 
 /// Default client lease (matches the reference): 10 s.
 constexpr std::uint64_t default_lease_ms = 10'000;
+/// Default `get()` reply-collection deadline when `GetOptions::timeout` is unset.
+constexpr std::uint64_t default_get_timeout_ms = 10'000;
 /// SN resolution mask for the default U32 frame-SN resolution (u32::MAX >> 4).
 constexpr std::uint32_t sn_mask = 0x0fff'ffff;
 /// Max bytes a single TCP batch can carry (the 2-byte length prefix is a u16).
@@ -53,6 +57,57 @@ constexpr std::size_t max_resmap_entries = 4096;
     default:
         return ZError::io_error;
     }
+}
+
+/// `PeerId` <-> `ZenohId` are the same 16-byte-array + length shape; the public
+/// `zenoh` module just doesn't re-export `zenoh.proto.fields`, so this conversion
+/// lives here at the boundary instead of being a public API.
+[[nodiscard]] auto to_zenoh_id(const PeerId& p) noexcept -> ZenohId {
+    ZenohId z{};
+    z.len = p.len;
+    z.bytes = p.bytes;
+    return z;
+}
+
+[[nodiscard]] auto from_zenoh_id(const ZenohId& z) noexcept -> PeerId {
+    PeerId p{};
+    p.len = z.len;
+    p.bytes = z.bytes;
+    return p;
+}
+
+/// `GetConsolidation`/`GetTarget` <-> `zenoh.proto.fields`'s `ConsolidationMode`/
+/// `QueryTarget`: same shape-mirroring reason as `to_zenoh_id`/`from_zenoh_id`.
+[[nodiscard]] auto to_consolidation_mode(GetConsolidation c) noexcept -> ConsolidationMode {
+    switch (c) {
+    case GetConsolidation::none:
+        return ConsolidationMode::none;
+    case GetConsolidation::monotonic:
+        return ConsolidationMode::monotonic;
+    case GetConsolidation::latest:
+        return ConsolidationMode::latest;
+    case GetConsolidation::automatic:
+        return ConsolidationMode::automatic;
+    }
+    return ConsolidationMode::automatic; // unreachable for a valid enumerator
+}
+
+[[nodiscard]] auto to_query_target(GetTarget t) noexcept -> QueryTarget {
+    switch (t) {
+    case GetTarget::all:
+        return QueryTarget::all;
+    case GetTarget::all_complete:
+        return QueryTarget::all_complete;
+    case GetTarget::best_matching:
+        return QueryTarget::best_matching;
+    }
+    return QueryTarget::best_matching; // unreachable for a valid enumerator
+}
+
+/// The effective reply-collection deadline in milliseconds: `opts.timeout_ms` if set,
+/// else `default_get_timeout_ms`.
+[[nodiscard]] auto effective_timeout_ms(const GetOptions& opts) noexcept -> std::uint64_t {
+    return opts.timeout_ms ? static_cast<std::uint64_t>(*opts.timeout_ms) : default_get_timeout_ms;
 }
 
 /// Parse "tcp/host:port", "host:port" (incl. "[ipv6]:port") into host + port.
@@ -123,6 +178,39 @@ struct SubReg {
         : id(i), key(std::move(k)), strand(cap, m), handler(std::move(h)) {}
 };
 
+// Plain data popped from a queryable's strand; wrapped into an `IncomingQuery`
+// (which needs a live `Session*`) only at delivery time — same reasoning as `Sample`
+// being built fresh from a receive-buffer copy in `dispatch_cursor`.
+struct PendingQuery {
+    std::uint32_t rid = 0;
+    std::string key;
+    std::string params;
+    std::vector<std::byte> payload; ///< Query::body's payload, if any (else empty)
+};
+
+// The active queryable registration (one per session, first cut). Mirrors `SubReg`.
+struct QblReg {
+    std::uint32_t id;
+    std::string key;
+    Strand<PendingQuery> strand;
+    QueryHandler handler; ///< empty for a pull-based (recv) queryable
+    QblReg(std::uint32_t i, std::string k, std::size_t cap, StrandMode m, QueryHandler h)
+        : id(i), key(std::move(k)), strand(cap, m), handler(std::move(h)) {}
+};
+
+// One in-flight get()'s bookkeeping: the reply strand, an optional callback (empty
+// for a pull-based `Getter`), whether the broker's `ResponseFinal` has been seen, and
+// the client-enforced deadline (the broker does not enforce query timeouts in v1).
+struct GetReg {
+    Strand<GetReply> strand;
+    GetReplyHandler handler;
+    bool final = false;
+    std::chrono::steady_clock::time_point deadline;
+    GetReg(std::size_t cap, StrandMode mode, GetReplyHandler h,
+           std::chrono::steady_clock::time_point dl)
+        : strand(cap, mode), handler(std::move(h)), deadline(dl) {}
+};
+
 Session::Session(Session&&) noexcept = default;
 auto Session::operator=(Session&&) noexcept -> Session& = default;
 Session::~Session() = default;
@@ -146,6 +234,7 @@ auto Session::open(std::string_view endpoint) -> std::expected<Session, ZError> 
         unsigned const v = rd();
         __builtin_memcpy(zid.bytes.data() + i, &v, sizeof(unsigned));
     }
+    s.local_zid_ = zid;
 
     std::vector<std::byte> txbuf(4096);
     std::vector<std::byte> rxbuf(4096);
@@ -207,10 +296,13 @@ auto Session::open(std::string_view endpoint) -> std::expected<Session, ZError> 
     return s;
 }
 
-auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> payload)
-    -> std::expected<void, ZError> {
+auto Session::local_zid() const noexcept -> PeerId { return from_zenoh_id(local_zid_); }
+
+auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> payload,
+                         std::optional<PeerId> target_zid) -> std::expected<void, ZError> {
     Push push{};
     push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    if (target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*target_zid)};
     Put put{};
     put.payload = payload;
     push.payload = PushBody{.body = std::move(put)};
@@ -232,10 +324,12 @@ auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> p
     return {};
 }
 
-auto Session::encode_put_head(std::string_view key_expr, std::span<const std::byte> payload)
+auto Session::encode_put_head(std::string_view key_expr, std::span<const std::byte> payload,
+                              std::optional<PeerId> target_zid)
     -> std::expected<std::size_t, ZError> {
     Push push{};
     push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    if (target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*target_zid)};
     Put put{};
     put.payload = payload; // present only so the encoded length prefix is correct
     push.payload = PushBody{.body = std::move(put)};
@@ -276,8 +370,8 @@ auto Session::flush_pending() -> std::expected<void, ZError> {
     return std::unexpected(ZError::would_block); // still partially buffered
 }
 
-auto Session::put(std::string_view key_expr, std::span<const std::byte> payload)
-    -> std::expected<void, ZError> {
+auto Session::put(std::string_view key_expr, std::span<const std::byte> payload,
+                  std::optional<PeerId> target_zid) -> std::expected<void, ZError> {
     // Drain any bytes a prior try_put left buffered (blocking).
     if (pending_off_ < tx_pending_.size()) {
         if (auto r = link_.write_all(std::span(tx_pending_).subspan(pending_off_)); !r)
@@ -288,7 +382,7 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload)
 
     // Scatter-gather: encode just the header into tx_scratch_ and write it together
     // with the borrowed payload, so the payload is never copied into a staging buffer.
-    auto const head = encode_put_head(key_expr, payload);
+    auto const head = encode_put_head(key_expr, payload, target_zid);
     if (!head) return std::unexpected(head.error());
 
     if (auto r = link_.writev_all(std::span(tx_scratch_).first(*head), payload); !r)
@@ -297,14 +391,14 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload)
     return {};
 }
 
-auto Session::try_put(std::string_view key_expr, std::span<const std::byte> payload)
-    -> std::expected<void, ZError> {
+auto Session::try_put(std::string_view key_expr, std::span<const std::byte> payload,
+                      std::optional<PeerId> target_zid) -> std::expected<void, ZError> {
     // Don't interleave a new frame ahead of buffered bytes: flush first.
     if (pending_off_ < tx_pending_.size()) {
         if (auto f = flush_pending(); !f) return std::unexpected(f.error());
     }
 
-    if (auto e = encode_put(key_expr, payload); !e) return std::unexpected(e.error());
+    if (auto e = encode_put(key_expr, payload, target_zid); !e) return std::unexpected(e.error());
     std::size_t const framed =
         static_cast<std::size_t>(load_le<std::uint16_t>(tx_scratch_.data())) + 2;
     auto const batch = std::span(tx_scratch_).first(framed);
@@ -341,8 +435,7 @@ auto Session::close() -> void {
     c.reason = 0;
     c.behaviour = CloseBehaviour::session;
     std::vector<std::byte> buf(64);
-    if (auto framed = frame_message(buf, c); framed)
-        (void)link_.write_all(std::span(buf).first(*framed));
+    if (auto framed = frame_message(buf, c)) (void)link_.write_all(std::span(buf).first(*framed));
 
     link_ = TcpLink{}; // close the socket
 }
@@ -513,6 +606,174 @@ auto Session::sub_drop() -> void {
     }
 }
 
+// --- Queryable declaration / teardown ---
+
+auto Session::write_declare_queryable(std::uint32_t id, std::string_view key, QueryableInfo qinfo)
+    -> std::expected<void, ZError> {
+    Declare d{};
+    DeclareQueryable dq{};
+    dq.id = id;
+    dq.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key};
+    dq.qinfo = qinfo;
+    d.body = DeclareBody{.body = dq};
+
+    std::vector<std::byte> tmp(key.size() + 64);
+    ByteWriter w{tmp};
+    if (!d.encode(w)) return std::unexpected(ZError::encode_error);
+    return write_frame(std::span(tmp).first(w.written()));
+}
+
+auto Session::write_undeclare_queryable(std::uint32_t id) -> void {
+    if (!link_.valid()) return;
+    Declare d{};
+    UndeclareQueryable uq{};
+    uq.id = id;
+    d.body = DeclareBody{.body = uq};
+
+    std::vector<std::byte> tmp(64);
+    ByteWriter w{tmp};
+    if (!d.encode(w)) return;
+    (void)write_frame(std::span(tmp).first(w.written())); // best-effort
+}
+
+auto Session::declare_queryable(std::string_view key_expr, QueryableOptions opts)
+    -> std::expected<Queryable, ZError> {
+    return declare_queryable(key_expr, QueryHandler{}, opts);
+}
+
+auto Session::declare_queryable(std::string_view key_expr, QueryHandler on_query,
+                                QueryableOptions opts) -> std::expected<Queryable, ZError> {
+    if (qbl_) return std::unexpected(ZError::already_queryable);
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
+    std::uint32_t const id = next_entity_id_++;
+    QueryableInfo const qinfo{.complete = opts.complete, .distance = opts.distance};
+    if (auto r = write_declare_queryable(id, key_expr, qinfo); !r)
+        return std::unexpected(r.error());
+    qbl_ = std::make_unique<QblReg>(id, std::string(key_expr), opts.capacity, opts.mode,
+                                    std::move(on_query));
+    return Queryable{this};
+}
+
+auto Session::qbl_drop() -> void {
+    if (qbl_) {
+        write_undeclare_queryable(qbl_->id);
+        qbl_.reset();
+    }
+}
+
+auto Session::send_response(std::uint32_t rid, std::string_view key_expr,
+                            std::span<const std::byte> payload, bool is_err)
+    -> std::expected<void, ZError> {
+    Response rsp{};
+    rsp.rid = rid;
+    rsp.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    if (is_err) {
+        Err e{};
+        e.payload = payload;
+        rsp.payload.body = e;
+    } else {
+        Put put{};
+        put.payload = payload;
+        Reply rep{};
+        rep.payload = PushBody{.body = put};
+        rsp.payload.body = rep;
+    }
+
+    std::vector<std::byte> tmp(64 + key_expr.size() + payload.size());
+    ByteWriter w{tmp};
+    if (!rsp.encode(w)) return std::unexpected(ZError::encode_error);
+    return write_frame(std::span(tmp).first(w.written()));
+}
+
+auto Session::send_response_final(std::uint32_t rid) -> void {
+    if (!link_.valid()) return;
+    ResponseFinal rf{};
+    rf.rid = rid;
+    std::vector<std::byte> tmp(32);
+    ByteWriter w{tmp};
+    if (!rf.encode(w)) return;
+    (void)write_frame(std::span(tmp).first(w.written())); // best-effort
+}
+
+// --- get() / Getter ---
+
+auto Session::write_request(std::uint32_t rid, std::string_view key_expr,
+                            std::string_view parameters, const GetOptions& opts)
+    -> std::expected<void, ZError> {
+    Request req{};
+    req.id = rid;
+    req.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    req.target = to_query_target(opts.target);
+    req.timeout = Duration::from_millis(effective_timeout_ms(opts));
+    if (opts.target_zid) req.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
+
+    Query q{};
+    q.consolidation = to_consolidation_mode(opts.consolidation);
+    q.parameters = parameters;
+    req.payload = RequestBody{.query = q};
+
+    std::vector<std::byte> tmp(64 + key_expr.size() + parameters.size());
+    ByteWriter w{tmp};
+    if (!req.encode(w)) return std::unexpected(ZError::encode_error);
+    return write_frame(std::span(tmp).first(w.written()));
+}
+
+auto Session::start_get(std::string_view key_expr, std::string_view parameters,
+                        GetReplyHandler handler, const GetOptions& opts)
+    -> std::expected<std::uint32_t, ZError> {
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
+    std::uint32_t const rid = next_request_id_++;
+    if (auto r = write_request(rid, key_expr, parameters, opts); !r)
+        return std::unexpected(r.error());
+    auto const deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms(opts));
+    pending_gets_[rid] =
+        std::make_unique<GetReg>(256, StrandMode::ordered, std::move(handler), deadline);
+    return rid;
+}
+
+auto Session::get(std::string_view key_expr, std::string_view parameters, GetOptions opts)
+    -> std::expected<Getter, ZError> {
+    auto rid = start_get(key_expr, parameters, GetReplyHandler{}, opts);
+    if (!rid) return std::unexpected(rid.error());
+    return Getter{this, *rid};
+}
+
+auto Session::get(std::string_view key_expr, std::string_view parameters, GetReplyHandler on_reply,
+                  GetOptions opts) -> std::expected<void, ZError> {
+    auto rid = start_get(key_expr, parameters, std::move(on_reply), opts);
+    if (!rid) return std::unexpected(rid.error());
+    return {};
+}
+
+auto Session::get_recv(std::uint32_t rid) -> std::expected<std::optional<GetReply>, ZError> {
+    for (;;) {
+        auto it = pending_gets_.find(rid);
+        if (it == pending_gets_.end())
+            return std::optional<GetReply>{std::nullopt}; // already cleaned up: treat as done
+        if (auto r = it->second->strand.pop()) return std::move(r);
+        if (it->second->final) {
+            pending_gets_.erase(it);
+            return std::optional<GetReply>{std::nullopt};
+        }
+        auto const now = std::chrono::steady_clock::now();
+        if (now >= it->second->deadline) {
+            pending_gets_.erase(it);
+            return std::unexpected(ZError::query_timeout);
+        }
+        // Bound this pump_step's wait to what's left of the deadline, so a short
+        // GetOptions::timeout is noticed as soon as it elapses rather than only after
+        // pump_step's normal (much longer) keepalive-cadence wait returns.
+        auto const remaining_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(it->second->deadline - now)
+                .count();
+        if (auto p = pump_step(static_cast<std::int32_t>(remaining_ms)); !p)
+            return std::unexpected(p.error());
+    }
+}
+
+auto Session::get_drop(std::uint32_t rid) -> void { pending_gets_.erase(rid); }
+
 // --- Receive pump ---
 
 auto Session::send_keepalive() -> std::expected<void, ZError> {
@@ -601,6 +862,83 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
                 resmap_.erase(uk->id);
             }
             rx_pos_ = rx_end_ - r.remaining();
+        } else if (mid == Request::mid) {
+            auto req = Request::decode(r);
+            if (!req) {
+                fault_ = ZError::protocol_error;
+                return std::unexpected(*fault_);
+            }
+            // `req->dest` (zid-targeting) is not re-filtered here: the broker already
+            // restricts fan-out to the matching peer before a Request ever reaches
+            // us, so by the time it's here it's already known to be for us.
+            if (qbl_) {
+                auto key = resolve_key(req->wire_expr);
+                if (!key) {
+                    fault_ = key.error();
+                    return std::unexpected(*fault_);
+                }
+                std::vector<std::byte> payload;
+                if (req->payload.query.body)
+                    payload.assign(req->payload.query.body->payload.begin(),
+                                   req->payload.query.body->payload.end());
+                PendingQuery pq{.rid = req->id,
+                                .key = *key,
+                                .params = std::string(req->payload.query.parameters),
+                                .payload = std::move(payload)};
+                if (qbl_->strand.post(*key, std::move(pq)) == PostResult::full) {
+                    return {}; // pause; retry next pump
+                }
+            } else {
+                // No queryable declared on this session: nobody will ever construct an
+                // IncomingQuery to finalize this request, so finalize it ourselves —
+                // otherwise the broker's fan-in counter for this rid waits forever.
+                send_response_final(req->id);
+            }
+            rx_pos_ = rx_end_ - r.remaining();
+        } else if (mid == Response::id) {
+            auto rsp = Response::decode(r);
+            if (!rsp) {
+                fault_ = ZError::protocol_error;
+                return std::unexpected(*fault_);
+            }
+            if (auto it = pending_gets_.find(rsp->rid); it != pending_gets_.end()) {
+                GetReply gr{};
+                PostResult post_result = PostResult::posted;
+                if (auto const* reply = std::get_if<Reply>(&rsp->payload.body)) {
+                    auto key = resolve_key(rsp->wire_expr);
+                    if (!key) {
+                        fault_ = key.error();
+                        return std::unexpected(*fault_);
+                    }
+                    gr.ok_ = true;
+                    SampleKind kind = SampleKind::del;
+                    std::vector<std::byte> payload;
+                    if (auto const* put = std::get_if<Put>(&reply->payload.body)) {
+                        kind = SampleKind::put;
+                        payload.assign(put->payload.begin(), put->payload.end());
+                    }
+                    gr.sample_ = Sample{*key, std::move(payload), kind};
+                    post_result = it->second->strand.post(*key, std::move(gr));
+                } else if (auto const* err = std::get_if<Err>(&rsp->payload.body)) {
+                    gr.ok_ = false;
+                    gr.err_payload_.assign(err->payload.begin(), err->payload.end());
+                    post_result = it->second->strand.post(std::string_view{}, std::move(gr));
+                }
+                if (post_result == PostResult::full) return {}; // pause; retry next pump
+            }
+            // else: unknown/already-cleaned-up rid (e.g. client-side timeout already
+            // fired) — silently ignore, matching resolve_key's "tolerate the unknown"
+            // spirit for anything that isn't a stream-desync signal.
+            rx_pos_ = rx_end_ - r.remaining();
+        } else if (mid == ResponseFinal::id) {
+            auto rf = ResponseFinal::decode(r);
+            if (!rf) {
+                fault_ = ZError::protocol_error;
+                return std::unexpected(*fault_);
+            }
+            if (auto it = pending_gets_.find(rf->rid); it != pending_gets_.end())
+                it->second->final = true;
+            rx_pos_ = rx_end_ - r.remaining();
         } else {
             // Unknown network message mid-frame: cannot be length-skipped safely.
             fault_ = ZError::protocol_error;
@@ -611,19 +949,28 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
     return {};
 }
 
-auto Session::pump_step() -> std::expected<void, ZError> {
+auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expected<void, ZError> {
     if (fault_) return std::unexpected(*fault_);     // sticky terminal fault — never resync
     if (rx_pos_ < rx_end_) return dispatch_cursor(); // resume an in-progress frame
 
-    auto ready = link_.poll_readable(keepalive_ms_);
+    // A caller-supplied max_wait_ms only ever shortens this call's poll (e.g.
+    // get_recv bounding it to a get()'s own deadline so a short GetOptions::timeout
+    // is noticed promptly); it never lengthens it past the normal keepalive cadence.
+    std::int32_t const wait = max_wait_ms ? std::min(*max_wait_ms, keepalive_ms_) : keepalive_ms_;
+    auto ready = link_.poll_readable(wait);
     if (!ready) {
         fault_ = io_to_zerr(ready.error());
         return std::unexpected(*fault_);
     }
-    if (!*ready) { // idle: keepalive timer fired
-        if (auto r = send_keepalive(); !r) {
-            fault_ = r.error();
-            return std::unexpected(*fault_);
+    if (!*ready) {
+        // Only a *real* keepalive-interval-long idle period sends a keepalive — a
+        // shortened wait timing out just means "no data yet, let the caller re-check
+        // its own deadline", not "the link has been idle for a full keepalive_ms_".
+        if (wait >= keepalive_ms_) {
+            if (auto r = send_keepalive(); !r) {
+                fault_ = r.error();
+                return std::unexpected(*fault_);
+            }
         }
         return {};
     }
@@ -667,10 +1014,41 @@ auto Session::sub_recv() -> std::expected<Sample, ZError> {
     }
 }
 
+auto Session::qbl_recv() -> std::expected<IncomingQuery, ZError> {
+    for (;;) {
+        if (!qbl_) return std::unexpected(ZError::connection_closed);
+        if (auto pq = qbl_->strand.pop())
+            return IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
+                                 std::move(pq->payload));
+        if (auto r = pump_step(); !r) return std::unexpected(r.error());
+    }
+}
+
 auto Session::run_once() -> std::expected<void, ZError> {
     if (auto r = pump_step(); !r) return std::unexpected(r.error());
     if (sub_ && sub_->handler) {
         while (auto s = sub_->strand.pop()) sub_->handler(*s); // deliver to the callback
+    }
+    if (qbl_ && qbl_->handler) {
+        while (auto pq = qbl_->strand.pop())
+            qbl_->handler(IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
+                                        std::move(pq->payload)));
+    }
+    // Drain callback-style get()s. Pull-style (handler-empty) entries are owned
+    // entirely by their Getter (recv()'s own pump loop and ~Getter()'s cleanup), so
+    // they're deliberately left untouched here to avoid two owners racing to erase
+    // the same map entry.
+    for (auto it = pending_gets_.begin(); it != pending_gets_.end();) {
+        auto& reg = *it->second;
+        if (!reg.handler) {
+            ++it;
+            continue;
+        }
+        while (auto r = reg.strand.pop()) reg.handler(*r);
+        if ((reg.final && reg.strand.empty()) || std::chrono::steady_clock::now() >= reg.deadline)
+            it = pending_gets_.erase(it);
+        else
+            ++it;
     }
     return {};
 }
@@ -715,6 +1093,103 @@ auto Subscriber::undeclare() -> void {
 auto Subscriber::key_expr() const noexcept -> std::string_view {
     if (session_ != nullptr && session_->sub_) return session_->sub_->key;
     return {};
+}
+
+// --- Queryable handle ---
+
+Queryable::Queryable(Queryable&& other) noexcept : session_(other.session_) {
+    other.session_ = nullptr;
+}
+
+auto Queryable::operator=(Queryable&& other) noexcept -> Queryable& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->qbl_drop(); // undeclare our own first
+        session_ = other.session_;
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+Queryable::~Queryable() {
+    if (session_ != nullptr) session_->qbl_drop(); // best-effort undeclare
+}
+
+auto Queryable::recv() -> std::expected<IncomingQuery, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->qbl_recv();
+}
+
+auto Queryable::undeclare() -> void {
+    if (session_ != nullptr) {
+        session_->qbl_drop();
+        session_ = nullptr;
+    }
+}
+
+auto Queryable::key_expr() const noexcept -> std::string_view {
+    if (session_ != nullptr && session_->qbl_) return session_->qbl_->key;
+    return {};
+}
+
+// --- IncomingQuery handle ---
+
+IncomingQuery::IncomingQuery(IncomingQuery&& other) noexcept
+    : session_(other.session_), rid_(other.rid_), key_(std::move(other.key_)),
+      params_(std::move(other.params_)), payload_(std::move(other.payload_)) {
+    other.session_ = nullptr;
+}
+
+auto IncomingQuery::operator=(IncomingQuery&& other) noexcept -> IncomingQuery& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->send_response_final(rid_); // finalize our own first
+        session_ = other.session_;
+        rid_ = other.rid_;
+        key_ = std::move(other.key_);
+        params_ = std::move(other.params_);
+        payload_ = std::move(other.payload_);
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+IncomingQuery::~IncomingQuery() {
+    if (session_ != nullptr) session_->send_response_final(rid_); // best-effort
+}
+
+auto IncomingQuery::reply(std::string_view key_expr, std::span<const std::byte> payload)
+    -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->send_response(rid_, key_expr, payload, /*is_err=*/false);
+}
+
+auto IncomingQuery::reply_err(std::span<const std::byte> payload) -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->send_response(rid_, std::string_view{}, payload, /*is_err=*/true);
+}
+
+// --- Getter handle ---
+
+Getter::Getter(Getter&& other) noexcept : session_(other.session_), rid_(other.rid_) {
+    other.session_ = nullptr;
+}
+
+auto Getter::operator=(Getter&& other) noexcept -> Getter& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->get_drop(rid_);
+        session_ = other.session_;
+        rid_ = other.rid_;
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+Getter::~Getter() {
+    if (session_ != nullptr) session_->get_drop(rid_);
+}
+
+auto Getter::recv() -> std::expected<std::optional<GetReply>, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->get_recv(rid_);
 }
 
 } // namespace zenoh

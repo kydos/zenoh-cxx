@@ -2,9 +2,9 @@
 #
 # Build with LLVM source-based coverage, run the test suite, and emit an lcov report
 # at build/<preset>/coverage.lcov covering the library sources only (tests, examples,
-# and fuzz targets excluded). Runs anywhere the clang toolchain plus llvm-cov /
-# llvm-profdata are available; in CI it runs inside the Docker image via
-# scripts/docker-coverage.sh.
+# fuzz targets, and vendored third-party headers excluded). Runs anywhere the clang
+# toolchain plus llvm-cov / llvm-profdata are available; in CI it runs inside the
+# Docker image via scripts/docker-coverage.sh.
 #
 # Usage:
 #   scripts/coverage.sh                 # default preset: linux-coverage
@@ -43,7 +43,7 @@ echo "::group::[${PRESET}] coverage report"
 "${COV}" export "${TEST_BIN}" \
     -instr-profile="${BUILD}/coverage.profdata" \
     -format=lcov \
-    -ignore-filename-regex='(tests|examples|fuzz)/' \
+    -ignore-filename-regex='(tests|examples|fuzz|third_party)/' \
     > "${BUILD}/coverage.lcov"
 # Make source paths repo-relative (strip the absolute working-dir prefix) so Codecov
 # maps them onto the repo tree. -i.bak is portable across GNU and BSD sed.

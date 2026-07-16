@@ -129,6 +129,7 @@ struct Push {
     QoS qos{};                            ///< ext 0x1 (U64), default-elided
     std::optional<Timestamp> timestamp{}; ///< ext 0x2 (ZStruct)
     NodeId nodeid{};                      ///< ext 0x3 (U64, mandatory), default-elided
+    std::optional<DestinationId> dest{};  ///< ext 0x4 (ZStruct, project-local, see exts.cppm)
     PushBody payload{};
 
     static constexpr std::uint8_t id = 0x1d;
@@ -237,6 +238,7 @@ struct Request {
     QueryTarget target = QueryTarget::best_matching; ///< ext 0x4 (U64, mandatory), default-elided
     std::optional<std::uint32_t> budget{};           ///< ext 0x5 (U64)
     std::optional<Duration> timeout{};               ///< ext 0x6 (U64, millis)
+    std::optional<DestinationId> dest{}; ///< ext 0x7 (ZStruct, project-local, see exts.cppm)
     RequestBody payload{};
 
     static constexpr std::uint8_t mid = 0x1c;

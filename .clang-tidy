@@ -16,6 +16,11 @@
 #     result of best-effort I/O (e.g. flush in destructors); [[nodiscard]] already
 #     enforces the non-discardable cases at compile time. (clang-tidy 19 ignores the
 #     explicit cast-to-void that newer versions honor.)
+#   - misc-header-include-cycle: vendored standalone Asio (third_party/asio, broker
+#     only) deliberately splits each header into a `foo.hpp` declarations file and a
+#     `impl/foo.ipp` bodies file that re-includes `foo.hpp` (guarded by the normal
+#     include guard, so it's not an actual cycle) -- a standard header-only-library
+#     idiom, not a bug in code this project owns.
 Checks: >
   bugprone-*,
   -bugprone-exception-escape,
@@ -30,6 +35,12 @@ Checks: >
   -misc-const-correctness,
   -misc-non-private-member-variables-in-classes,
   -misc-no-recursion,
-  -misc-use-internal-linkage
-HeaderFilterRegex: '(src|include)/'
+  -misc-use-internal-linkage,
+  -misc-header-include-cycle
+# Unanchored substring match, so scoped narrowly enough to avoid matching
+# vendored third-party headers pulled in transitively (third_party/asio/asio/
+# include/... would otherwise match a bare "include/" alternative -- our own
+# public headers always sit under include/zenoh/, so that's what's matched
+# instead of the bare directory name).
+HeaderFilterRegex: '(src/|broker/|include/zenoh/)'
 FormatStyle: file
