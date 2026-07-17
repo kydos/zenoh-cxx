@@ -4,6 +4,7 @@ module;
 #include <asio/strand.hpp>
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -150,20 +151,32 @@ class Tables {
     auto on_response_final(FaceId from, std::uint32_t local_rid) -> void;
 
     // --- test-only introspection; callers must already be on strand() ---
-    [[nodiscard]] auto face_count() const noexcept -> std::size_t { return faces_.size(); }
+    // Asserted, not just documented: these are as easy to call off-strand by
+    // accident as any mutating method (e.g. a test forgetting to wrap one in
+    // on_strand()), and being merely read-only doesn't make that safe -- faces_/
+    // resources_/pending_queries_/fanout_remaining_ are all written concurrently
+    // from strand()-posted handlers.
+    [[nodiscard]] auto face_count() const noexcept -> std::size_t {
+        assert(strand_.running_in_this_thread());
+        return faces_.size();
+    }
     [[nodiscard]] auto resource_count() const noexcept -> std::size_t {
+        assert(strand_.running_in_this_thread());
         return resources_.resource_count();
     }
     [[nodiscard]] auto pending_query_count() const noexcept -> std::size_t {
+        assert(strand_.running_in_this_thread());
         return pending_queries_.size();
     }
     [[nodiscard]] auto fanout_count() const noexcept -> std::size_t {
+        assert(strand_.running_in_this_thread());
         return fanout_remaining_.size();
     }
     /// Number of faces registered on the exact resource keyed by `key` (see
     /// `ResourceTable::face_count_for`) — lets a test await "N sessions all declared
     /// the identical subscription/queryable" deterministically.
     [[nodiscard]] auto resource_face_count(std::string_view key) const -> std::size_t {
+        assert(strand_.running_in_this_thread());
         return resources_.face_count_for(key);
     }
 

@@ -11,7 +11,19 @@
 // except the stress test, which explicitly exercises `--threads > 1` (see the broker
 // plan's M6 section; the dedicated `linux-tsan` preset re-runs this whole binary
 // under ThreadSanitizer as the concurrency-safety gate, not a separate test file).
+//
+// Corner-case follow-up pass (rock-solid-before-optimizing): raw Del delivery, the
+// publisher self-loop skip, deep wildcard hierarchies, payload size boundaries,
+// declare/undeclare churn, disconnect-not-undeclare resource cleanup, a
+// since-disconnected zid target, multi-reply queries, mixed ok/err fan-in, wildcard
+// fan-out to multiple literal queryables, explicit queryable undeclare, and
+// concurrent gets on one session (request-id crosstalk). `RawClient` (below) plays
+// the client side of the handshake by hand -- mirroring test_session.cpp's
+// FakeRouter, which plays the mirror-image server side against a real Session --
+// so a test can put bytes on the wire a real Session can never produce (e.g. a raw
+// Del Push).
 import zenoh.broker;
+import zenoh.proto;
 import zenoh;
 
 #include "ztest.hpp"
@@ -19,11 +31,14 @@ import zenoh;
 #include <asio/post.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,7 +46,14 @@ import zenoh;
 #include <type_traits>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <cerrno>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 using namespace zenoh::broker;
+using namespace zenoh;
 
 namespace {
 
@@ -79,6 +101,145 @@ struct TestBroker {
         if (runner.joinable()) runner.join();
     }
 };
+
+// Plays the client side of the transport handshake by hand (mirror image of
+// test_session.cpp's FakeRouter, which plays the server side against a real
+// Session), so a test can put arbitrary bytes on the wire -- content a real
+// Session's public API can never produce (a raw Del Push, deliberately malformed
+// content, etc). Kept minimal: only what the corner-case tests below need.
+struct RawClient {
+    int fd = -1;
+
+    RawClient() = default;
+    RawClient(const RawClient&) = delete;
+    auto operator=(const RawClient&) -> RawClient& = delete;
+    RawClient(RawClient&& o) noexcept : fd(o.fd) { o.fd = -1; }
+    auto operator=(RawClient&& o) noexcept -> RawClient& {
+        if (this != &o) {
+            if (fd >= 0) ::close(fd);
+            fd = o.fd;
+            o.fd = -1;
+        }
+        return *this;
+    }
+    ~RawClient() {
+        if (fd >= 0) ::close(fd);
+    }
+
+    [[nodiscard]] static auto connect(std::uint16_t port) -> std::optional<RawClient> {
+        RawClient c;
+        c.fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (c.fd < 0) return std::nullopt;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(c.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+            return std::nullopt;
+        if (!c.handshake()) return std::nullopt;
+        return c;
+    }
+
+    template <class Msg>
+    [[nodiscard]] static auto encode_body(const Msg& m) -> std::vector<std::byte> {
+        std::vector<std::byte> buf(4096);
+        ByteWriter w{buf};
+        if (!m.encode(w)) return {};
+        return {buf.data(), buf.data() + w.written()};
+    }
+
+    [[nodiscard]] auto read_exact(std::span<std::byte> out) const -> bool {
+        std::size_t off = 0;
+        while (off < out.size()) {
+            ssize_t const n = ::recv(fd, out.data() + off, out.size() - off, 0);
+            if (n > 0) {
+                off += static_cast<std::size_t>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] auto write_all(std::span<const std::byte> data) const -> bool {
+        std::size_t off = 0;
+        while (off < data.size()) {
+            ssize_t const n = ::send(fd, data.data() + off, data.size() - off, 0);
+            if (n > 0) {
+                off += static_cast<std::size_t>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] auto recv_batch() const -> std::optional<std::vector<std::byte>> {
+        std::array<std::byte, 2> len{};
+        if (!read_exact(len)) return std::nullopt;
+        std::uint16_t const l = load_le<std::uint16_t>(len.data());
+        std::vector<std::byte> body(l);
+        if (l != 0 && !read_exact(body)) return std::nullopt;
+        return body;
+    }
+
+    [[nodiscard]] auto send_batch(std::span<const std::byte> body) const -> bool {
+        std::array<std::byte, 2> len{};
+        store_le<std::uint16_t>(len.data(), static_cast<std::uint16_t>(body.size()));
+        return write_all(len) && write_all(body);
+    }
+
+  private:
+    // Client side of InitSyn/InitAck/OpenSyn/OpenAck -- mirrors Session::open, with
+    // the roles of Face::handshake (broker/src/broker.cpp) inverted.
+    [[nodiscard]] auto handshake() -> bool {
+        InitSyn isyn{};
+        isyn.version = 9;
+        isyn.identifier.whatami = WhatAmI::client;
+        isyn.identifier.zid.len = 16;
+        isyn.identifier.zid.bytes.fill(std::byte{0x42});
+        if (!send_batch(encode_body(isyn))) return false;
+
+        auto iack_bytes = recv_batch();
+        if (!iack_bytes) return false;
+        ByteReader ir{*iack_bytes};
+        auto iack = InitAck::decode(ir);
+        if (!iack || iack->version != 9) return false;
+        std::vector<std::byte> const cookie(iack->cookie.begin(), iack->cookie.end());
+
+        OpenSyn osyn{};
+        osyn.lease = Duration::from_millis(10000);
+        osyn.sn = 0;
+        osyn.cookie = cookie;
+        if (!send_batch(encode_body(osyn))) return false;
+
+        auto oack_bytes = recv_batch();
+        if (!oack_bytes) return false;
+        ByteReader ackr{*oack_bytes};
+        return OpenAck::decode(ackr).has_value();
+    }
+};
+
+// Encodes one FrameHeader + one Push(Del{}) on `key` and sends it as a single raw
+// batch -- the shape a real Session can never produce (Session::put/try_put only
+// ever encode Put), mirroring broker/src/tables.cpp's own encode_push(is_del=true).
+[[nodiscard]] auto send_raw_del(const RawClient& c, std::string_view key, std::uint32_t sn)
+    -> bool {
+    FrameHeader fh{};
+    fh.reliability = Reliability::reliable;
+    fh.sn = sn;
+
+    Push push{};
+    push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key};
+    push.payload = PushBody{.body = Del{}};
+
+    std::vector<std::byte> buf(256 + key.size());
+    ByteWriter w{buf};
+    if (!fh.encode(w) || !push.encode(w)) return false;
+    return c.send_batch(std::span(buf).first(w.written()));
+}
 
 // Reads `fn()` from inside a real handler running on `tables`'s own routing strand,
 // blocking the calling (test) thread until it completes. Required for any test-only
@@ -783,4 +944,520 @@ TEST("Broker handles concurrent multi-session query/reply under a multi-threaded
 
     for (int r = 0; r < num_requesters; ++r) CHECK(req_ok[r]);
     for (int i = 0; i < num_queryables; ++i) CHECK(qbl_ok[i]);
+}
+
+// Session::put/try_put can only ever encode Put -- a real Session never sends a Del
+// -- so this drives one through the wire by hand via RawClient to prove Push
+// routing is payload-shape-agnostic and a subscriber decodes it as a del Sample.
+TEST("Broker forwards a raw Del Push to a matching subscriber as SampleKind::del") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto sess = Session::open(tb.endpoint());
+    CHECK(sess.has_value());
+    if (!sess) return;
+    auto sub = sess->declare_subscriber("demo/del/key");
+    CHECK(sub.has_value());
+    if (!sub) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    auto raw = RawClient::connect(tb.broker->port());
+    CHECK(raw.has_value());
+    if (!raw) return;
+    CHECK(send_raw_del(*raw, "demo/del/key", 0));
+
+    auto s = sub->recv();
+    CHECK(s.has_value());
+    if (s) {
+        CHECK(s->kind() == SampleKind::del);
+        CHECK(s->key_expr() == "demo/del/key");
+        CHECK(s->payload().empty());
+    }
+}
+
+TEST("A publisher never receives its own Push, even with a matching subscription") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto sess = Session::open(tb.endpoint());
+    auto other_pub = Session::open(tb.endpoint());
+    CHECK(sess.has_value());
+    CHECK(other_pub.has_value());
+    if (!sess || !other_pub) return;
+
+    auto sub = sess->declare_subscriber("demo/selfloop/**");
+    CHECK(sub.has_value());
+    if (!sub) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // Self-loop skip is per connection (face), not per message -- `sess` publishing
+    // to its own matching subscription is unconditionally dropped, so it can never
+    // be observed directly. Prove it indirectly: publish it first, then have a
+    // *different* session publish a distinct payload the same subscription also
+    // matches, and confirm that's the first (and only) thing ever delivered --
+    // if the self-publish had leaked through, it would have arrived first instead.
+    CHECK(sess->put("demo/selfloop/a", bytes("self")).has_value());
+    CHECK(other_pub->put("demo/selfloop/b", bytes("other")).has_value());
+
+    auto s = sub->recv();
+    CHECK(s.has_value());
+    if (s) CHECK(str(s->payload()) == "other");
+}
+
+TEST("A deep wildcard hierarchy fans out to every intersecting pattern and no other") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto pub = Session::open(tb.endpoint());
+    auto sess_deep_star = Session::open(tb.endpoint());  // "**": matches
+    auto sess_wrong_star = Session::open(tb.endpoint()); // "a/*": too shallow, no match
+    auto sess_mid_star = Session::open(tb.endpoint());   // "a/b/**": matches
+    auto sess_literal = Session::open(tb.endpoint());    // literal key itself: matches
+    CHECK(pub.has_value());
+    CHECK(sess_deep_star.has_value());
+    CHECK(sess_wrong_star.has_value());
+    CHECK(sess_mid_star.has_value());
+    CHECK(sess_literal.has_value());
+    if (!pub || !sess_deep_star || !sess_wrong_star || !sess_mid_star || !sess_literal) return;
+
+    auto sub_deep = sess_deep_star->declare_subscriber("**");
+    auto sub_wrong = sess_wrong_star->declare_subscriber("a/*");
+    auto sub_mid = sess_mid_star->declare_subscriber("a/b/**");
+    auto sub_literal = sess_literal->declare_subscriber("a/b/c/d");
+    CHECK(sub_deep.has_value());
+    CHECK(sub_wrong.has_value());
+    CHECK(sub_mid.has_value());
+    CHECK(sub_literal.has_value());
+    if (!sub_deep || !sub_wrong || !sub_mid || !sub_literal) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    bool wrong_got_it = false;
+    std::string wrong_payload;
+    std::thread wrong_thread([&] {
+        auto s = sub_wrong->recv();
+        wrong_got_it = s.has_value();
+        if (s) wrong_payload = str(s->payload());
+    });
+
+    CHECK(pub->put("a/b/c/d", bytes("deep")).has_value());
+
+    auto sd = sub_deep->recv();
+    CHECK(sd.has_value());
+    if (sd) CHECK(str(sd->payload()) == "deep");
+    auto sm = sub_mid->recv();
+    CHECK(sm.has_value());
+    if (sm) CHECK(str(sm->payload()) == "deep");
+    auto sl = sub_literal->recv();
+    CHECK(sl.has_value());
+    if (sl) CHECK(str(sl->payload()) == "deep");
+
+    // Prove "a/*" (single segment, no **) never received the 4-segment publish:
+    // publish something it *does* match and confirm that's the first thing it sees.
+    CHECK(pub->put("a/x", bytes("only-this")).has_value());
+    wrong_thread.join();
+    CHECK(wrong_got_it);
+    if (wrong_got_it) CHECK(wrong_payload == "only-this");
+}
+
+TEST("A zero-length payload round-trips intact for both put() and get()") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto pub = Session::open(tb.endpoint());
+    auto sub_sess = Session::open(tb.endpoint());
+    auto qbl_sess = Session::open(tb.endpoint());
+    auto requester = Session::open(tb.endpoint());
+    CHECK(pub.has_value());
+    CHECK(sub_sess.has_value());
+    CHECK(qbl_sess.has_value());
+    CHECK(requester.has_value());
+    if (!pub || !sub_sess || !qbl_sess || !requester) return;
+
+    auto sub = sub_sess->declare_subscriber("demo/empty/put");
+    auto qbl = qbl_sess->declare_queryable("demo/empty/get");
+    CHECK(sub.has_value());
+    CHECK(qbl.has_value());
+    if (!sub || !qbl) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    CHECK(pub->put("demo/empty/put", {}).has_value());
+    auto s = sub->recv();
+    CHECK(s.has_value());
+    if (s) CHECK(s->payload().empty());
+
+    std::thread qbl_thread([&] {
+        auto q = qbl->recv();
+        if (q) (void)q->reply(q->key_expr(), {});
+    });
+    auto getter = requester->get("demo/empty/get");
+    CHECK(getter.has_value());
+    if (getter) {
+        auto r = getter->recv();
+        CHECK(r.has_value() && r->has_value());
+        if (r && *r) {
+            CHECK((*r)->is_ok());
+            CHECK((*r)->sample().payload().empty());
+        }
+    }
+    qbl_thread.join();
+}
+
+TEST("A large (32KB) payload delivers whole and intact to a subscriber") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto pub = Session::open(tb.endpoint());
+    auto sub_sess = Session::open(tb.endpoint());
+    CHECK(pub.has_value());
+    CHECK(sub_sess.has_value());
+    if (!pub || !sub_sess) return;
+
+    auto sub = sub_sess->declare_subscriber("demo/large/payload");
+    CHECK(sub.has_value());
+    if (!sub) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    std::vector<std::byte> big(32768);
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<std::byte>(i & 0xff);
+
+    CHECK(pub->put("demo/large/payload", big).has_value());
+    auto s = sub->recv();
+    CHECK(s.has_value());
+    if (s) {
+        CHECK(s->payload().size() == big.size());
+        CHECK(std::ranges::equal(s->payload(), big));
+    }
+}
+
+TEST("Redeclaring a subscriber on the same key repeatedly never accumulates stale "
+     "resource-table entries") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    using namespace zenoh;
+    auto sess = Session::open(tb.endpoint());
+    CHECK(sess.has_value());
+    if (!sess) return;
+
+    constexpr int cycles = 4;
+    for (int i = 0; i < cycles; ++i) {
+        auto sub = sess->declare_subscriber("demo/churn/key");
+        CHECK(sub.has_value());
+        if (!sub) return;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(on_strand(tables, [&] { return tables.resource_face_count("demo/churn/key"); }) == 1);
+
+        sub->undeclare();
+        CHECK(wait_until([&] {
+            return on_strand(tables,
+                             [&] { return tables.resource_face_count("demo/churn/key"); }) == 0;
+        }));
+    }
+}
+
+TEST("A session's disconnect (not just an explicit undeclare) removes it from the "
+     "resource table") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    using namespace zenoh;
+    {
+        auto sess = Session::open(tb.endpoint());
+        CHECK(sess.has_value());
+        if (!sess) return;
+        auto sub = sess->declare_subscriber("demo/disconnect/resource");
+        CHECK(sub.has_value());
+        if (!sub) return;
+
+        CHECK(wait_until(
+            [&] { return on_strand(tables, [&] { return tables.resource_count(); }) == 1; }));
+    } // `sess` (and its Subscriber) destroyed here without ever calling undeclare().
+
+    CHECK(wait_until(
+        [&] { return on_strand(tables, [&] { return tables.resource_count(); }) == 0; }));
+}
+
+TEST("put() targeted at a since-disconnected zid reaches nobody, and the broker "
+     "keeps routing normally afterward") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto pub = Session::open(tb.endpoint());
+    auto sess_a = Session::open(tb.endpoint());
+    CHECK(pub.has_value());
+    CHECK(sess_a.has_value());
+    if (!pub || !sess_a) return;
+
+    auto sub_a = sess_a->declare_subscriber("demo/gone/zid");
+    CHECK(sub_a.has_value());
+    if (!sub_a) return;
+
+    PeerId zid_b{};
+    {
+        auto sess_b = Session::open(tb.endpoint());
+        CHECK(sess_b.has_value());
+        if (!sess_b) return;
+        auto sub_b = sess_b->declare_subscriber("demo/gone/zid");
+        CHECK(sub_b.has_value());
+        if (!sub_b) return;
+        zid_b = sess_b->local_zid();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    } // B disconnects here.
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    CHECK(pub->put("demo/gone/zid", bytes("for-gone-b"), zid_b).has_value());
+    CHECK(pub->put("demo/gone/zid", bytes("broadcast")).has_value());
+
+    // A's first delivered sample must be the broadcast: proof the B-targeted put,
+    // aimed at a peer no longer connected, was delivered nowhere and did not hang
+    // or crash the broker.
+    auto a1 = sub_a->recv();
+    CHECK(a1.has_value());
+    if (a1) CHECK(str(a1->payload()) == "broadcast");
+}
+
+// Exercises Tables::on_response's deliberate "do not erase" behavior (see
+// broker/src/tables.cpp): a queryable answering the same query more than once
+// before it completes -- IncomingQuery::reply()'s doc comment explicitly allows
+// this, but no other test in this file ever calls it twice.
+TEST("A queryable's reply() called multiple times delivers every reply before the "
+     "final") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto responder = Session::open(tb.endpoint());
+    auto requester = Session::open(tb.endpoint());
+    CHECK(responder.has_value());
+    CHECK(requester.has_value());
+    if (!responder || !requester) return;
+
+    auto qbl = responder->declare_queryable("demo/multi/reply");
+    CHECK(qbl.has_value());
+    if (!qbl) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::thread responder_thread([&] {
+        auto q = qbl->recv();
+        if (!q) return;
+        (void)q->reply(q->key_expr(), bytes("one"));
+        (void)q->reply(q->key_expr(), bytes("two"));
+        (void)q->reply(q->key_expr(), bytes("three"));
+    });
+
+    auto getter = requester->get("demo/multi/reply");
+    CHECK(getter.has_value());
+    if (getter) {
+        auto replies = drain_replies(*getter);
+        std::ranges::sort(replies);
+        CHECK((replies == std::vector<std::string>{"one", "three", "two"}));
+    }
+    responder_thread.join();
+}
+
+TEST("One ok and one err reply to the same get() are both delivered, correctly "
+     "tagged") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto sess_ok = Session::open(tb.endpoint());
+    auto sess_err = Session::open(tb.endpoint());
+    auto requester = Session::open(tb.endpoint());
+    CHECK(sess_ok.has_value());
+    CHECK(sess_err.has_value());
+    CHECK(requester.has_value());
+    if (!sess_ok || !sess_err || !requester) return;
+
+    auto qbl_ok = sess_ok->declare_queryable("demo/mixed");
+    auto qbl_err = sess_err->declare_queryable("demo/mixed");
+    CHECK(qbl_ok.has_value());
+    CHECK(qbl_err.has_value());
+    if (!qbl_ok || !qbl_err) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    std::thread t_ok([&] {
+        auto q = qbl_ok->recv();
+        if (q) (void)q->reply(q->key_expr(), bytes("good"));
+    });
+    std::thread t_err([&] {
+        auto q = qbl_err->recv();
+        if (q) (void)q->reply_err(bytes("bad"));
+    });
+
+    auto getter = requester->get("demo/mixed");
+    CHECK(getter.has_value());
+    if (getter) {
+        int ok_count = 0;
+        int err_count = 0;
+        for (;;) {
+            auto r = getter->recv();
+            CHECK(r.has_value());
+            if (!r || !*r) break;
+            if ((*r)->is_ok()) {
+                ++ok_count;
+                CHECK(str((*r)->sample().payload()) == "good");
+            } else {
+                ++err_count;
+                CHECK(str((*r)->error_payload()) == "bad");
+            }
+        }
+        CHECK(ok_count == 1);
+        CHECK(err_count == 1);
+    }
+    t_ok.join();
+    t_err.join();
+}
+
+TEST("A wildcard get() reaches every one of several literal-keyed queryables") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto sess_x = Session::open(tb.endpoint());
+    auto sess_y = Session::open(tb.endpoint());
+    auto sess_z = Session::open(tb.endpoint());
+    auto requester = Session::open(tb.endpoint());
+    CHECK(sess_x.has_value());
+    CHECK(sess_y.has_value());
+    CHECK(sess_z.has_value());
+    CHECK(requester.has_value());
+    if (!sess_x || !sess_y || !sess_z || !requester) return;
+
+    auto qbl_x = sess_x->declare_queryable("a/x");
+    auto qbl_y = sess_y->declare_queryable("a/y");
+    auto qbl_z = sess_z->declare_queryable("a/z");
+    CHECK(qbl_x.has_value());
+    CHECK(qbl_y.has_value());
+    CHECK(qbl_z.has_value());
+    if (!qbl_x || !qbl_y || !qbl_z) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    std::thread t_x([&] {
+        auto q = qbl_x->recv();
+        if (q) (void)q->reply(q->key_expr(), bytes("x"));
+    });
+    std::thread t_y([&] {
+        auto q = qbl_y->recv();
+        if (q) (void)q->reply(q->key_expr(), bytes("y"));
+    });
+    std::thread t_z([&] {
+        auto q = qbl_z->recv();
+        if (q) (void)q->reply(q->key_expr(), bytes("z"));
+    });
+
+    auto getter = requester->get("a/**");
+    CHECK(getter.has_value());
+    if (getter) {
+        auto replies = drain_replies(*getter);
+        std::ranges::sort(replies);
+        CHECK((replies == std::vector<std::string>{"x", "y", "z"}));
+    }
+    t_x.join();
+    t_y.join();
+    t_z.join();
+}
+
+TEST("Undeclaring a queryable removes it from the resource table and a subsequent "
+     "get() completes with zero matches") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    using namespace zenoh;
+    auto responder = Session::open(tb.endpoint());
+    auto requester = Session::open(tb.endpoint());
+    CHECK(responder.has_value());
+    CHECK(requester.has_value());
+    if (!responder || !requester) return;
+
+    auto qbl = responder->declare_queryable("demo/qundeclare");
+    CHECK(qbl.has_value());
+    if (!qbl) return;
+
+    CHECK(wait_until([&] {
+        return on_strand(tables, [&] { return tables.resource_face_count("demo/qundeclare"); }) ==
+               1;
+    }));
+
+    qbl->undeclare();
+
+    CHECK(wait_until([&] {
+        return on_strand(tables, [&] { return tables.resource_face_count("demo/qundeclare"); }) ==
+               0;
+    }));
+
+    auto getter = requester->get("demo/qundeclare");
+    CHECK(getter.has_value());
+    if (getter) {
+        auto r = getter->recv();
+        CHECK(r.has_value() && !r->has_value());
+    }
+}
+
+// Two get()s in flight on the same session before either Getter is drained --
+// proves the requester's rid bookkeeping (pending_gets_) never crosses replies
+// between them, even though both requests share the same underlying socket/SN.
+TEST("Two concurrent get()s on one session never cross-deliver each other's "
+     "replies") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto sess_1 = Session::open(tb.endpoint());
+    auto sess_2 = Session::open(tb.endpoint());
+    auto requester = Session::open(tb.endpoint());
+    CHECK(sess_1.has_value());
+    CHECK(sess_2.has_value());
+    CHECK(requester.has_value());
+    if (!sess_1 || !sess_2 || !requester) return;
+
+    auto qbl_1 = sess_1->declare_queryable("demo/concurrent/one");
+    auto qbl_2 = sess_2->declare_queryable("demo/concurrent/two");
+    CHECK(qbl_1.has_value());
+    CHECK(qbl_2.has_value());
+    if (!qbl_1 || !qbl_2) return;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    std::thread t1([&] {
+        auto q = qbl_1->recv();
+        if (q) (void)q->reply(q->key_expr(), bytes("payload-one"));
+    });
+    std::thread t2([&] {
+        auto q = qbl_2->recv();
+        if (q) (void)q->reply(q->key_expr(), bytes("payload-two"));
+    });
+
+    auto getter1 = requester->get("demo/concurrent/one");
+    CHECK(getter1.has_value());
+    auto getter2 = requester->get("demo/concurrent/two");
+    CHECK(getter2.has_value());
+
+    if (getter1 && getter2) {
+        auto replies1 = drain_replies(*getter1);
+        auto replies2 = drain_replies(*getter2);
+        CHECK(replies1 == std::vector<std::string>{"payload-one"});
+        CHECK(replies2 == std::vector<std::string>{"payload-two"});
+    }
+    t1.join();
+    t2.join();
 }

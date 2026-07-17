@@ -22,6 +22,7 @@ add_executable(zenoh-tests
     test_strand.cpp
     test_subscriber.cpp
     test_broker.cpp
+    test_broker_stress.cpp
 )
 # Link the runtime (which transitively brings the proto codec) so the session/tcp
 # integration tests can drive a real Session and those sources show up in coverage.
