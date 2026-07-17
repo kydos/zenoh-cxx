@@ -211,6 +211,8 @@ struct GetReg {
         : strand(cap, mode), handler(std::move(h)), deadline(dl) {}
 };
 
+auto GetRegDeleter::operator()(GetReg* p) const noexcept -> void { delete p; }
+
 Session::Session(Session&&) noexcept = default;
 auto Session::operator=(Session&&) noexcept -> Session& = default;
 Session::~Session() = default;
@@ -727,8 +729,8 @@ auto Session::start_get(std::string_view key_expr, std::string_view parameters,
         return std::unexpected(r.error());
     auto const deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms(opts));
-    pending_gets_[rid] =
-        std::make_unique<GetReg>(256, StrandMode::ordered, std::move(handler), deadline);
+    pending_gets_[rid] = std::unique_ptr<GetReg, GetRegDeleter>(
+        new GetReg(256, StrandMode::ordered, std::move(handler), deadline));
     return rid;
 }
 

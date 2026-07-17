@@ -206,6 +206,25 @@ struct QblReg; // defined in session.cpp
 class Getter;
 struct GetReg; // defined in session.cpp
 
+/// Out-of-line deleter for `pending_gets_`'s `unique_ptr<GetReg>` entries. A bare
+/// `std::unique_ptr<Incomplete>` *direct* member (see `sub_`/`qbl_` below) is the
+/// ordinary, safe pimpl idiom as long as the enclosing class's own destructor is
+/// declared here and defined out-of-line where the type is complete (which
+/// `Session::~Session()` already is). A `std::unordered_map<K, unique_ptr<Incomplete>>`
+/// is not safe the same way: under clang+libstdc++ (this project's Linux/CI
+/// toolchain — see `CLAUDE.md`), the container's own implicitly-defined special
+/// members eagerly instantiate `std::default_delete<GetReg>::operator()`'s body
+/// (and its `static_assert(sizeof(T)>0)`) while parsing this interface unit, even
+/// though nothing here actually destroys a `GetReg` — confirmed via bisection: the
+/// same code compiles cleanly under clang+libc++ (macOS), so this is a
+/// libstdc++-specific eagerness quirk, not a language rule. A custom deleter whose
+/// `operator()` is merely *declared* here (its `noexcept` alone is all the
+/// container's trait computations need) and *defined* in `session.cpp` (where
+/// `GetReg` is complete) sidesteps it entirely.
+struct GetRegDeleter {
+    auto operator()(GetReg* p) const noexcept -> void;
+};
+
 /// A client session to a single Zenoh router over TCP.
 ///
 /// Lifecycle: `open()` performs the 4-way transport handshake and returns a ready
@@ -414,7 +433,7 @@ class Session {
     std::unique_ptr<SubReg> sub_{};     ///< the single active subscriber (first cut)
     std::unique_ptr<QblReg> qbl_{};     ///< the single active queryable (first cut)
     std::uint32_t next_request_id_ = 0; ///< monotonic get() request id
-    std::unordered_map<std::uint32_t, std::unique_ptr<GetReg>>
+    std::unordered_map<std::uint32_t, std::unique_ptr<GetReg, GetRegDeleter>>
         pending_gets_{}; ///< in-flight get()s
 };
 
