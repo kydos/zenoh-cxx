@@ -82,14 +82,18 @@ which `asio::strand` a given operation runs on — not from locking:
   counter), so stored references in `Tables` never alias a reconnected peer's slot.
 - **Tier 2 — one global `Tables::strand()`**: guards the face registry, the
   `ResourceTable`, and the query fan-out/fan-in maps (`pending_queries_`/
-  `fanout_remaining_`). A decoded Push/Request/Response is **materialized into an
-  owned struct** (`RoutedPush`/`RoutedRequest`/`RoutedResponse` — owned `std::string`/
-  `std::vector<std::byte>`, never a borrowed view) on the Face's own strand *before*
-  `asio::post`ing it to `Tables::strand()` — required because `zenoh.proto` messages
-  are borrow-only views into the receive buffer (PLAN.md D2), and that buffer is
-  reused by the next `async_read` before a posted cross-strand handler runs.
-  Delivery back down to a target face is symmetric: `asio::post(target
-  face's strand, ...)`.
+  `fanout_remaining_`). A decoded Push/Request/Response is **materialized into owned
+  storage** (`RoutedPush`/`RoutedRequest`/`RoutedResponse` — an owned key string plus,
+  for a Push, its outbound bytes already composed into a refcounted `SharedBuf`;
+  never a borrowed view) on the Face's own strand *before* `asio::post`ing it to
+  `Tables::strand()` — required because `zenoh.proto` messages are borrow-only views
+  into the receive buffer (PLAN.md D2), and that buffer is reused by the next read
+  before a posted cross-strand handler runs. Delivery back down to a target face is
+  symmetric: `asio::post(target face's strand, ...)`. Both directions are **batched
+  per inbound frame**: every consecutive Push in one frame travels up as a single
+  post, and each target face receives its whole share of that batch in a single post
+  back down — so the cost of crossing tiers is paid per frame and per face, not per
+  message.
 - **This is a deliberate v1 simplification, not a ceiling.** One global routing strand
   means routing *decisions* aren't parallelized across cores — aggregate throughput
   under `--threads N` scales from concurrent I/O completion handling across faces
@@ -155,15 +159,21 @@ clang+libstdc++ toolchain already set up for named modules.)
   than silently mismatched via `ke::intersects`. Matching subscriber faces
   (`ResourceTable::matching_subscribers`, deduplicated by `face_id` so a face with
   two+ overlapping declared subscriptions is still delivered to exactly once) are
-  found via `zenoh.ke::intersects`, filtered by `dest` if set, and the message is
-  **re-encoded per target** (decode → match → re-encode, never a byte relay — see
-  "v1 simplifications" below for why). A target face that's congested (its own
-  outbound queue backed up past a watermark) is silently skipped rather than
-  queued further or disconnected — see "Performance" below for the full policy and
-  why this can drop an otherwise-reliable Push.
+  found via `zenoh.ke::intersects`, filtered by `dest` if set. The bytes every
+  subscriber receives are **composed once, on the receiving face's own strand**, as
+  the message is decoded — not once per target, and not on the routing strand: a
+  Push that arrived with `scope == 0` already *is* what subscribers should see, so
+  it is forwarded exactly as received (a memcpy, extensions and all); a
+  resmap-compressed one (`scope != 0`) is re-encoded with its key expanded and
+  everything else carried over. Routing then hands each matching face a refcounted
+  slice of that one buffer (see `SharedBuf`/`MsgSlice` in `tables.cppm`), so fan-out
+  to N subscribers costs N slice references, not N encodes. A target face that's
+  congested (its own outbound queue backed up past a byte watermark) is silently
+  skipped rather than queued further or disconnected — see "Performance" below for
+  the full policy and why this can drop an otherwise-reliable Push.
 - **Request/Response/ResponseFinal**: unlike Push, a query key expression is
   legitimately a *pattern* — `get()`'s own default shape is `"demo/example/**"` — so
-  `Tables::on_request` does **not** reject a wildcarded key the way `route_push` rejects
+  `Tables::on_request` does **not** reject a wildcarded key the way `on_push_batch` rejects
   one; `ke::intersects` is documented safe (order-invariant, no wrong answers, only
   possibly-redundant ones) on non-canonical/wildcarded input on either side. Matching
   queryable faces are found the same way (deduplicated by `face_id`), filtered by
@@ -207,7 +217,14 @@ clang+libstdc++ toolchain already set up for named modules.)
 - **Outbound composition always emits `scope == 0`** (full keyexpr) to every
   receiver, regardless of what that receiving face itself declared via
   `DeclareKeyExpr`. Per-target outbound resmap compression is a contained future
-  optimization, not required for correctness.
+  optimization, not required for correctness. It is also what makes the composed
+  bytes target-independent, and so shareable across a fan-out.
+- **A `scope != 0` (resmap-compressed) Push loses any extension `zenoh.proto`
+  doesn't model.** Re-encoding that case rebuilds the message from the decoded
+  `Push` struct, so anything the decoder skipped isn't reproduced (everything it
+  *does* model — QoS, timestamp, node id, `DestinationId`, and `Put`'s encoding/
+  source info/attachment — is carried over). The `scope == 0` path has no such gap:
+  it copies the received bytes verbatim.
 - **No broker-side query timeout enforcement.** `GetOptions::timeout_ms` is enforced
   entirely client-side (`Getter::recv()`'s pump loop) — sufficient for correctness on
   its own; a slow queryable just means a slow reply, not a broker-side leak (the
@@ -306,14 +323,131 @@ zid-targeting cases) — a real reference peer simply never sends the extension,
 `DestinationId` is a non-mandatory extension, so old/foreign peers are unaffected by
 its existence).
 
-## Performance: from a crashing connection to ~700k–900k+ msg/s
+## Performance
 
 **Use a Release build (`clang-release`/`linux-clang-release`) for anything
 throughput-sensitive** — the `clang`/`linux-clang` presets (ASan+UBSan) are for
 correctness testing, not speed, and their per-access instrumentation overhead is
 enough on its own to change the numbers below by several times.
 
-### The original bug wasn't ASan — it was a real close-on-overflow policy
+### Where the numbers stand
+
+Release build, macOS/M2 (8 cores), loopback, 8-byte payloads, this project's own
+`z_pub_thr --batch 50` publishing and `z_sub_thr` subscribing. "broker CPU/msg" is
+`zenohb`'s own CPU time (summed across its thread pool) divided by messages
+delivered — the metric that actually isolates the broker from the clients, since
+end-to-end msg/s is often limited by whichever client process saturates a core
+first.
+
+| Shape | Throughput | Broker CPU per message |
+| --- | --- | --- |
+| 1 pub → 1 sub, `--threads 1` | ~9.5M msg/s | 0.09 µs |
+| 1 pub → 1 sub, `--threads 2` | ~9.0M msg/s | 0.17 µs |
+| 1 pub → 4 subs, `--threads 4` (aggregate delivered) | ~20M msg/s | 0.12 µs |
+| 1 pub → 1 sub, 1 KiB payloads, `--threads 2` | ~1.2M msg/s | 1.0 µs |
+| 1 pub → 1 sub, 32 KiB payloads, `--threads 2` | ~81k msg/s (~2.7 GB/s) | 16 µs |
+
+Round-trip latency through the broker (a ping/pong pair — publish, echo, publish
+back, so **two** broker traversals per RTT — measured over 18k round trips after
+warmup) is ~54 µs p50 at `--threads 2`, ~58 µs at `--threads 4`, ~94 µs at
+`--threads 1`; a sizeable share of that is the client's own poll/recv path rather
+than the broker.
+
+**Thread-count guidance has changed**: with the per-message work now small, each
+extra worker thread mostly adds cross-thread strand handoffs. For a *single*
+pub/sub pair, `--threads 1` is now the fastest configuration and also the cheapest;
+more threads pay off once there are enough independent connections to give them
+real parallel I/O to do (the 4-subscriber row above). Start at `--threads 2`–`4`
+for a realistic connection count and measure rather than assuming more is better.
+
+`--batch` on `z_pub_thr` (this project's publisher only — the reference has no
+equivalent flag) still matters, but far less than it used to: the broker now
+coalesces on both sides regardless of how the publisher batches.
+
+### What makes it fast
+
+Everything below is on the per-message path; the theme is that nothing scales with
+the number of *messages* if it can be made to scale with the number of *frames* or
+*faces* instead.
+
+- **One `read` per many batches, no per-batch allocation.** `Face::next_batch` reads
+  into one reusable per-face buffer with `async_read_some` and hands out borrows of
+  the complete batches already sitting in it, growing it only for a peer that
+  actually sends batches larger than 16 KiB. It used to issue two `async_read`s
+  (length, then body) into a freshly allocated, zero-initialized `std::vector` per
+  batch.
+- **One `write` per many messages.** `Face::append_msg` frames outbound messages into
+  a contiguous accumulation buffer, packing as many as fit under one length prefix
+  and one `FrameHeader` (up to the peer's batch size), and `pump_tx` hands the whole
+  thing to a single `async_write`; a second buffer accumulates whatever arrives while
+  that write is in flight, and the two swap. This replaced a scatter-gather write
+  over a `std::deque` of per-message frames — which sounds equivalent but is not:
+  ASIO caps a buffer sequence at **64 iovecs**, so that design could never write more
+  than 64 small messages per syscall, whereas this one fills a 64 KiB batch. The
+  write is also initiated inline rather than from a `co_spawn`ed coroutine, so an
+  idle face's message reaches the wire in the same handler instead of after another
+  trip through the event loop (a direct latency saving).
+- **Compose once per message, never per target.** Outbound bytes are target-independent
+  (see "v1 simplifications"), so they are composed once — on the receiving face's own
+  Tier-1 strand, in parallel across faces, rather than on the single global routing
+  strand — and fanned out as refcounted slices. A Push that arrives with `scope == 0`
+  isn't even re-encoded: its bytes are copied verbatim, which is both cheaper than
+  decode→re-encode and lossless w.r.t. extensions.
+- **One allocation per frame, not per message — and usually zero.** All the Pushes
+  decoded from one inbound frame are composed back-to-back into a single `SharedBuf`
+  (a refcounted block whose header and bytes share one allocation, handed to the
+  encoder uninitialized). Because a `Face` can observe (`SharedBuf::unique()`) that
+  the block it filled last time has since been consumed by every face it was
+  delivered to — which in steady state it has — the same block is refilled frame
+  after frame and the publish path allocates **nothing at all** in steady state.
+  Blocks are capped at 256 KiB per frame so a peer packing many key-expanding Pushes
+  into one frame can't make the broker hold an unbounded buffer.
+- **Batched strand hops in both directions.** A frame's Pushes go up to the routing
+  strand in one post (`Tables::on_push_batch`), and each matching face gets its whole
+  share of that batch in one post back down (`FaceHandle::deliver` takes a block plus
+  a run of slices). N messages to M subscribers cost M cross-strand hops, not N×M.
+- **Memoized matching.** `ResourceTable::matching_subscribers`/`matching_queryables`
+  cache the full match set per queried key (bounded at 4096 entries, cleared
+  wholesale by any declare/undeclare — declarations are rare relative to messages),
+  so a repeat publish is one hash lookup with no `ke::intersects` calls, no scan of
+  the declaration set, and no allocation. The exact-hash fast path and the general
+  wildcard scan still run on a cache miss.
+- **Congestion accounted in bytes.** `FaceHandle::congested` is set when a face's
+  queued outbound *bytes* cross 1 MiB and cleared once drained below 256 KiB
+  (previously: 65536 queued frames, which bounded nothing in memory terms and let a
+  slow consumer's queue get arbitrarily stale). `Tables` skips (drops) delivery to a
+  congested face *before* ever calling `deliver()`, rather than queuing further or
+  closing the connection. **A reliable-marked Push can therefore still be dropped for
+  one specific slow consumer** — a deliberate v1 trade-off: that consumer stays
+  connected and catches up, instead of being disconnected (the original behavior, see
+  below) or stalling the producer and every other subscriber. No retransmission or
+  true flow-controlled blocking is implemented.
+- **`asio::recycling_allocator` on the per-batch `asio::post`s**, and reused (rather
+  than regrown-from-empty) accumulation vectors on both sides of each hop.
+
+### What was tried and left alone
+
+- **Scatter-gather for large payloads.** The outbound path copies a message's bytes
+  into the accumulation buffer rather than referencing the shared block, which for a
+  32 KiB payload is a second copy of it. Keeping large messages by reference and
+  writing them with an iovec list would save that copy, but measurement puts it at
+  single-digit percent of the 32 KiB-payload cost (which is dominated by kernel-side
+  copies and syscalls), for a materially more complex tx path. Left as a documented
+  option if large-payload throughput ever becomes the priority.
+- **Concrete (non-type-erased) strand executors.** `asio::strand<asio::any_io_executor>`
+  costs a virtual dispatch per post; `asio::strand<asio::io_context::executor_type>`
+  would not. It never showed up as more than noise in profiles, and it would require
+  `<asio/io_context.hpp>` in `tables.cppm`'s global module fragment — exactly the
+  BMI-poisoning pattern this file's "Why `Face` isn't its own module" section
+  documents. Not worth it.
+- The remaining profile at 8-byte payloads is roughly: ~25% `zenoh.proto` Push/Put
+  decoding (inherent — the protocol has no per-message length prefix, so a message
+  must be parsed to find where the next one starts), ~11% memcpy, ~9% `recv`/`send`
+  syscalls, ~5% routing (match + fan-out), the rest event-loop machinery. Further
+  gains would have to come from the codec or from a different concurrency model, not
+  from this layer.
+
+### History: the original bug wasn't ASan — it was a real close-on-overflow policy
 
 An earlier version of this section claimed the ~20k–26k msg/s ceiling seen with
 real `zenoh-rust` `z_pub_thr`/`z_sub_thr` was fine, and that only the ASan preset's
@@ -321,126 +455,35 @@ overhead caused the `Unable to push non droppable network message ... Closing
 transport!` crash some users hit. That was wrong, caught only once a faster
 producer (this project's own `z_pub_thr --batch N`, and a from-scratch measurement
 harness) was used against a Release build and the *same* connection-killing
-behavior reproduced instantly. The real root cause: `Face::enqueue_and_pump`'s
-overflow policy used to call `close_now()` the moment a consumer's outbound
-`tx_queue_` crossed 1024 buffered frames — turning *any* transient production/drain
-mismatch, not just a genuinely stuck peer, into an outright disconnect. The
-reference client's own unbatched, one-`put()`-at-a-time publish rate (~20k–35k
-msg/s, limited by its own per-call overhead, not the broker) happened to stay just
-under that threshold, which is why it looked fine until a faster producer was
-tried.
-
-Fixed with a proper congestion policy (see below) plus several throughput fixes
-identified by an architect review and a systems-expert review specifically
-commissioned to chase this down. Net result (Release build, loopback, 8-byte
-payload, single publisher → single subscriber):
-
-| Configuration | Throughput | Notes |
-| --- | --- | --- |
-| Before any of this (original bug) | connection closed within ~1s of a fast producer | not a real number — the "ceiling" was actually a crash |
-| Real `zenoh-rust` `z_pub_thr` (unbatched) → this project's `z_sub_thr` | ~575k–580k msg/s, `--threads 1` | the reference client's own per-`put()` rate is now well below the broker's actual capacity |
-| This project's `z_pub_thr --batch 50` → real `zenoh-rust` `z_sub_thr` | ~900k–913k msg/s, `--threads 4` | the real `zenoh-rust` subscriber's receive path outperforms this project's own `z_sub_thr` example |
-| This project's `z_pub_thr --batch 50` → this project's `z_sub_thr` | ~675k–680k msg/s, `--threads 4` | limited by this project's own single-threaded subscriber example, not the broker (see below) |
-
-At this point **the broker is no longer the bottleneck for this benchmark shape**:
-`ps` during a sustained run shows the *subscriber* process pinned at ~100% CPU on
-its one thread, while `zenohb` has headroom to spare across its thread pool.
-Getting past ~900k msg/s end-to-end from here requires speeding up the
-single-threaded client's own receive/decode/dispatch path (`zenoh.session`), which
-is a different component with its own review scope, not this broker.
+behavior reproduced instantly. The real root cause: the outbound overflow policy
+used to call `close_now()` the moment a consumer's outbound queue crossed 1024
+buffered frames — turning *any* transient production/drain mismatch, not just a
+genuinely stuck peer, into an outright disconnect. The reference client's own
+unbatched, one-`put()`-at-a-time publish rate (~20k–35k msg/s, limited by its own
+per-call overhead, not the broker) happened to stay just under that threshold,
+which is why it looked fine until a faster producer was tried. The congestion
+policy above replaced it.
 
 **There is no memory leak** in either the old or new code. What looked like
-unbounded RSS growth while chasing the original bug was an ASan quarantine/redzone
-artifact under sustained high-frequency allocation (confirmed: `leaks` refuses to
-even inspect an ASan-instrumented process; a Release-build broker's RSS stayed
-flat processing 3M+ messages from a single tight-loop publisher, both before and
-after the throughput fixes below).
-
-### What changed
-
-- **Congestion-based backpressure replaces close-on-overflow.** `FaceHandle` (in
-  `zenoh.broker.tables`) carries a `std::shared_ptr<std::atomic<bool>> congested`,
-  owned by the `Face` and set from the `Face`'s own strand once `tx_queue_` crosses
-  a high watermark (65536 frames), cleared once drained back below a low watermark
-  (16384) — the same hysteresis shape as `pending_routing_jobs`/
-  `throttle_if_backlogged` above, just for a different queue. `Tables::route_push`
-  and the `on_request` fan-out loop skip (drop) delivery to a congested target
-  *before* ever calling `deliver()`, rather than queuing further or closing the
-  face. **This means a genuinely reliable-marked Push (`FrameHeader::reliability`
-  is always `Reliability::reliable` for Push) can still be silently dropped for
-  one specific slow consumer under sustained congestion** — a deliberate v1
-  trade-off (a slow consumer stays connected and catches back up once it can, but
-  loses some deliveries while congested, rather than the previous "kill the
-  connection outright" behavior, and rather than blocking every *other*, faster
-  consumer or the producer itself to accommodate one slow one). No retransmission
-  or true flow-controlled blocking is implemented; that would require decoding a
-  per-message congestion-control bit this project doesn't currently read.
-- **Outbound write coalescing.** `Face::pump_tx()` used to issue one
-  `asio::async_write` per queued frame — one TCP segment, one syscall, one epoll
-  round-trip per message, confirmed as the dominant per-message cost once the
-  close-on-overflow bug stopped masking it. It now gathers every currently-queued
-  frame into one scatter-gather `async_write` (a `std::vector<asio::const_buffer>`
-  referencing `tx_queue_`'s own elements — safe because `std::deque::push_back`
-  never invalidates references to existing elements, so more frames can queue up
-  while a coalesced write is in flight without disturbing it) and pops them all on
-  one completion.
-- **Exact-literal-match fast path.** `ResourceTable::matching_subscribers`/
-  `matching_queryables` used to call `zenoh.ke::intersects` (several heap
-  allocations per call, even for a trivial two-chunk key) against *every* declared
-  resource, every message. They now try an O(1) hash lookup for an exact match
-  first (`by_key_` gained a transparent hash/equality so a `std::string_view` can
-  probe it without constructing a temporary `std::string`), skipping `intersects`
-  entirely for the common case of a publish landing on a subscription declared on
-  that exact key, and only falling back to the general wildcard scan for every
-  *other* resource.
-- **Batched routing-strand posts.** `Face::dispatch_frame_body` used to
-  `asio::post` each decoded Push to `Tables::strand()` individually. It now
-  accumulates every consecutive Push decoded from one inbound frame into a batch
-  and posts the whole batch once (`Tables::on_push_batch`), amortizing the
-  Face→Tables `asio::post` hop (a heap-allocated handler node plus a cross-strand
-  wakeup) over the batch instead of paying it per message. The batch is flushed
-  before any *other* message type in the same frame is handled, so relative
-  ordering against interleaved Declare/Request/Response traffic within one frame is
-  preserved exactly — only consecutive Pushes are ever batched together. (A real,
-  narrow bug was caught and fixed here during review: several early-return paths
-  in the decode loop — a malformed trailing message, a decode failure mid-run —
-  used to discard an already-accumulated, not-yet-posted batch instead of flushing
-  it first, silently losing otherwise-valid Pushes decoded earlier in the same
-  frame. `tests/test_broker.cpp` has a dedicated multi-Push-per-frame case, via the
-  client `Batch` API, covering the batching path itself — no test yet covers the
-  specific malformed-trailing-message scenario the bug required, which remains a
-  documented coverage gap.)
-- **`asio::recycling_allocator` on the per-message `asio::post` calls.** Both
-  `Face::post_to_tables` and the delivery closure `build_handle()` builds now bind
-  a recycling allocator (the same mechanism ASIO's own strand/coroutine-frame
-  machinery already uses internally) instead of the default `::operator new`/
-  `delete` per post — a per-thread free list for a handler shape that repeats at
-  message rate.
-- **Minor allocation cleanups**: `RoutedPush::key` is move- rather than
-  copy-constructed; `ResourceTable::face_count_for` uses the same heterogeneous
-  lookup as the matching fast path instead of constructing a temporary
-  `std::string`.
+unbounded RSS growth while chasing that bug was an ASan quarantine/redzone artifact
+under sustained high-frequency allocation (confirmed: `leaks` refuses to even
+inspect an ASan-instrumented process; a Release-build broker's RSS stayed flat
+processing 3M+ messages from a single tight-loop publisher).
 
 ### Reproducing the numbers
 
 ```sh
-./build/clang-release/zenohb -l tcp/127.0.0.1:7447 --threads 4 &
-./build/clang-release/examples/z_sub_thr -e tcp/127.0.0.1:7447 -s 8 -n 500000 &
+./build/clang-release/zenohb -l tcp/127.0.0.1:7447 --threads 1 &
+./build/clang-release/examples/z_sub_thr -e tcp/127.0.0.1:7447 -s 5 -n 500000 &
 ./build/clang-release/examples/z_pub_thr -e tcp/127.0.0.1:7447 --batch 50 8
 ```
 
-`--batch` (this project's `z_pub_thr` only — the reference has no equivalent flag)
-matters more than expected: throughput peaks around `--batch 50`–`64` and is
-*lower* at much larger batch sizes (e.g. `--batch 256`) or much smaller ones (e.g.
-`--batch 20`) in informal testing here — the exact mechanism wasn't fully
-characterized (plausibly an interaction between how much work accumulates per
-inbound frame and per-strand scheduling fairness under `--threads > 1`) and is
-worth profiling further if you're chasing the last bit of throughput. `--threads`
-scaling also inverted from the pre-fix advice: with the close-on-overflow bug
-present, more threads made things *worse* for a single pub/sub pair (more
-cross-thread wakeup jitter around a bug that was already trigger-happy); with it
-fixed, `--threads 2`–`6` all measurably outperform `--threads 1` for this
-benchmark shape, plateauing somewhere in that range on an 8-core test machine.
+For broker CPU per message, sample `ps -o time= -p <zenohb pid>` before and after a
+run of known message count rather than trusting end-to-end msg/s — the clients are
+frequently the limiting factor. For fan-out, start N `z_sub_thr` processes against
+one publisher and sum their reported rates. The latency figures come from a
+ping/pong pair built on the public `Session` API (publish on `lat/ping`, echo to
+`lat/pong`, measure the round trip) — about 40 lines, not shipped as an example.
 
 ## Testing
 

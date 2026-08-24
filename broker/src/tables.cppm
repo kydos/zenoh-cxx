@@ -10,7 +10,9 @@ module;
 #include <functional>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -33,15 +35,167 @@ import zenoh.ke;
 // decouples this module from zenoh.broker.face and avoids a module dependency cycle.
 export namespace zenoh::broker {
 
-/// A registered face, as `Tables` sees it: just enough to route. `deliver` hands one
-/// *unframed* encoded network message (Push/Request/Response/ResponseFinal) to that
-/// face; the callback itself is responsible for posting onto that face's own strand
-/// before touching any face-owned state (its per-face frame SN, tx queue, socket) —
-/// `Tables` never needs to know that seam exists.
+/// A refcount-shared, immutable block of encoded, *unframed* network message bytes:
+/// either exactly one message (the query path) or every Push decoded from one inbound
+/// frame laid end to end (the publish path), addressed by `MsgSlice`.
+///
+/// Encoding a message is independent of which face receives it (outbound composition
+/// always emits `scope == 0`, see docs/BROKER.md), so a fan-out to N subscribers
+/// encodes once and hands the same immutable block to all N — the per-target work is
+/// reduced to framing those bytes with that face's own SN, which `Face` does by
+/// appending to its outbound buffer.
+///
+/// Deliberately not `std::shared_ptr<std::vector<std::byte>>`, and deliberately one
+/// block per *frame* rather than per message: this is the only object the publish
+/// path allocates, so it is worth being frugal. Refcount, length and bytes share a
+/// single allocation (no separate control block); the storage is handed to the
+/// encoder *uninitialized* (`std::vector`'s sized constructor would zero an
+/// over-estimated buffer before the encoder overwrote it); and because a `Face` can
+/// tell (via `unique()`) that the block it filled last time has since been consumed
+/// by everyone it was delivered to, the steady state reuses one block per face and
+/// allocates nothing at all. Copying is one relaxed increment — that is what fan-out
+/// to an extra face costs.
+///
+/// Thread-safety is exactly `shared_ptr`'s: the refcount is atomic (a block routinely
+/// outlives the strand that encoded it, ending up referenced by several other faces'
+/// strands), the bytes are immutable once published, and nothing else is shared.
+class SharedBuf {
+  public:
+    SharedBuf() noexcept = default;
+    SharedBuf(const SharedBuf& other) noexcept : rep_(other.rep_) { retain(); }
+    SharedBuf(SharedBuf&& other) noexcept : rep_(other.rep_) { other.rep_ = nullptr; }
+    auto operator=(const SharedBuf& other) noexcept -> SharedBuf& {
+        if (this != &other) {
+            release();
+            rep_ = other.rep_;
+            retain();
+        }
+        return *this;
+    }
+    auto operator=(SharedBuf&& other) noexcept -> SharedBuf& {
+        if (this != &other) {
+            release();
+            rep_ = other.rep_;
+            other.rep_ = nullptr;
+        }
+        return *this;
+    }
+    ~SharedBuf() { release(); }
+
+    /// Allocate an uninitialized block of `capacity` bytes for an encoder to fill,
+    /// then declare how much of it is live with `finish`. Empty (falsy) if `capacity`
+    /// exceeds what the 32-bit length field can express.
+    [[nodiscard]] static auto allocate(std::size_t capacity) -> SharedBuf {
+        if (capacity > 0xffff'ffffU) return {};
+        SharedBuf m;
+        // Single block: header, then `capacity` bytes of storage left uninitialized
+        // on purpose — the encoder writes over them immediately.
+        void* raw = ::operator new(sizeof(Rep) + capacity);
+        m.rep_ =
+            ::new (raw) Rep{.refs = 1, .size = 0, .capacity = static_cast<std::uint32_t>(capacity)};
+        return m;
+    }
+
+    /// Writable view of the whole storage — valid only while this is the sole
+    /// reference (see `unique`), i.e. while the owner is still filling it in.
+    [[nodiscard]] auto storage() noexcept -> std::span<std::byte> {
+        if (rep_ == nullptr) return {};
+        return {bytes_of(rep_), rep_->capacity};
+    }
+    /// Declare the first `n` bytes of the storage live. Immutable to sharers after.
+    auto finish(std::size_t n) noexcept -> void {
+        if (rep_ != nullptr) rep_->size = static_cast<std::uint32_t>(n);
+    }
+    /// True when no other reference exists, so the owner may refill the storage.
+    /// Acquire-ordered against the last releasing thread's writes, exactly as
+    /// `shared_ptr::use_count() == 1` would need to be to be actionable.
+    [[nodiscard]] auto unique() const noexcept -> bool {
+        return rep_ != nullptr && rep_->refs.load(std::memory_order_acquire) == 1;
+    }
+    [[nodiscard]] auto capacity() const noexcept -> std::size_t {
+        return rep_ == nullptr ? 0 : rep_->capacity;
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept { return rep_ != nullptr; }
+    [[nodiscard]] auto bytes() const noexcept -> std::span<const std::byte> {
+        if (rep_ == nullptr) return {};
+        return {bytes_of(rep_), rep_->size};
+    }
+    [[nodiscard]] auto size() const noexcept -> std::size_t {
+        return rep_ == nullptr ? 0 : rep_->size;
+    }
+
+  private:
+    struct Rep {
+        std::atomic<std::uint32_t> refs;
+        std::uint32_t size;
+        std::uint32_t capacity;
+    };
+
+    [[nodiscard]] static auto bytes_of(Rep* rep) noexcept -> std::byte* {
+        return reinterpret_cast<std::byte*>(rep) + sizeof(Rep);
+    }
+    auto retain() const noexcept -> void {
+        // Relaxed: a new reference is only ever created from an existing one held by
+        // this thread, so no ordering against the pointee is needed here.
+        if (rep_ != nullptr) rep_->refs.fetch_add(1, std::memory_order_relaxed);
+    }
+    auto release() noexcept -> void {
+        if (rep_ == nullptr) return;
+        // acq_rel on the last decrement so every other thread's writes/reads through
+        // its own reference happen-before this destruction (the standard shared_ptr
+        // pattern).
+        if (rep_->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            rep_->~Rep();
+            ::operator delete(static_cast<void*>(rep_));
+        }
+        rep_ = nullptr;
+    }
+
+    Rep* rep_ = nullptr;
+};
+
+/// One encoded message's extent within a `SharedBuf`.
+struct MsgSlice {
+    std::uint32_t offset = 0;
+    std::uint32_t length = 0;
+};
+
+/// Encode `push` into `out`, starting at `out[offset]` and growing `out` if needed;
+/// returns the slice written, or nullopt on a pathological encode failure (callers
+/// skip that message rather than faulting the whole routing step).
+///
+/// Encoding lives here, and happens *before* the routing strand ever sees the
+/// message: `Face` (Tier 1, one strand per connection, so genuinely parallel across
+/// the pool) encodes as it decodes, and the single global routing strand (Tier 2)
+/// only matches and fans out already-encoded bytes.
+[[nodiscard]] auto encode_push_into(SharedBuf& out, std::size_t offset, const Push& push)
+    -> std::optional<MsgSlice>;
+
+/// Copy `msg` (one already-encoded network message) into `out` at `offset`, growing
+/// `out` if needed; same return contract as `encode_push_into`. Used when a decoded
+/// message needs no rewriting at all and can be forwarded exactly as it arrived.
+[[nodiscard]] auto copy_msg_into(SharedBuf& out, std::size_t offset, std::span<const std::byte> msg)
+    -> std::optional<MsgSlice>;
+
+/// Encode one Push into a block of its own (a whole `SharedBuf` holding just it).
+/// Convenience for one-off publishes — the routing path uses `encode_push_into`.
+[[nodiscard]] auto make_push_msg(std::string_view key, std::span<const std::byte> payload,
+                                 bool is_del) -> SharedBuf;
+
+/// A registered face, as `Tables` sees it: just enough to route. `deliver` hands a
+/// run of *unframed* encoded network messages to that face, in order; the callback
+/// itself is responsible for posting onto that face's own strand before touching any
+/// face-owned state (its per-face frame SN, outbound buffer, socket) — `Tables` never
+/// needs to know that seam exists. Deliveries are handed over a whole run at a time
+/// (rather than one call per message) so that one inbound frame carrying N Pushes
+/// costs one Tables→Face hop per target face, not N: `block` is the shared encoded
+/// bytes and `slices` picks out, in order, the messages within it that this
+/// particular face is to receive.
 struct FaceHandle {
     FaceId id = 0;
     ZenohId zid{};
-    std::function<void(std::vector<std::byte>)> deliver;
+    std::function<void(SharedBuf block, std::vector<MsgSlice> slices)> deliver;
     /// Set by the owning `Face` itself (from its own strand) once its outbound
     /// queue backs up past a high watermark; cleared once drained below a low
     /// watermark (see `Face::enqueue_and_pump`/`pump_tx` in `broker.cpp`). `Tables`
@@ -58,13 +212,15 @@ struct FaceHandle {
     std::shared_ptr<std::atomic<bool>> congested;
 };
 
-/// A publish/delete, decoded and copied out of a Face's receive buffer (never a
-/// borrowed view — see the broker plan's "borrow-only codec boundary" section) before
-/// being posted to the routing strand.
+/// A publish/delete, decoded out of a Face's receive buffer and immediately
+/// re-encoded into the batch's shared outbound block (never a borrowed view into the
+/// receive buffer — see the broker plan's "borrow-only codec boundary" section)
+/// before being posted to the routing strand. `key` stays as a separate owned string
+/// because that is what the routing strand matches on; `slice` is what it hands to
+/// each matching face, relative to the `SharedBuf` passed alongside the batch.
 struct RoutedPush {
-    std::string key;
-    std::vector<std::byte> payload; ///< empty for a Del
-    bool is_del = false;
+    MsgSlice slice;              ///< this message's extent in the batch's block
+    std::string key;             ///< resolved (resmap-expanded) key, for matching
     std::optional<ZenohId> dest; ///< zid-targeting filter, if the publisher set one
 };
 
@@ -134,12 +290,14 @@ class Tables {
 
     /// Route every entry in `msgs` (in order, one entry for an unbatched single
     /// Push), all under one strand visit — filtered by each message's `dest` if
-    /// set (a narrowing filter, never a bypass — see `docs/BROKER.md`).
-    /// `Face::dispatch_frame_body` accumulates every consecutive Push decoded
-    /// from one inbound frame into one batch and posts it here once, amortizing
-    /// the Face->Tables `asio::post` hop (and its cross-thread wakeup cost) over
-    /// the whole batch instead of paying it per message.
-    auto on_push_batch(FaceId from, const std::vector<RoutedPush>& msgs) -> void;
+    /// set (a narrowing filter, never a bypass — see `docs/BROKER.md`). Each
+    /// entry's `slice` addresses `block`, the one shared buffer holding all their
+    /// encoded bytes. `Face::dispatch_frame_body` accumulates every consecutive
+    /// Push decoded from one inbound frame into one such batch and posts it here
+    /// once, amortizing the Face->Tables `asio::post` hop (and its cross-thread
+    /// wakeup cost) over the whole batch instead of paying it per message.
+    auto on_push_batch(FaceId from, const SharedBuf& block, const std::vector<RoutedPush>& msgs)
+        -> void;
     /// Route a query to every matching queryable face per `msg.target`/`msg.dest`,
     /// recording the fan-out for `on_response`/`on_response_final` to fan back in.
     /// Zero matches synthesizes an immediate `ResponseFinal` back to `from`.
@@ -183,8 +341,21 @@ class Tables {
   private:
     using QueryKey = std::pair<FaceId, std::uint32_t>; ///< (face, that face's local rid)
 
-    /// Shared per-message routing body for `on_push_batch` (one message at a time).
-    auto route_push(FaceId from, const RoutedPush& msg) -> void;
+    /// One target face's share of the batch currently being routed: every message of
+    /// that batch that matched it, in arrival order.
+    struct Delivery {
+        FaceId id = 0;
+        std::vector<MsgSlice> slices;
+    };
+
+    /// Append `slice` to `to`'s share of the batch in flight, creating its slot in
+    /// `deliveries_[0, used)` if this is the first message matching it.
+    auto queue_delivery(std::size_t& used, FaceId to, MsgSlice slice) -> void;
+    /// Hand each accumulated slot to its face (one `deliver` call per face) and reset.
+    auto flush_deliveries(const SharedBuf& block, std::size_t used) -> void;
+    /// One-message convenience wrapper around `deliver` (query-path messages, which
+    /// have no batch to amortize over).
+    static auto deliver_one(const FaceHandle& face, SharedBuf msg) -> void;
 
     asio::strand<asio::any_io_executor> strand_;
     std::atomic<std::size_t> pending_routing_jobs_{0};
@@ -194,6 +365,11 @@ class Tables {
     std::uint32_t next_local_rid_ = 0; ///< monotonic, shared across all forwarded Requests
     std::map<QueryKey, QueryKey> pending_queries_; ///< (answering face,local rid) -> origin
     std::map<QueryKey, int> fanout_remaining_;     ///< origin -> outstanding answer count
+    /// Per-face delivery accumulator for the batch currently being routed. A member
+    /// (rather than a local) purely to reuse its allocation across calls: only the
+    /// first `used` slots of any given `on_push_batch` are live, and nothing outlives
+    /// the call.
+    std::vector<Delivery> deliveries_;
 };
 
 } // namespace zenoh::broker

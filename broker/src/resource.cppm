@@ -91,22 +91,31 @@ class ResourceTable {
     /// intersects `literal_key`, deduplicated by `face_id` (a face with two+
     /// overlapping declared subscriptions on the same key is still returned once).
     /// `literal_key` must be wildcard-free — a Push/Del key is always literal, and
-    /// `Tables::route_push` rejects one containing `*` before calling this. Takes an
-    /// exact-hash-lookup fast path first (an O(1) `by_key_.find`, skipping
-    /// `zenoh.ke::intersects` entirely) before falling back to the general
-    /// wildcard scan for every other declared resource — the common case (a
-    /// publish landing on a subscription declared on that exact literal key) never
-    /// pays `intersects`'s chunk-splitting/DP cost at all.
+    /// `Tables::on_push_batch` rejects one containing `*` before calling this.
+    ///
+    /// **Memoized**: the full match set for a key is computed once and cached, so a
+    /// repeat publish on that key (the overwhelmingly common shape — a publisher
+    /// sends millions of messages on a handful of keys) costs one hash lookup and no
+    /// `zenoh.ke::intersects` calls, no scan of the declaration set, and no
+    /// allocation at all. Any `declare_*`/`undeclare_*`/`remove_face` invalidates the
+    /// whole cache (declarations are rare relative to messages).
+    ///
+    /// The returned reference is borrowed from that cache: it is valid only until the
+    /// next call on this object (a subsequent `matching_*` may rehash the cache, a
+    /// declaration change clears it). Callers route from it immediately and never
+    /// hold it.
     [[nodiscard]] auto matching_subscribers(std::string_view literal_key) const
-        -> std::vector<FaceCtx>;
+        -> const std::vector<FaceCtx>&;
     /// Every `FaceCtx` with `queryable == true` on a resource whose pattern
-    /// intersects `key`, deduplicated by `face_id` (see `matching_subscribers`).
+    /// intersects `key`, deduplicated by `face_id` (see `matching_subscribers`, whose
+    /// memoization and borrowed-reference lifetime apply here too).
     /// Unlike `matching_subscribers`, `key` need not be wildcard-free: a query key
     /// expression is legitimately a pattern (e.g. `get()`'s own default shape,
     /// `"demo/example/**"`) — `zenoh.ke::intersects` is documented safe on
     /// non-canonical/wildcarded input on either side, so `Tables::on_request` does
-    /// not reject one the way `route_push` rejects a wildcarded publish key.
-    [[nodiscard]] auto matching_queryables(std::string_view key) const -> std::vector<FaceCtx>;
+    /// not reject one the way `on_push_batch` rejects a wildcarded publish key.
+    [[nodiscard]] auto matching_queryables(std::string_view key) const
+        -> const std::vector<FaceCtx>&;
 
     /// Number of distinct declared (canonical) patterns. Test-only introspection.
     [[nodiscard]] auto resource_count() const noexcept -> std::size_t { return by_key_.size(); }
@@ -120,7 +129,32 @@ class ResourceTable {
     [[nodiscard]] auto face_count_for(std::string_view canonical_key) const -> std::size_t;
 
   private:
+    /// Memoized match sets, keyed by the *queried* key (not by a declared pattern):
+    /// see `matching_subscribers`. Cleared wholesale by any declaration change
+    /// (`invalidate()`), and capped at `max_cache_entries` so a peer publishing on
+    /// endlessly-varying keys can't grow it without bound — at the cap the cache is
+    /// simply cleared and refills with the live working set.
+    struct MatchCache {
+        std::unordered_map<std::string, std::vector<FaceCtx>, TransparentStringHash,
+                           std::equal_to<>>
+            entries;
+    };
+    static constexpr std::size_t max_cache_entries = 4096;
+
+    /// Drop every memoized match set — called by every mutating operation.
+    auto invalidate() noexcept -> void {
+        sub_cache_.entries.clear();
+        qbl_cache_.entries.clear();
+    }
+
+    /// Shared body of `matching_subscribers`/`matching_queryables`: a memoized
+    /// exact-hash + wildcard-scan match, selecting on `want_queryable`.
+    [[nodiscard]] auto matching(MatchCache& cache, std::string_view key, bool want_queryable) const
+        -> const std::vector<FaceCtx>&;
+
     std::unordered_map<std::string, Resource, TransparentStringHash, std::equal_to<>> by_key_;
+    mutable MatchCache sub_cache_; ///< mutable: pure memoization, no observable state
+    mutable MatchCache qbl_cache_;
 };
 
 } // namespace zenoh::broker

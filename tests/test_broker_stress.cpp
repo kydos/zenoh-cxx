@@ -120,8 +120,28 @@ auto make_counting_face(FaceId id, int& counter) -> FaceHandle {
     FaceHandle h;
     h.id = id;
     h.congested = std::make_shared<std::atomic<bool>>(false);
-    h.deliver = [&counter](std::vector<std::byte>) { ++counter; };
+    // `deliver` hands over a whole run of messages at a time (one call per face per
+    // routed batch, see FaceHandle in tables.cppm), so count messages, not calls.
+    h.deliver = [&counter](SharedBuf, std::vector<MsgSlice> slices) {
+        counter += static_cast<int>(slices.size());
+    };
     return h;
+}
+
+// One-message push batch: the encoded Push in a block of its own, plus the single
+// RoutedPush slice covering it (what Face::flush_push_batch builds for real traffic).
+struct OnePush {
+    SharedBuf block;
+    std::vector<RoutedPush> batch;
+};
+
+auto one_push(std::string_view key) -> OnePush {
+    OnePush p;
+    p.block = make_push_msg(key, {}, /*is_del=*/false);
+    p.batch.push_back(RoutedPush{
+        .slice = MsgSlice{.offset = 0, .length = static_cast<std::uint32_t>(p.block.size())},
+        .key = std::string(key)});
+    return p;
 }
 
 auto join_chunks(const std::vector<std::string>& chunks) -> std::string {
@@ -216,9 +236,9 @@ TEST("Tables scales to ~5,000 declared resources and routes to exactly the match
     // face (an exact-hash match) and that index's wildcard sibling ("<i>/**"
     // intersects "<i>", per test_ke.cpp's `ab/**` vector), and nothing else.
     std::string const target_key = "demo/scale/" + std::to_string(target_index);
-    std::vector<RoutedPush> batch{RoutedPush{.key = target_key, .payload = {}, .is_del = false}};
+    auto const pushed = one_push(target_key);
     (void)on_strand(tables, [&] {
-        tables.on_push_batch(0, batch);
+        tables.on_push_batch(0, pushed.block, pushed.batch);
         return 0;
     });
 
@@ -253,9 +273,9 @@ TEST("~2,000 faces sharing one declared subscription each receive one push exact
     CHECK(on_strand(tables, [&] { return tables.resource_face_count(key); }) ==
           static_cast<std::size_t>(num_faces));
 
-    std::vector<RoutedPush> batch{RoutedPush{.key = key, .payload = {}, .is_del = false}};
+    auto const pushed = one_push(key);
     (void)on_strand(tables, [&] {
-        tables.on_push_batch(0, batch);
+        tables.on_push_batch(0, pushed.block, pushed.batch);
         return 0;
     });
 
@@ -298,9 +318,9 @@ TEST("Hundreds of overlapping wildcard declarations match a deep key exactly as 
     // "~500 declared patterns... plus a comparable number of decoys".
     CHECK(delivered.size() > 500);
 
-    std::vector<RoutedPush> batch{RoutedPush{.key = key, .payload = {}, .is_del = false}};
+    auto const pushed = one_push(key);
     (void)on_strand(tables, [&] {
-        tables.on_push_batch(0, batch);
+        tables.on_push_batch(0, pushed.block, pushed.batch);
         return 0;
     });
 
@@ -366,16 +386,17 @@ TEST("Sustained high-volume unbatched put() delivers every message exactly once,
 
 TEST("A congested subscriber's face drops without stalling another, then un-congests once it "
      "drains") {
-    // Straight from broker.cpp's congested_high_watermark/congested_low_watermark
-    // (65536/16384) -- comfortably clear the high watermark, and keep the recovery
-    // trickle well under it so the still-undrained `active` subscriber (not actively
+    // Sized against broker.cpp's congested_high_watermark/congested_low_watermark,
+    // which are in *bytes* of queued outbound data (1 MiB / 256 KiB): a "flood"
+    // payload frames to a few tens of bytes, so tens of thousands of undrained
+    // messages comfortably clear the high watermark, while the recovery trickle
+    // stays well under it so the still-undrained `active` subscriber (not actively
     // re-drained during that phase) never itself congests.
     constexpr int flood_count = 90'000;
     constexpr int recovery_publish_count = 20'000;
-    // `recv_batch` reads exactly one framed message per `run_once()` call (see
-    // session.cpp), so draining back through a backlog approaching
-    // congested_high_watermark takes on the order of tens of thousands of calls, not
-    // a handful -- this cap just bounds a genuine hang, it isn't expected to be hit.
+    // `run_once()` dispatches one batch per call, so draining a backlog that reached
+    // the high watermark takes many thousands of calls, not a handful -- this cap
+    // just bounds a genuine hang, it isn't expected to be hit.
     constexpr int max_recovery_iters = 150'000;
     std::string const key = "demo/congest/x";
 

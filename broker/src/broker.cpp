@@ -3,13 +3,13 @@ module;
 #include <asio/as_tuple.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/bind_allocator.hpp>
+#include <asio/bind_executor.hpp>
 #include <asio/buffer.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/post.hpp>
-#include <asio/read.hpp>
 #include <asio/recycling_allocator.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/strand.hpp>
@@ -17,12 +17,12 @@ module;
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -60,17 +60,29 @@ namespace zenoh::broker {
 namespace {
 
 constexpr std::uint64_t default_lease_ms = 10'000;
-// Congestion watermarks for a Face's outbound tx_queue_ (hysteresis: cross `high`
-// to start dropping new deliveries to this face, drain back below `low` to
-// resume). Replaces an earlier "close the face on overflow" policy: that turned
+// Congestion watermarks, in *bytes* of outbound data queued for a Face (hysteresis:
+// cross `high` to start dropping new deliveries to this face, drain back below `low`
+// to resume). Replaces an earlier "close the face on overflow" policy: that turned
 // any transient production/drain mismatch -- not just a genuinely stuck peer --
 // into an outright disconnect (confirmed: a single fast publisher could trip it
 // within ~1s of connecting). Dropping keeps the slow consumer connected and lets
 // it catch back up, at the cost of reliable delivery to it while congested (v1
-// policy -- see docs/BROKER.md).
-constexpr std::size_t congested_high_watermark = 65536;
-constexpr std::size_t congested_low_watermark = 16384;
-constexpr std::size_t frame_overhead = 8;        ///< 2-byte len prefix + FrameHeader margin
+// policy -- see docs/BROKER.md). Bytes rather than a message count so the bound is
+// on actual memory (and so on how far behind -- i.e. how stale -- a slow consumer's
+// queue is allowed to get) regardless of payload size.
+constexpr std::size_t congested_high_watermark = 1U << 20; // 1 MiB queued
+constexpr std::size_t congested_low_watermark = 1U << 18;  // 256 KiB queued
+// Initial size of a Face's reusable receive buffer. Sized to hold many small
+// batches per `read_some` syscall (the point of buffering at all) without
+// committing 64 KiB per connection up front; `next_batch` grows it on demand for a
+// peer that actually sends batches larger than this, up to the 64 KiB the 2-byte
+// length prefix can express.
+constexpr std::size_t rx_buffer_initial = std::size_t{16} * 1024;
+// Bound on how many bytes of re-encoded Pushes one Face accumulates into a single
+// shared block before posting it to the routing strand (see Face::flush_push_batch).
+// Caps both the memory a single inbound frame can make the broker hold and how long
+// a routed batch can get before the first of its messages starts moving.
+constexpr std::size_t max_push_block_bytes = std::size_t{256} * 1024;
 constexpr std::size_t max_key_len = 0xffff;      ///< mirrors Session's resolve_key bound
 constexpr std::size_t max_resmap_entries = 4096; ///< mirrors Session's resmap_ bound
 constexpr std::size_t max_decl_ids = 4096;       ///< cap on sub_ids_/qbl_ids_, same rationale
@@ -111,43 +123,101 @@ class Face : public std::enable_shared_from_this<Face> {
         post_to_tables([id = id_](Tables& tables) { tables.remove_face(id); });
     }
 
-    /// Frame `msg` (an unframed, already-encoded network message) with this face's
-    /// own SN, enqueue it, and (re)start the async-write chain if idle. Must run on
-    /// `strand_` -- the only caller is the closure `build_handle()` posts through.
-    auto enqueue_and_pump(std::vector<std::byte> msg) -> void {
+    /// Frame `msgs` (unframed, already-encoded network messages, in order) into this
+    /// face's outbound byte stream and (re)start the async-write chain if idle. Must
+    /// run on `strand_` -- the only caller is the closure `build_handle()` posts
+    /// through. Taking a whole run at a time is what lets consecutive messages share
+    /// one frame and one `write` syscall (see `append_msg`/`pump_tx`).
+    auto enqueue_and_pump(const SharedBuf& block, const std::vector<MsgSlice>& slices) -> void {
         assert(strand_.running_in_this_thread());
-        if (tx_queue_.size() >= congested_high_watermark) {
+        auto const bytes = block.bytes();
+        for (auto const& slice : slices) {
+            if (slice.offset + slice.length <= bytes.size()) {
+                append_msg(bytes.subspan(slice.offset, slice.length));
+            }
+        }
+        pump_tx();
+    }
+
+  private:
+    /// Bytes queued for this face but not yet written to the socket.
+    [[nodiscard]] auto queued_bytes() const noexcept -> std::size_t {
+        return tx_len_ + tx_inflight_len_;
+    }
+
+    /// Make room for `need` bytes in the accumulation buffer, doubling so growth is
+    /// amortized. `tx_accum_` is used as raw storage -- `tx_len_`, not the vector's
+    /// own size, says how much of it is live -- so that appending is a plain memcpy
+    /// with no per-append bookkeeping and no re-zeroing of storage the encoder is
+    /// about to overwrite (`std::vector::insert` at the end showed up as ~10% of
+    /// broker CPU when this path used it).
+    auto ensure_tx_capacity(std::size_t need) -> void {
+        if (tx_accum_.size() >= need) return;
+        std::size_t cap = std::max<std::size_t>(tx_accum_.size() * 2, 4096);
+        while (cap < need) cap *= 2;
+        tx_accum_.resize(cap);
+    }
+
+    /// Append one encoded network message to the outbound byte stream, extending the
+    /// currently-open batch/frame if it still fits and starting a new one otherwise.
+    ///
+    /// Batching (rather than one framed batch per message, as this used to do) is
+    /// what makes the write path cheap in the only two places it costs anything: the
+    /// wire (one 2-byte length prefix + one `FrameHeader` amortized over every
+    /// message that fits alongside it, which the peer then demuxes in a single
+    /// decode loop) and the syscall count (`pump_tx` hands the accumulated bytes to
+    /// exactly one `write`, however many messages that is -- a scatter-gather write
+    /// over per-message buffers instead caps out at ASIO's 64-iovec limit).
+    auto append_msg(std::span<const std::byte> body) -> void {
+        if (queued_bytes() >= congested_high_watermark) {
             // Slow consumer: drop rather than close (see congested_high_watermark's
             // comment). Tables should already have stopped routing new messages to
             // this face by the time congested_ is visible on its strand; this is
             // the defensive backstop for whatever was already in flight through
-            // that small window, so tx_queue_ can't grow past this bound.
+            // that small window, so the queue can't grow past this bound.
             congested_->store(true, std::memory_order_relaxed);
             return;
         }
-        if (frame_overhead + msg.size() > peer_batch_size_) return; // doesn't fit; drop silently
-        std::vector<std::byte> framed(2 + frame_overhead + msg.size());
+        // Budget for one batch's content, i.e. everything after its 2-byte length
+        // prefix -- the peer's advertised batch size covers the prefix too (the same
+        // accounting the client's own `Session` tx path uses).
+        std::size_t const cap = peer_batch_size_ > 2 ? std::size_t{peer_batch_size_} - 2 : 0;
+
+        if (open_batch_ != no_open_batch) {
+            std::size_t const content = tx_len_ - open_batch_ - 2;
+            if (content + body.size() <= cap) { // fits alongside what's already framed
+                ensure_tx_capacity(tx_len_ + body.size());
+                __builtin_memcpy(tx_accum_.data() + tx_len_, body.data(), body.size());
+                tx_len_ += body.size();
+                store_le<std::uint16_t>(tx_accum_.data() + open_batch_,
+                                        static_cast<std::uint16_t>(content + body.size()));
+                return;
+            }
+            open_batch_ = no_open_batch; // full: this message starts a fresh batch
+        }
+
+        std::array<std::byte, 16> hdr{};
+        ByteWriter w{hdr};
         FrameHeader fh{};
         fh.reliability = Reliability::reliable;
         fh.sn = frame_sn_;
-        ByteWriter w{std::span(framed).subspan(2)};
         if (!fh.encode(w)) return;
-        std::size_t const hdr = w.written();
-        std::size_t const content = hdr + msg.size();
-        if (2 + content > peer_batch_size_) return; // doesn't fit after all; drop silently
-        __builtin_memcpy(framed.data() + 2 + hdr, msg.data(), msg.size());
-        store_le<std::uint16_t>(framed.data(), static_cast<std::uint16_t>(content));
-        framed.resize(2 + content);
-        frame_sn_ = (frame_sn_ + 1) & 0x0fff'ffff;
+        std::size_t const hdr_len = w.written();
+        if (hdr_len + body.size() > cap) return; // can never fit a batch; drop silently
 
-        tx_queue_.push_back(std::move(framed));
-        if (tx_queue_.size() >= congested_high_watermark) {
+        ensure_tx_capacity(tx_len_ + 2 + hdr_len + body.size());
+        std::byte* const at = tx_accum_.data() + tx_len_;
+        store_le<std::uint16_t>(at, static_cast<std::uint16_t>(hdr_len + body.size()));
+        __builtin_memcpy(at + 2, hdr.data(), hdr_len);
+        __builtin_memcpy(at + 2 + hdr_len, body.data(), body.size());
+        open_batch_ = tx_len_;
+        tx_len_ += 2 + hdr_len + body.size();
+        frame_sn_ = (frame_sn_ + 1) & 0x0fff'ffff;
+        if (queued_bytes() >= congested_high_watermark) {
             congested_->store(true, std::memory_order_relaxed);
         }
-        if (!writing_) pump_tx();
     }
 
-  private:
     // Posts `fn` (any callable taking `Tables&`) onto `tables_->strand()`, tracking
     // it in `Tables::pending_routing_jobs()` so `throttle_if_backlogged` can detect
     // and bound Tier-2 backlog. Every message-triggered post to `tables_->strand()`
@@ -174,11 +244,12 @@ class Face : public std::enable_shared_from_this<Face> {
             .id = id_,
             .zid = zid_,
             .deliver =
-                [self = shared_from_this()](std::vector<std::byte> msg) {
+                [self = shared_from_this()](SharedBuf block, std::vector<MsgSlice> slices) {
                     asio::post(self->strand_,
                                asio::bind_allocator(asio::recycling_allocator<void>{},
-                                                    [self, msg = std::move(msg)]() mutable {
-                                                        self->enqueue_and_pump(std::move(msg));
+                                                    [self, block = std::move(block),
+                                                     slices = std::move(slices)]() mutable {
+                                                        self->enqueue_and_pump(block, slices);
                                                     }));
                 },
             .congested = congested_};
@@ -190,7 +261,7 @@ class Face : public std::enable_shared_from_this<Face> {
         assert(strand_.running_in_this_thread());
         sock_.set_option(asio::ip::tcp::no_delay(true));
 
-        auto isyn_bytes = co_await read_batch();
+        auto isyn_bytes = co_await next_batch();
         if (!isyn_bytes) co_return false;
         ByteReader isyn_r{*isyn_bytes};
         auto isyn = InitSyn::decode(isyn_r);
@@ -211,7 +282,7 @@ class Face : public std::enable_shared_from_this<Face> {
         ack.cookie = cookie;
         if (!co_await send_now(encode_one(ack))) co_return false;
 
-        auto osyn_bytes = co_await read_batch();
+        auto osyn_bytes = co_await next_batch();
         if (!osyn_bytes) co_return false;
         ByteReader osyn_r{*osyn_bytes};
         auto osyn = OpenSyn::decode(osyn_r);
@@ -230,7 +301,7 @@ class Face : public std::enable_shared_from_this<Face> {
     [[nodiscard]] auto read_loop() -> asio::awaitable<void> {
         for (;;) {
             co_await throttle_if_backlogged();
-            auto batch = co_await read_batch();
+            auto batch = co_await next_batch();
             if (!batch) co_return;
             if (!process_batch(*batch)) co_return;
         }
@@ -258,20 +329,48 @@ class Face : public std::enable_shared_from_this<Face> {
         }
     }
 
-    // Read one length-prefixed TCP batch (2-byte LE length + body); nullopt on
-    // EOF/error.
-    [[nodiscard]] auto read_batch() -> asio::awaitable<std::optional<std::vector<std::byte>>> {
+    // Next length-prefixed TCP batch (2-byte LE length + body); nullopt on EOF/error.
+    //
+    // Reads into one reusable per-face buffer via `read_some` and hands back a
+    // *borrow* into it, rather than doing two `async_read`s (length, then body) into
+    // a freshly-allocated vector per batch: one `read` syscall typically yields
+    // several batches from a pipelining peer, and none of them allocates. The
+    // returned span is valid only until the next `next_batch()` call (which may
+    // compact or grow the buffer) -- every caller fully consumes a batch before
+    // asking for the next, and nothing decoded out of it escapes as a view (a Push
+    // is re-encoded into its own owned buffer immediately, see `on_push`).
+    [[nodiscard]] auto next_batch() -> asio::awaitable<std::optional<std::span<const std::byte>>> {
         auto token = asio::as_tuple(asio::use_awaitable);
-        std::array<std::byte, 2> len_buf{};
-        auto [ec1, n1] = co_await asio::async_read(sock_, asio::buffer(len_buf), token);
-        if (ec1 || n1 != 2) co_return std::nullopt;
-        std::uint16_t const len = load_le<std::uint16_t>(len_buf.data());
-        std::vector<std::byte> body(len);
-        if (len != 0) {
-            auto [ec2, n2] = co_await asio::async_read(sock_, asio::buffer(body), token);
-            if (ec2 || n2 != len) co_return std::nullopt;
+        for (;;) {
+            std::size_t const avail = rx_end_ - rx_start_;
+            if (avail >= 2) {
+                std::uint16_t const len = load_le<std::uint16_t>(rx_buf_.data() + rx_start_);
+                std::size_t const need = 2 + std::size_t{len};
+                if (avail >= need) { // a whole batch is already buffered
+                    std::span<const std::byte> const batch{rx_buf_.data() + rx_start_ + 2, len};
+                    rx_start_ += need;
+                    co_return batch;
+                }
+                compact_rx(); // partial: make room (and capacity) for the rest of it
+                if (rx_buf_.size() < need) rx_buf_.resize(need);
+            } else {
+                compact_rx();
+            }
+            auto [ec, n] = co_await sock_.async_read_some(
+                asio::buffer(rx_buf_.data() + rx_end_, rx_buf_.size() - rx_end_), token);
+            if (ec || n == 0) co_return std::nullopt;
+            rx_end_ += n;
         }
-        co_return body;
+    }
+
+    // Slide the unconsumed tail back to the front of the receive buffer so the space
+    // already-consumed batches occupied becomes writable again.
+    auto compact_rx() -> void {
+        if (rx_start_ == 0) return;
+        std::size_t const avail = rx_end_ - rx_start_;
+        if (avail != 0) __builtin_memmove(rx_buf_.data(), rx_buf_.data() + rx_start_, avail);
+        rx_start_ = 0;
+        rx_end_ = avail;
     }
 
     [[nodiscard]] auto send_now(std::vector<std::byte> framed) -> asio::awaitable<bool> {
@@ -306,32 +405,29 @@ class Face : public std::enable_shared_from_this<Face> {
 
         if (mid == FrameHeader::id) {
             if (!FrameHeader::decode(r)) return false;
-            return dispatch_frame_body(r);
+            return dispatch_frame_body(r, batch);
         }
         if (mid == KeepAlive::id) return true;
         if (mid == Close::id) return false; // peer closed the session
         return true;                        // unknown top-level batch: tolerate (forward-compat)
     }
 
-    [[nodiscard]] auto dispatch_frame_body(ByteReader& r) -> bool {
-        // Every Push decoded from this one frame accumulates here instead of
-        // posting to Tables individually -- amortizes the Face->Tables asio::post
-        // hop (a heap-allocated handler node plus a cross-strand wakeup) over the
-        // whole run of consecutive Pushes instead of paying it per message; this
-        // was measured as a meaningful share of the per-message routing cost at
-        // high throughput (see docs/BROKER.md's "Performance testing" section).
-        // Flushed before any *other* message type in the same frame is handled,
-        // so relative ordering against interleaved Declare/Request/Response
-        // traffic within one frame is preserved exactly -- only consecutive
-        // Pushes are ever batched together.
-        std::vector<RoutedPush> push_batch;
-        auto flush_pushes = [&] {
-            if (push_batch.empty()) return;
-            post_to_tables([id = id_, batch = std::move(push_batch)](Tables& tables) {
-                tables.on_push_batch(id, batch);
-            });
-            push_batch.clear(); // defensive: usable again regardless of moved-from state
-        };
+    // `batch` is the whole enclosing batch `r` reads from, passed through so a Push
+    // can be located byte-exactly within it (see `on_push`'s forward-as-received
+    // path).
+    [[nodiscard]] auto dispatch_frame_body(ByteReader& r, std::span<const std::byte> batch)
+        -> bool {
+        // Every Push decoded from this one frame accumulates in `push_batch_`
+        // (re-encoded back to back into `push_block_`) instead of being posted to
+        // Tables individually -- amortizes the Face->Tables asio::post hop (a
+        // heap-allocated handler node plus a cross-strand wakeup) over the whole run
+        // of consecutive Pushes instead of paying it per message; this was measured
+        // as a meaningful share of the per-message routing cost at high throughput
+        // (see docs/BROKER.md's "Performance testing" section). Flushed before any
+        // *other* message type in the same frame is handled, so relative ordering
+        // against interleaved Declare/Request/Response traffic within one frame is
+        // preserved exactly -- only consecutive Pushes are ever batched together.
+        auto flush_pushes = [this] { flush_push_batch(); };
 
         while (r.remaining() > 0) {
             auto pk = r.peek();
@@ -342,7 +438,7 @@ class Face : public std::enable_shared_from_this<Face> {
             std::uint8_t const mid = std::to_integer<std::uint8_t>(*pk) & mid_mask;
 
             if (mid == Push::id) {
-                if (!on_push(r, push_batch)) {
+                if (!on_push(r, batch)) {
                     flush_pushes(); // ditto: earlier Pushes in this run are still valid
                     return false;
                 }
@@ -372,40 +468,107 @@ class Face : public std::enable_shared_from_this<Face> {
         return true;
     }
 
-    // Resolve `we` to an owned key string via this face's resmap_ (mirrors
-    // Session::resolve_key exactly -- same shape, same bounds).
-    [[nodiscard]] auto resolve_key(const WireExpr& we) -> std::optional<std::string> {
+    // Resolve `we` into `out` via this face's resmap_ (mirrors Session::resolve_key
+    // exactly -- same shape, same bounds). Writing into a caller-owned string lets
+    // the hot path reuse one scratch buffer's capacity instead of allocating a fresh
+    // key per message.
+    [[nodiscard]] auto resolve_key_into(const WireExpr& we, std::string& out) -> bool {
         if (we.scope == 0) {
-            if (we.suffix.size() > max_key_len) return std::nullopt;
-            return std::string(we.suffix);
+            if (we.suffix.size() > max_key_len) return false;
+            out.assign(we.suffix);
+            return true;
         }
         auto it = resmap_.find(we.scope);
-        if (it == resmap_.end()) return std::nullopt;
-        if (it->second.size() + we.suffix.size() > max_key_len) return std::nullopt;
-        std::string out = it->second;
+        if (it == resmap_.end()) return false;
+        if (it->second.size() + we.suffix.size() > max_key_len) return false;
+        out.assign(it->second);
         out.append(we.suffix);
+        return true;
+    }
+
+    // Same, returning an owned string -- for the non-hot paths (declare/query).
+    [[nodiscard]] auto resolve_key(const WireExpr& we) -> std::optional<std::string> {
+        std::string out;
+        if (!resolve_key_into(we, out)) return std::nullopt;
         return out;
     }
 
-    /// Decodes one Push and appends it to `batch` (see `dispatch_frame_body`) --
-    /// does not post to Tables itself.
-    [[nodiscard]] auto on_push(ByteReader& r, std::vector<RoutedPush>& batch) -> bool {
+    /// Decodes one Push into this frame's shared outbound block and records it in
+    /// `push_batch_` (see `dispatch_frame_body`) -- does not post to Tables itself.
+    ///
+    /// Composing the outbound bytes here, on this face's own (Tier-1, per-connection,
+    /// genuinely parallel) strand rather than later on the single global routing
+    /// strand, is deliberate: they are identical for every destination face, so Tier
+    /// 2 is left with nothing but matching and handing out slices of one refcounted
+    /// block -- and the payload is never copied into an intermediate buffer, going
+    /// straight into the outbound bytes.
+    ///
+    /// A Push that arrives with `scope == 0` already carries the full key, i.e. it is
+    /// byte-for-byte what every subscriber should receive, so it is forwarded exactly
+    /// as received (one memcpy, no re-encode -- and, as a bonus, every extension it
+    /// carries survives verbatim). Only a resmap-compressed one (`scope != 0`) has to
+    /// be re-encoded, with its key expanded and everything else carried over.
+    [[nodiscard]] auto on_push(ByteReader& r, std::span<const std::byte> batch) -> bool {
         assert(strand_.running_in_this_thread());
+        std::size_t const before = r.remaining();
         auto push = Push::decode(r);
         if (!push) return false;
-        auto key = resolve_key(push->wire_expr);
-        if (!key) return false;
+        if (!resolve_key_into(push->wire_expr, key_scratch_)) return false;
+
+        // Keep one frame's worth of composed Pushes bounded: a peer can pack a great
+        // many small Pushes into one frame, and each may expand (a short resmap-
+        // compressed key becomes the full key on the way out). Past the bound, post
+        // what's accumulated and start a fresh block rather than growing one without
+        // limit.
+        if (push_used_ >= max_push_block_bytes) flush_push_batch();
+
+        std::optional<MsgSlice> slice;
+        if (push->wire_expr.scope == 0) {
+            // Exactly the bytes `Push::decode` just consumed out of `batch`.
+            auto const raw = batch.subspan(batch.size() - before, before - r.remaining());
+            slice = copy_msg_into(push_block_, push_used_, raw);
+        } else {
+            push->wire_expr =
+                WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_scratch_};
+            slice = encode_push_into(push_block_, push_used_, *push);
+        }
+        if (!slice) return true; // pathological encode failure: skip it, stay in sync
+        push_used_ = slice->offset + slice->length;
 
         RoutedPush msg{};
-        msg.key = std::move(*key);
+        msg.slice = *slice;
+        msg.key.assign(key_scratch_);
         if (push->dest) msg.dest = push->dest->zid;
-        if (auto const* put = std::get_if<Put>(&push->payload.body)) {
-            msg.payload.assign(put->payload.begin(), put->payload.end());
-        } else {
-            msg.is_del = true;
-        }
-        batch.push_back(std::move(msg));
+        push_batch_.push_back(std::move(msg));
         return true;
+    }
+
+    /// Post whatever Pushes have accumulated for this frame to the routing strand,
+    /// and start a fresh block for the next run.
+    ///
+    /// The block is reused rather than reallocated whenever the previous one has
+    /// already been consumed by every face it was delivered to (`unique()`), which in
+    /// steady state it has -- so a sustained publish stream allocates nothing per
+    /// message *and* nothing per frame. A block still referenced by a lagging face is
+    /// simply left to that face and a new one allocated here.
+    auto flush_push_batch() -> void {
+        if (push_batch_.empty()) {
+            push_used_ = 0;
+            return;
+        }
+        push_block_.finish(push_used_);
+        std::size_t const count = push_batch_.size();
+        post_to_tables([id = id_, block = push_block_, batch = std::move(push_batch_)](
+                           Tables& tables) { tables.on_push_batch(id, block, batch); });
+        // The batch vector went with the post, so this one starts empty: size it for
+        // what the last frame needed, rather than letting it regrow from nothing (a
+        // handful of reallocations) on every single frame.
+        push_batch_.clear();
+        push_batch_.reserve(count);
+        push_used_ = 0;
+        if (!push_block_.unique() || push_block_.capacity() > max_push_block_bytes) {
+            push_block_ = SharedBuf{}; // still in flight, or grown oversized: start over
+        }
     }
 
     [[nodiscard]] auto on_request(ByteReader& r) -> bool {
@@ -539,48 +702,45 @@ class Face : public std::enable_shared_from_this<Face> {
         return true;
     }
 
+    // Hand everything accumulated so far to one `async_write`, if a write isn't
+    // already in flight. Two buffers ping-pong: whatever arrives while a write is
+    // outstanding accumulates in `tx_accum_` and goes out in the *next* write, so a
+    // burst costs one syscall rather than one per message (and, unlike a
+    // scatter-gather write over per-message buffers, isn't capped by ASIO's 64-iovec
+    // limit -- a full 64 KiB batch goes out whole).
+    //
+    // The write is initiated inline, not via `co_spawn` as it once was: ASIO's
+    // reactive socket service attempts the send immediately on an idle socket, so
+    // for an otherwise-idle face the message reaches the wire within this same
+    // handler instead of after another trip through the event loop -- which is a
+    // direct, per-message latency saving on top of the syscall saving above.
     auto pump_tx() -> void {
         assert(strand_.running_in_this_thread());
-        if (tx_queue_.empty()) {
-            writing_ = false;
-            return;
-        }
+        if (writing_ || tx_len_ == 0) return;
+        tx_accum_.swap(tx_inflight_); // tx_accum_ takes over the (spent) other buffer
+        tx_inflight_len_ = std::exchange(tx_len_, 0);
+        open_batch_ = no_open_batch; // the batch we just handed off is closed now
         writing_ = true;
-        // Coalesce every currently-queued frame into one scatter-gather write
-        // instead of one async_write (and one epoll round-trip) per frame --
-        // draining strictly one frame per syscall was the dominant per-message
-        // cost once the congestion fix above stopped connections dying under
-        // real load: measured as the actual throughput ceiling, not the codec or
-        // the loopback socket itself (see docs/BROKER.md's "Performance testing"
-        // section). Referencing `tx_queue_`'s elements here is safe even if more
-        // frames are pushed while this write is in flight: push_back never
-        // invalidates references/pointers to existing deque elements, and any
-        // newly-queued frames are simply picked up by the *next* pump_tx() call.
-        std::size_t const n = tx_queue_.size();
-        std::vector<asio::const_buffer> bufs;
-        bufs.reserve(n);
-        for (auto const& frame : tx_queue_) bufs.emplace_back(asio::buffer(frame));
-        asio::co_spawn(
-            strand_,
-            [this, self = shared_from_this(), bufs = std::move(bufs),
-             n]() -> asio::awaitable<void> {
-                auto token = asio::as_tuple(asio::use_awaitable);
-                // async_write's buffer-sequence overload transfers the sum of all
-                // buffer sizes or fails with an error -- no partial-write case to
-                // check, unlike async_write_some.
-                auto [ec, written] = co_await asio::async_write(sock_, bufs, token);
-                (void)written;
-                if (ec) {
-                    close_now();
-                    co_return;
-                }
-                for (std::size_t i = 0; i < n; ++i) tx_queue_.pop_front();
-                if (tx_queue_.size() <= congested_low_watermark) {
-                    congested_->store(false, std::memory_order_relaxed);
-                }
-                pump_tx();
-            },
-            asio::detached);
+        asio::async_write(
+            sock_, asio::buffer(tx_inflight_.data(), tx_inflight_len_),
+            asio::bind_executor(
+                strand_,
+                asio::bind_allocator(
+                    asio::recycling_allocator<void>{},
+                    [this, self = shared_from_this()](const asio::error_code& ec, std::size_t) {
+                        writing_ = false;
+                        if (ec) {
+                            close_now();
+                            return;
+                        }
+                        // async_write transfers everything or fails -- no partial
+                        // write to carry over, unlike async_write_some.
+                        tx_inflight_len_ = 0; // storage is kept for the next swap
+                        if (queued_bytes() <= congested_low_watermark) {
+                            congested_->store(false, std::memory_order_relaxed);
+                        }
+                        pump_tx();
+                    })));
     }
 
     auto close_now() -> void {
@@ -596,7 +756,35 @@ class Face : public std::enable_shared_from_this<Face> {
     ZenohId zid_{};
     std::uint16_t peer_batch_size_ = 0xffff;
     std::uint32_t frame_sn_ = 0;
-    std::deque<std::vector<std::byte>> tx_queue_;
+
+    /// Reusable receive buffer and the window of it holding read-but-unconsumed
+    /// bytes (`[rx_start_, rx_end_)`) -- see `next_batch`/`compact_rx`.
+    std::vector<std::byte> rx_buf_ = std::vector<std::byte>(rx_buffer_initial);
+    std::size_t rx_start_ = 0;
+    std::size_t rx_end_ = 0;
+    /// Scratch for the resolved key of the message being decoded (`resolve_key_into`).
+    std::string key_scratch_;
+    /// The Pushes decoded from the frame currently being dispatched, and the shared
+    /// block their re-encoded bytes are written into (`push_used_` bytes of it are
+    /// live). Both are members purely to keep their allocations across frames -- see
+    /// `flush_push_batch`.
+    std::vector<RoutedPush> push_batch_;
+    SharedBuf push_block_;
+    std::size_t push_used_ = 0;
+
+    /// Outbound byte stream, framed and ready to write: `tx_accum_[0, tx_len_)` is
+    /// being filled, `tx_inflight_[0, tx_inflight_len_)` is what the outstanding
+    /// `async_write` (if `writing_`) is sending. The two swap on each `pump_tx`, so
+    /// neither reallocates in steady state. Both vectors are raw storage: their
+    /// `size()` is capacity, and the `*_len_` counters are the live extents.
+    std::vector<std::byte> tx_accum_;
+    std::size_t tx_len_ = 0;
+    std::vector<std::byte> tx_inflight_;
+    std::size_t tx_inflight_len_ = 0;
+    /// Offset in `tx_accum_` of the still-extendable batch's length prefix, or
+    /// `no_open_batch` when the next message must start a new batch.
+    static constexpr std::size_t no_open_batch = static_cast<std::size_t>(-1);
+    std::size_t open_batch_ = no_open_batch;
     bool writing_ = false;
     /// Shared with `Tables` via `FaceHandle::congested` (see its doc comment).
     /// Always non-null: allocated once at construction, never reassigned.
