@@ -216,6 +216,59 @@ zenohd -l tcp/127.0.0.1:7447 &
 ./build/clang/examples/z_pub_thr -e tcp/127.0.0.1:7447 8      # or zenoh-rust z_pub_thr
 ```
 
+### Query/reply
+
+`examples/z_get.cpp` (`z_get`) — the C++ equivalent of zenoh-rust's `z_get`: sends one
+query and prints every reply until the query completes.
+`z_get [-e endpoint] [-s selector] [-t BEST_MATCHING|ALL|ALL_COMPLETE] [-o timeout_ms]`.
+The selector is split at the first `?` into the key expression and the parameters
+`get` takes separately. The reference's `-p/--payload` is not modeled: `get` sends a
+key expression and parameters only (a queryable can *read* a query payload via
+`IncomingQuery::payload()`, but the client cannot send one).
+
+`examples/z_queryable.cpp` (`z_queryable`) — the C++ equivalent of zenoh-rust's
+`z_queryable`: declares a queryable and answers every query with a fixed payload in a
+blocking `recv` loop. `z_queryable [-e endpoint] [-k key] [-p payload] [--complete]`.
+Each `IncomingQuery` sends its `ResponseFinal` when it goes out of scope.
+
+`examples/z_querier.cpp` (`z_querier`) — the C++ equivalent of zenoh-rust's
+`z_querier`: the same query once a second, forever. Same flags as `z_get`. Two
+differences, both runtime gaps: there is no `declare_querier` (a querier declared once
+and reused, with a matching listener), so each iteration issues a plain `get()`; and
+since a query cannot carry a payload, the iteration counter the reference sends as the
+query payload appears only in this side's printed output.
+
+```sh
+zenohd -l tcp/127.0.0.1:7447 &                     # or this project's zenohb
+./build/clang/examples/z_queryable -e tcp/127.0.0.1:7447 &
+./build/clang/examples/z_get -e tcp/127.0.0.1:7447 -s 'demo/example/**'
+z_get -e tcp/127.0.0.1:7447 -s 'demo/example/**'   # from ../zenoh-rust
+z_queryable -e tcp/127.0.0.1:7447 &                # reference queryable, C++ getter
+```
+
+### Ping/pong (latency)
+
+`examples/z_ping.cpp` (`z_ping`) and `examples/z_pong.cpp` (`z_pong`) — the C++
+equivalents of zenoh-rust's `z_ping`/`z_pong`. `z_ping` publishes a `<payload_size>`
+payload on `test/ping` and blocks for the echo on `test/pong`, timing each round trip;
+`z_pong` subscribes to `test/ping` and republishes each payload on `test/pong`.
+`z_ping [-e endpoint] [-n samples] [-w warmup_secs] <payload_size>`,
+`z_pong [-e endpoint]`. Because `put` blocks until the payload is written, it already
+behaves like the reference's `CongestionControl::Block`; the reference's express-QoS
+`--no-express` flag has no runtime equivalent and is not modeled.
+
+```sh
+zenohd -l tcp/127.0.0.1:7447 &                     # or this project's zenohb
+./build/clang/examples/z_pong -e tcp/127.0.0.1:7447 &
+./build/clang/examples/z_ping -e tcp/127.0.0.1:7447 -n 100 64
+z_pong -e tcp/127.0.0.1:7447 &                     # from ../zenoh-rust: reference pong,
+./build/clang/examples/z_ping -e tcp/127.0.0.1:7447 64   # C++ ping — and vice versa
+```
+
+`z_ping` and `z_pong` both declare a subscriber and publish on the same session, so
+they exercise the full-duplex path (a blocking `put` interleaved with the receive
+pump) that no other example covers.
+
 ```sh
 # Router + reference subscriber (from ../zenoh-rust):
 zenohd -l tcp/127.0.0.1:7447 &

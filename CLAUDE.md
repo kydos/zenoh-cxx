@@ -302,11 +302,19 @@ this codebase's no-exceptions convention.
 
 ### Examples
 
-`examples/{z_put,z_pub,z_put_float,z_pub_thr,z_sub,z_sub_thr}.cpp` are runnable
-C++ equivalents of the corresponding `zenoh-rust` example binaries, built by default
-(`ZENOH_EXAMPLES=ON`) into `build/<preset>/examples/`. They're also the manual
-interop test path against a real `zenohd` router — see `docs/RUNTIME.md` for the
-exact invocation sequences (router + reference pub/sub + this repo's binaries).
+`examples/*.cpp` are runnable C++ equivalents of the corresponding `zenoh-rust`
+example binaries, built by default (`ZENOH_EXAMPLES=ON`) into
+`build/<preset>/examples/`: `z_put`/`z_pub`/`z_put_float`/`z_pub_thr`/`z_sub`/
+`z_sub_thr` (pub/sub), `z_get`/`z_queryable`/`z_querier` (query/reply), and
+`z_ping`/`z_pong` (round-trip latency). `examples/zexample.hpp` holds the helpers
+they share (the `ZError` name mapping, byte-span/string conversions) — include it
+*after* `import zenoh;`, since it names types that module exports. They're also the
+manual interop test path against a real `zenohd` router — see `docs/RUNTIME.md` for
+the exact invocation sequences (router + reference binaries + this repo's).
+
+Not modeled, for lack of a runtime API rather than by choice: `z_delete` (there is no
+`Session::del` — `SampleKind::del` exists on the receive path only), a query payload
+(`z_get -p`), `declare_querier`/matching listeners, and express/congestion QoS flags.
 
 `zenohb` (`broker/src/main.cpp`, always built) is the broker executable —
 `zenohb -l tcp/host:port [--threads N]`. It's the manual interop test path in the

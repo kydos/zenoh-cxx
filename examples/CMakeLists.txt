@@ -23,3 +23,23 @@ target_compile_features(z_pub_thr PRIVATE cxx_std_23)
 add_executable(z_sub_thr z_sub_thr.cpp)
 target_link_libraries(z_sub_thr PRIVATE zenoh)
 target_compile_features(z_sub_thr PRIVATE cxx_std_23)
+
+add_executable(z_get z_get.cpp)
+target_link_libraries(z_get PRIVATE zenoh)
+target_compile_features(z_get PRIVATE cxx_std_23)
+
+add_executable(z_queryable z_queryable.cpp)
+target_link_libraries(z_queryable PRIVATE zenoh)
+target_compile_features(z_queryable PRIVATE cxx_std_23)
+
+add_executable(z_querier z_querier.cpp)
+target_link_libraries(z_querier PRIVATE zenoh)
+target_compile_features(z_querier PRIVATE cxx_std_23)
+
+add_executable(z_ping z_ping.cpp)
+target_link_libraries(z_ping PRIVATE zenoh)
+target_compile_features(z_ping PRIVATE cxx_std_23)
+
+add_executable(z_pong z_pong.cpp)
+target_link_libraries(z_pong PRIVATE zenoh)
+target_compile_features(z_pong PRIVATE cxx_std_23)

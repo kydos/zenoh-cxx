@@ -165,7 +165,8 @@ for the full story.
 ## Examples
 
 Every preset builds runtime example programs under `build/<preset>/examples/`:
-`z_put`, `z_pub`, `z_put_float`, `z_pub_thr`, `z_sub`, `z_sub_thr`. See
+`z_put`, `z_pub`, `z_put_float`, `z_pub_thr`, `z_sub`, `z_sub_thr` (pub/sub),
+`z_get`, `z_queryable`, `z_querier` (query/reply), and `z_ping`/`z_pong` (latency). See
 [`docs/RUNTIME.md`](docs/RUNTIME.md) for how to run them against a Zenoh router (this
 project's own `zenohb`, above, or a real `zenohd`). Protocol/codec internals are
 documented in [`docs/PROTO.md`](docs/PROTO.md).
