@@ -95,6 +95,28 @@ wipe a stale cache (e.g. when a flag was removed from a preset), reconfigure fre
 cmake --preset <preset> --fresh
 ```
 
+## Testing
+
+`ctest` registers one case per test, so the suite reports test-by-test and can be
+narrowed or run in parallel:
+
+```sh
+ctest --preset clang                  # every test, one ctest case each
+ctest --preset clang -j8              # ... in parallel
+ctest --preset clang -R 'is_canon'    # only cases matching a regex
+ctest --preset clang -L '^test_ke$'   # only cases from tests/test_ke.cpp
+```
+
+The test binary can also be run directly, which prints an `ok`/`FAIL` line per case
+with its elapsed time, grouped by source file:
+
+```sh
+build/clang/tests/zenoh-tests                     # everything
+build/clang/tests/zenoh-tests --filter test_ke    # cases whose id contains the text
+build/clang/tests/zenoh-tests --list              # every case id, one per line
+build/clang/tests/zenoh-tests --help
+```
+
 ## Formatting & linting
 
 Style is enforced with **clang-format** (`.clang-format`) and **clang-tidy**

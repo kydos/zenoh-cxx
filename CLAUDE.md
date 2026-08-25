@@ -68,8 +68,9 @@ Key presets (see `CMakePresets.json`):
 - `linux-clang-release`, `linux-coverage`, `linux-fuzz`
 - `linux-tsan` — Linux Docker, ThreadSanitizer (`-DZENOH_TSAN=ON`, mutually exclusive
   with `ZENOH_SANITIZE`) — the broker's concurrency-safety gate; runs
-  `tests/test_broker.cpp`'s multi-threaded stress cases instrumented with
-  `-fsanitize=thread` (see `docs/BROKER.md`).
+  `tests/test_broker{,_stress}.cpp`'s multi-threaded stress cases instrumented with
+  `-fsanitize=thread` (see `docs/BROKER.md`). `ctest -L test_broker_stress` narrows a
+  run to the stress file.
 
 Linux builds run via `scripts/docker-ci.sh [preset]` (builds the toolchain image,
 then configure+build+test — same path as CI). On a host with clang+libstdc++ already
@@ -80,12 +81,37 @@ cache: `cmake --preset <preset> --fresh`.
 
 ## Testing
 
-There is **one test binary** (`zenoh-tests`, `tests/*.cpp`) registered as a single
-ctest case (`ctest --preset <preset>` runs the whole suite — there's no ctest-level
-filtering to a single source file). The harness is a from-scratch minimal one
-(`tests/ztest.hpp`: `TEST("name") { CHECK(cond); }`), not doctest/GoogleTest — no
-CLI test-name filter exists in `run()`; narrow by commenting out `TEST` blocks or
-running the whole binary directly (`build/<preset>/tests/zenoh-tests`).
+There is **one test binary** (`zenoh-tests`, `tests/*.cpp`) built on a from-scratch
+minimal harness (`tests/ztest.hpp`: `TEST("name") { CHECK(cond); }`), not
+doctest/GoogleTest. Running it directly prints one `ok`/`FAIL` line per case with its
+elapsed time, grouped under the source file it came from, and the failed CHECKs
+indented beneath their case:
+
+```sh
+build/<preset>/tests/zenoh-tests                  # everything
+build/<preset>/tests/zenoh-tests --filter test_ke # cases whose id contains the text
+build/<preset>/tests/zenoh-tests --run '<id>'     # exactly one case
+build/<preset>/tests/zenoh-tests --list           # every id, one per line
+```
+
+A case id is `<suite>::<name>`, where the suite is the source file stem
+(`test_ke::is_canon accepts …`). Other flags: `-q/--quiet` (failures + summary only),
+`--color`/`--no-color`, `-h`.
+
+`tests/ZTestDiscover.cmake` runs `--list` as a build step and registers **one ctest
+case per `TEST`** (`tests/CMakeLists.txt`), each labeled with its suite — so
+`ctest --preset <preset>` reports the suite test-by-test, `-R '<regex>'` narrows to
+one case, `-L '^test_broker$'` to one source file (labels are regex-matched, so a bare
+`-L test_broker` also picks up `test_broker_stress`), and `-j` runs cases in parallel
+(184 cases on the `clang` preset: ~30 s serial, ~6-10 s at `-j8`, vs ~13 s for the
+whole binary in one process — process-per-test trades startup cost for granularity
+and parallelism). Set `-DZENOH_CTEST_PER_TEST=OFF` to go back to a single ctest case
+that runs the binary once.
+
+The generated case list lives at `build/<preset>/tests/ztest_cases.cmake` and is a
+pure build output: ctest reaches it through the configure-time shim
+`ztest_include.cmake`, which falls back to a failing `zenoh-tests-not-discovered`
+case when the suite is run before it has ever been built.
 
 Test files are organized by layer, not 1:1 with modules: `test_varint.cpp`,
 `test_codec.cpp`, `test_ext.cpp`, `test_ke.cpp` (key-expression matching),
@@ -95,7 +121,10 @@ Test files are organized by layer, not 1:1 with modules: `test_varint.cpp`,
 `test_strand.cpp`/`test_subscriber.cpp`/`test_query_api.cpp` (client runtime, against
 a real `socketpair`/loopback), `test_broker.cpp` (the broker — a real `Broker` on
 loopback port 0, driven by real `Session` clients; see `docs/BROKER.md`'s "Testing"),
-`test_coverage.cpp`/`test_umbrella.cpp` (fill gaps for the coverage gate).
+`test_broker_stress.cpp` (broker scale/stress — `Tables`/`ResourceTable` at
+thousands of declarations, sustained no-loss throughput, congestion drop/recover,
+connect/disconnect churn), `test_coverage.cpp`/`test_umbrella.cpp` (fill gaps for the
+coverage gate).
 
 **Differential testing**: `tools/vector-gen` (a small Rust program that path-deps the
 `zenoh-rust` reference `zenoh-proto` crate) emits golden byte vectors into the
