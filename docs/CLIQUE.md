@@ -326,13 +326,8 @@ $B/zenohb -l tcp/127.0.0.1:7449 --peer tcp/127.0.0.1:7447 --threads 2 &
 # each other. `stdbuf -o0` only matters because z_sub's stdout is a pipe here and
 # would otherwise stay buffered until you kill it.
 stdbuf -o0 $B/examples/z_sub -e tcp/127.0.0.1:7449 -k 'demo/example/**' &
-$B/examples/z_put tcp/127.0.0.1:7448 demo/example/k hello   # NOTE: positional args
+$B/examples/z_put -e tcp/127.0.0.1:7448 -k demo/example/k -p hello
 ```
-
-Careful with the CLI difference: this repo's `z_put` takes **positional**
-`<endpoint> <key> <value>`, while `z_pub`/`z_sub` (and every `zenoh-rust` example)
-take `-e`/`-k`/`-p`. Passing `-k`/`-p` to `z_put` silently publishes on the key `-k`
-and looks exactly like a routing failure.
 
 To see the split-horizon invariant do its job, put a subscriber behind *both* peers of
 the publisher's broker (`:7447` and `:7449` above) and publish twice — each subscriber

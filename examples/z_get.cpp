@@ -2,11 +2,11 @@
 // query completes. The C++23 equivalent of zenoh-rust's z_get.rs (the blocking
 // reply-pull loop).
 //
-// Usage: z_get [options]
-//   -e, --connect E   router endpoint (default tcp/127.0.0.1:7447)
-//   -s, --selector S  selector to query (default demo/example/**), "<key>?<params>"
-//   -t, --target T    BEST_MATCHING | ALL | ALL_COMPLETE (default BEST_MATCHING)
-//   -o, --timeout MS  query timeout in milliseconds (default 10000)
+// Usage: z_get [OPTIONS]        (run with --help for the full option list)
+//   -s, --selector <SELECTOR>  selector to query, "<key>?<params>"
+//                              [default: demo/example/**]
+//   -t, --target <TARGET>      BEST_MATCHING | ALL | ALL_COMPLETE
+//   -o, --timeout <TIMEOUT>    query timeout in milliseconds [default: 10000]
 //
 // The reference splits a Selector into key expression + parameters; the runtime's
 // `get` takes the two separately, so the selector is split at the first '?' here.
@@ -32,6 +32,23 @@ import zenoh;
 
 namespace {
 
+auto usage(const char* argv0) -> void {
+    std::printf("Usage: %s [OPTIONS]\n\n"
+                "Options:\n"
+                "  -s, --selector <SELECTOR>\n"
+                "          The selection of resources to query [default: demo/example/**]\n"
+                "  -p, --payload <PAYLOAD>\n"
+                "          Payload to put in the query (no effect: `get` sends a key\n"
+                "          expression and parameters only)\n"
+                "  -t, --target <TARGET>\n"
+                "          The target queryables of the query [default: BEST_MATCHING]\n"
+                "          [possible values: BEST_MATCHING, ALL, ALL_COMPLETE]\n"
+                "  -o, --timeout <TIMEOUT>\n"
+                "          The query timeout in milliseconds [default: 10000]\n",
+                argv0);
+    zexample::print_common_help();
+}
+
 auto parse_target(std::string_view s, zenoh::GetTarget& out) -> bool {
     if (s == "BEST_MATCHING") {
         out = zenoh::GetTarget::best_matching;
@@ -48,28 +65,49 @@ auto parse_target(std::string_view s, zenoh::GetTarget& out) -> bool {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    if (zexample::wants_help(argc, argv)) {
+        usage(argv[0]);
+        return 0;
+    }
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    std::string endpoint = "tcp/127.0.0.1:7447";
+    zexample::CommonArgs common;
     std::string selector = "demo/example/**";
     zenoh::GetOptions opts{};
     opts.timeout_ms = 10000;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
-        if ((arg == "-e" || arg == "--connect") && i + 1 < argc) {
-            endpoint = argv[++i];
-        } else if ((arg == "-s" || arg == "--selector") && i + 1 < argc) {
-            selector = argv[++i];
-        } else if ((arg == "-t" || arg == "--target") && i + 1 < argc) {
-            if (!parse_target(argv[++i], opts.target)) {
-                std::fprintf(stderr, "unknown target '%s'\n", argv[i]);
+        if (arg == "-s" || arg == "--selector") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            selector = value;
+        } else if (arg == "-p" || arg == "--payload") {
+            if (zexample::option_value(argc, argv, i) == nullptr) return 1;
+            zexample::no_effect(arg, "a query carries a key expression and parameters only");
+        } else if (arg == "-t" || arg == "--target") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            if (!parse_target(value, opts.target)) {
+                std::fprintf(stderr, "error: unknown target '%s'\n", value);
                 return 1;
             }
-        } else if ((arg == "-o" || arg == "--timeout") && i + 1 < argc) {
-            opts.timeout_ms = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "-o" || arg == "--timeout") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            opts.timeout_ms = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+        } else {
+            switch (zexample::parse_common(argc, argv, i, common)) {
+            case zexample::Arg::consumed:
+                break;
+            case zexample::Arg::fatal:
+                return 1;
+            case zexample::Arg::unrecognized:
+                return zexample::unknown_option(argv[0], arg);
+            }
         }
     }
+    const std::string& endpoint = common.endpoint;
 
     // Split "<key expr>?<parameters>" the way the reference's Selector does.
     std::string key = selector;

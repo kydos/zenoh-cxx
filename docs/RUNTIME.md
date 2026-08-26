@@ -196,9 +196,24 @@ permanently** (a byte stream can't resync): every later `recv`/`run` returns
 
 ## Example & manual interop test
 
+Every example takes the same options as its `zenoh-rust` counterpart, so a command
+line written for one runs against the other: `-h`/`--help` prints the full list, and
+the reference's shared `CommonArgs` (`-e/--connect`, `-m/--mode`, `-c/--config`,
+`--cfg`, `-l/--listen`, `--no-multicast-scouting`, `--enable-shm`) is recognized by
+all of them (`examples/zexample.hpp`'s `parse_common`). Only `-e/--connect` maps onto
+a capability this runtime has: `-m/--mode` accepts `client` and rejects `peer`/
+`router` (this is a client-only implementation), and the rest parse and then print a
+`note: ... has no effect` line on stderr rather than failing. Per-example options with
+no runtime equivalent behave the same way — `z_pub -a/--attach`,
+`z_pub --add-matching-listener`, `z_get -p/--payload`, `z_pub_thr --express`,
+`z_pub_thr -p/--priority`, `z_ping/z_pong --no-express`,
+`z_querier --add-matching-listener`. An option that is not a reference option at all
+is rejected with `error: unknown option`.
+
+
 `examples/z_sub.cpp` (`z_sub`) — the C++ equivalent of zenoh-rust's `z_sub`: declares a
 subscriber and prints every received sample in a blocking `recv` loop.
-`z_sub [-e endpoint] [-k key]` (default key `demo/example/**`). Verified against the
+`z_sub [OPTIONS]` with `-k/--key` (default `demo/example/**`). Verified against the
 reference router + publishers:
 
 ```sh
@@ -210,28 +225,30 @@ z_delete -e tcp/127.0.0.1:7447 -k demo/example/test         # delivered as DELET
 ```
 
 `examples/z_put.cpp` (`z_put`):
-`z_put [endpoint] [key] [value] [-e endpoint] [--try] [--batch] [--count N]` (the
-endpoint may be positional or given with `-e`/`--connect`). With `--batch` the
-puts are coalesced into API-level batches (one Frame per batch).
+`z_put [OPTIONS] [endpoint] [key] [value]`. `-k/--key` and `-p/--payload` mirror the
+reference; the three positional arguments and `--try`/`--batch`/`--count` are
+extensions of this port. With `--batch` the puts are coalesced into API-level batches
+(one Frame per batch).
 
 `examples/z_pub.cpp` (`z_pub`) — the C++ equivalent of zenoh-rust's `z_pub`:
 publishes `"[<idx>] <payload>"` to a key once a second, forever.
-`z_pub [-e endpoint] [-k key] [-p payload]`. The reference also sets a TEXT_PLAIN
-encoding and an optional attachment and supports a matching listener; `put` carries
-no such metadata or subscription matching yet, so those knobs are omitted.
+`z_pub [OPTIONS]` with `-k/--key` and `-p/--payload`. The reference also sets a
+TEXT_PLAIN encoding; `put` carries no such metadata, and its `-a/--attach` and
+`--add-matching-listener` parse but have no effect.
 
 `examples/z_put_float.cpp` (`z_put_float`) — the C++ equivalent of zenoh-rust's
 `z_put_float`: publishes a single `double`. The payload is the 8 little-endian bytes
 of the value (`f64::to_le_bytes()`), the exact layout zenoh-ext's `z_serialize`
 produces, so a reference subscriber can `z_deserialize::<f64>` it.
-`z_put_float [-e endpoint] [-k key] [-p value]`.
+`z_put_float [OPTIONS]` with `-k/--key` and `-p/--payload`.
 
 `examples/z_pub_thr.cpp` (`z_pub_thr`) — the C++ equivalent of zenoh-rust's
 `z_pub_thr`: publishes a fixed-size payload to `test/thr` in a tight loop and, with
 `-t`, prints `msg/s` every `-n N` messages.
-`z_pub_thr [-e endpoint] [-t] [-n N] [--batch B] <payload_size>`. Blocking `put`
-matches the reference's `CongestionControl::Block`; `--batch B` coalesces B puts per
-flush (markedly higher throughput). Measure with the reference `z_sub_thr`:
+`z_pub_thr [OPTIONS] <PAYLOAD_SIZE>` with `-t/--print` and `-n/--number`. Blocking
+`put` matches the reference's `CongestionControl::Block`; its `--express` and
+`-p/--priority` parse but have no effect. `--batch B`, which coalesces B puts per
+flush (markedly higher throughput), is an extension with no reference counterpart. Measure with the reference `z_sub_thr`:
 
 ```sh
 zenohd -l tcp/127.0.0.1:7447 &
@@ -243,7 +260,7 @@ z_sub_thr -m client -e tcp/127.0.0.1:7447 &        # from ../zenoh-rust
 `examples/z_sub_thr.cpp` (`z_sub_thr`) — the C++ equivalent of zenoh-rust's
 `z_sub_thr`: a callback subscriber on `test/thr` that counts messages in rounds of
 `-n N`, prints `msg/s` per round, and exits after `-s M` rounds (printing a final
-summary). `z_sub_thr [-e endpoint] [-s M] [-n N]`. Driven by `Session::run()` (the
+summary). `z_sub_thr [OPTIONS]` with `-s/--samples` and `-n/--number`. Driven by `Session::run()` (the
 receive pump). Pair it with either publisher:
 
 ```sh
@@ -256,7 +273,7 @@ zenohd -l tcp/127.0.0.1:7447 &
 
 `examples/z_get.cpp` (`z_get`) — the C++ equivalent of zenoh-rust's `z_get`: sends one
 query and prints every reply until the query completes.
-`z_get [-e endpoint] [-s selector] [-t BEST_MATCHING|ALL|ALL_COMPLETE] [-o timeout_ms]`.
+`z_get [OPTIONS]` with `-s/--selector`, `-t/--target` and `-o/--timeout`.
 The selector is split at the first `?` into the key expression and the parameters
 `get` takes separately. The reference's `-p/--payload` is not modeled: `get` sends a
 key expression and parameters only (a queryable can *read* a query payload via
@@ -264,7 +281,7 @@ key expression and parameters only (a queryable can *read* a query payload via
 
 `examples/z_queryable.cpp` (`z_queryable`) — the C++ equivalent of zenoh-rust's
 `z_queryable`: declares a queryable and answers every query with a fixed payload in a
-blocking `recv` loop. `z_queryable [-e endpoint] [-k key] [-p payload] [--complete]`.
+blocking `recv` loop. `z_queryable [OPTIONS]` with `-k/--key`, `-p/--payload` and `--complete`.
 Each `IncomingQuery` sends its `ResponseFinal` when it goes out of scope.
 
 `examples/z_querier.cpp` (`z_querier`) — the C++ equivalent of zenoh-rust's
@@ -288,8 +305,8 @@ z_queryable -e tcp/127.0.0.1:7447 &                # reference queryable, C++ ge
 equivalents of zenoh-rust's `z_ping`/`z_pong`. `z_ping` publishes a `<payload_size>`
 payload on `test/ping` and blocks for the echo on `test/pong`, timing each round trip;
 `z_pong` subscribes to `test/ping` and republishes each payload on `test/pong`.
-`z_ping [-e endpoint] [-n samples] [-w warmup_secs] <payload_size>`,
-`z_pong [-e endpoint]`. Because `put` blocks until the payload is written, it already
+`z_ping [OPTIONS] <PAYLOAD_SIZE>` with `-n/--samples` and `-w/--warmup`;
+`z_pong [OPTIONS]`. Because `put` blocks until the payload is written, it already
 behaves like the reference's `CongestionControl::Block`; the reference's express-QoS
 `--no-express` flag has no runtime equivalent and is not modeled.
 

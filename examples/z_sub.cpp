@@ -1,9 +1,8 @@
 // z_sub: connect to a Zenoh router, declare a subscriber, and print every received
 // sample. The C++23 equivalent of zenoh-rust's z_sub.rs (the blocking recv loop).
 //
-// Usage: z_sub [options]
-//   -e, --connect E  router endpoint (default tcp/127.0.0.1:7447)
-//   -k, --key K      key expression to subscribe to (default demo/example/**)
+// Usage: z_sub [OPTIONS]        (run with --help for the full option list)
+//   -k, --key <KEY>  key expression to subscribe to [default: demo/example/**]
 //
 // Verify with the reference publisher:
 //   zenohd -l tcp/127.0.0.1:7447 &
@@ -17,30 +16,17 @@
 
 import zenoh;
 
+#include "zexample.hpp"
+
 namespace {
 
-auto error_name(zenoh::ZError e) -> const char* {
-    switch (e) {
-    case zenoh::ZError::would_block:
-        return "would_block";
-    case zenoh::ZError::connection_closed:
-        return "connection_closed";
-    case zenoh::ZError::io_error:
-        return "io_error";
-    case zenoh::ZError::protocol_error:
-        return "protocol_error";
-    case zenoh::ZError::encode_error:
-        return "encode_error";
-    case zenoh::ZError::bad_endpoint:
-        return "bad_endpoint";
-    case zenoh::ZError::already_subscribed:
-        return "already_subscribed";
-    case zenoh::ZError::already_queryable:
-        return "already_queryable";
-    case zenoh::ZError::query_timeout:
-        return "query_timeout";
-    }
-    return "unknown";
+auto usage(const char* argv0) -> void {
+    std::printf("Usage: %s [OPTIONS]\n\n"
+                "Options:\n"
+                "  -k, --key <KEY>\n"
+                "          The key expression to subscribe to [default: demo/example/**]\n",
+                argv0);
+    zexample::print_common_help();
 }
 
 auto kind_name(zenoh::SampleKind k) -> const char* {
@@ -50,25 +36,39 @@ auto kind_name(zenoh::SampleKind k) -> const char* {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    if (zexample::wants_help(argc, argv)) {
+        usage(argv[0]);
+        return 0;
+    }
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    std::string endpoint = "tcp/127.0.0.1:7447";
+    zexample::CommonArgs common;
     std::string key = "demo/example/**";
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
-        if ((arg == "-e" || arg == "--connect") && i + 1 < argc) {
-            endpoint = argv[++i];
-        } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
-            key = argv[++i];
+        if (arg == "-k" || arg == "--key") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            key = value;
+        } else {
+            switch (zexample::parse_common(argc, argv, i, common)) {
+            case zexample::Arg::consumed:
+                break;
+            case zexample::Arg::fatal:
+                return 1;
+            case zexample::Arg::unrecognized:
+                return zexample::unknown_option(argv[0], arg);
+            }
         }
     }
+    const std::string& endpoint = common.endpoint;
 
     std::printf("Opening session...\n");
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
         std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
-                     error_name(session.error()));
+                     zexample::error_name(session.error()));
         return 1;
     }
 
@@ -76,7 +76,7 @@ auto main(int argc, char** argv) -> int {
     auto sub = session->declare_subscriber(key);
     if (!sub) {
         std::fprintf(stderr, "declare_subscriber('%s') failed: %s\n", key.c_str(),
-                     error_name(sub.error()));
+                     zexample::error_name(sub.error()));
         return 1;
     }
 
@@ -85,7 +85,7 @@ auto main(int argc, char** argv) -> int {
         auto sample = sub->recv();
         if (!sample) {
             if (sample.error() == zenoh::ZError::connection_closed) break;
-            std::fprintf(stderr, "recv failed: %s\n", error_name(sample.error()));
+            std::fprintf(stderr, "recv failed: %s\n", zexample::error_name(sample.error()));
             return 1;
         }
         auto payload = sample->payload();

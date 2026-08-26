@@ -317,16 +317,30 @@ this codebase's no-exceptions convention.
 example binaries, built by default (`ZENOH_EXAMPLES=ON`) into
 `build/<preset>/examples/`: `z_put`/`z_pub`/`z_put_float`/`z_pub_thr`/`z_sub`/
 `z_sub_thr` (pub/sub), `z_get`/`z_queryable`/`z_querier` (query/reply), and
-`z_ping`/`z_pong` (round-trip latency). `examples/zexample.hpp` holds the helpers
-they share (the `ZError` name mapping, byte-span/string conversions) — include it
-*after* `import zenoh;`, since it names types that module exports. They're also the
+`z_ping`/`z_pong` (round-trip latency). `examples/zexample.hpp` holds what they
+share — the `ZError` name mapping, byte-span/string conversions, and the CLI plumbing
+(`wants_help`, `option_value`, `parse_common`, `print_common_help`); include it
+*after* `import zenoh;`, since it names types that module exports.
+
+**Every example's CLI matches its reference counterpart's**, so a command line written
+for one runs against the other: `-h`/`--help` everywhere, and the reference's shared
+`CommonArgs` (`-e/--connect`, `-m/--mode`, `-c/--config`, `--cfg`, `-l/--listen`,
+`--no-multicast-scouting`, `--enable-shm`) is recognized by all of them. Only
+`-e/--connect` maps onto a capability this runtime has; `-m/--mode` accepts `client`
+and rejects `peer`/`router`; the rest — and the per-example options listed below —
+parse and then print `note: ... has no effect` on stderr. Anything that is not a
+reference option is rejected with `error: unknown option`. Keep that contract when
+adding an example: mirror the reference's option names, short forms and defaults, and
+route unsupported ones through `zexample::no_effect` rather than dropping them. They're also the
 manual interop test path against a real `zenohd` router — see `docs/RUNTIME.md` for
 the exact invocation sequences (router + reference binaries + this repo's).
 
 Not modeled, for lack of a runtime API rather than by choice: `z_delete` (there is no
 `Session::del` — `SampleKind::del` exists on the receive path only), a query payload
-(`z_get -p`), `declare_querier`/matching listeners, and the express/priority QoS flags
-(congestion control *is* modeled — see `PutOptions`/`GetOptions::congestion`).
+(`z_get -p`, `z_querier -p`), `declare_querier`/matching listeners
+(`--add-matching-listener`), attachments (`z_pub -a`), and express/priority QoS
+(`--express`, `--no-express`, `z_pub_thr -p`). Congestion control *is* modeled —
+see `PutOptions`/`GetOptions::congestion`.
 
 `zenohb` (`broker/src/main.cpp`, always built) is the broker executable —
 `zenohb -l tcp/host:port [--peer tcp/host:port]... [--advertise tcp/host:port]

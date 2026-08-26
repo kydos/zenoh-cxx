@@ -1,15 +1,17 @@
 // z_pub_thr: publish to "test/thr" as fast as possible and (optionally) report the
 // achieved throughput. The C++23 equivalent of zenoh-rust's z_pub_thr.rs.
 //
-// Usage: z_pub_thr [options] <payload_size>
-//   <payload_size>   payload length in bytes (required, positional)
-//   -e, --connect E  router endpoint (default tcp/127.0.0.1:7447)
-//   -t, --print      print throughput statistics
-//   -n, --number N   messages per measurement window (default 100000)
-//       --batch B    coalesce B puts per flush via the batching API (default 1)
+// Usage: z_pub_thr [OPTIONS] <PAYLOAD_SIZE>   (run with --help for the full list)
+//   <PAYLOAD_SIZE>         payload length in bytes (required, positional)
+//   -t, --print            print throughput statistics
+//   -n, --number <NUMBER>  messages per measurement window [default: 100000]
+//       --batch <BATCH>    coalesce BATCH puts per flush via the batching API
+//                          (default 1) — an extension, not a reference option
 //
 // Our `put` blocks until the message is handed to the transport, matching the
-// reference's CongestionControl::Block. Priority/express knobs are not modeled yet.
+// reference's CongestionControl::Block. The reference's --express and -p/--priority
+// select QoS the runtime does not expose, so both are accepted and reported as having
+// no effect.
 //
 // Measure with the reference subscriber:
 //   zenohd -l tcp/127.0.0.1:7447 &
@@ -27,39 +29,44 @@
 
 import zenoh;
 
+#include "zexample.hpp"
+
 namespace {
 
-auto error_name(zenoh::ZError e) -> const char* {
-    switch (e) {
-    case zenoh::ZError::would_block:
-        return "would_block";
-    case zenoh::ZError::connection_closed:
-        return "connection_closed";
-    case zenoh::ZError::io_error:
-        return "io_error";
-    case zenoh::ZError::protocol_error:
-        return "protocol_error";
-    case zenoh::ZError::encode_error:
-        return "encode_error";
-    case zenoh::ZError::bad_endpoint:
-        return "bad_endpoint";
-    case zenoh::ZError::already_subscribed:
-        return "already_subscribed";
-    case zenoh::ZError::already_queryable:
-        return "already_queryable";
-    case zenoh::ZError::query_timeout:
-        return "query_timeout";
-    }
-    return "unknown";
+auto usage(const char* argv0) -> void {
+    std::printf("Usage: %s [OPTIONS] <PAYLOAD_SIZE>\n\n"
+                "Arguments:\n"
+                "  <PAYLOAD_SIZE>\n"
+                "          Size of the payload to publish, in bytes\n"
+                "\n"
+                "Options:\n"
+                "  -t, --print\n"
+                "          Print the statistics\n"
+                "  -n, --number <NUMBER>\n"
+                "          Number of messages in each throughput measurement"
+                " [default: 100000]\n"
+                "      --batch <BATCH>\n"
+                "          Coalesce BATCH puts per flush (an extension of this port,\n"
+                "          with no reference counterpart) [default: 1]\n"
+                "      --express\n"
+                "          (no effect: express QoS is not implemented)\n"
+                "  -p, --priority <PRIORITY>\n"
+                "          (no effect: priority QoS is not implemented)\n",
+                argv0);
+    zexample::print_common_help();
 }
 
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    if (zexample::wants_help(argc, argv)) {
+        usage(argv[0]);
+        return 0;
+    }
     // Line-buffer stdout so throughput lines flush promptly even when redirected.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    std::string endpoint = "tcp/127.0.0.1:7447";
+    zexample::CommonArgs common;
     bool print = false;
     std::size_t number = 100000;
     std::size_t batch_size = 1;
@@ -67,18 +74,35 @@ auto main(int argc, char** argv) -> int {
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
-        if ((arg == "-e" || arg == "--connect") && i + 1 < argc) {
-            endpoint = argv[++i];
-        } else if (arg == "-t" || arg == "--print") {
+        if (arg == "-t" || arg == "--print") {
             print = true;
-        } else if ((arg == "-n" || arg == "--number") && i + 1 < argc) {
-            number = std::strtoul(argv[++i], nullptr, 10);
-        } else if (arg == "--batch" && i + 1 < argc) {
-            batch_size = std::strtoul(argv[++i], nullptr, 10);
+        } else if (arg == "-n" || arg == "--number") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            number = std::strtoul(value, nullptr, 10);
+        } else if (arg == "--batch") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            batch_size = std::strtoul(value, nullptr, 10);
+        } else if (arg == "--express") {
+            zexample::no_effect(arg, "express QoS is not implemented");
+        } else if (arg == "-p" || arg == "--priority") {
+            if (zexample::option_value(argc, argv, i) == nullptr) return 1;
+            zexample::no_effect(arg, "priority QoS is not implemented");
         } else if (!arg.empty() && arg.front() != '-') {
             payload_size = std::atol(argv[i]);
+        } else {
+            switch (zexample::parse_common(argc, argv, i, common)) {
+            case zexample::Arg::consumed:
+                break;
+            case zexample::Arg::fatal:
+                return 1;
+            case zexample::Arg::unrecognized:
+                return zexample::unknown_option(argv[0], arg);
+            }
         }
     }
+    const std::string& endpoint = common.endpoint;
 
     if (payload_size < 0) {
         std::fprintf(stderr, "usage: %s [-e endpoint] [-t] [-n N] [--batch B] <payload_size>\n",
@@ -96,7 +120,7 @@ auto main(int argc, char** argv) -> int {
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
         std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
-                     error_name(session.error()));
+                     zexample::error_name(session.error()));
         return 1;
     }
 
@@ -124,7 +148,7 @@ auto main(int argc, char** argv) -> int {
     if (batch_size == 1) {
         for (;;) {
             if (auto r = session->put(key, payload); !r) {
-                std::fprintf(stderr, "put failed: %s\n", error_name(r.error()));
+                std::fprintf(stderr, "put failed: %s\n", zexample::error_name(r.error()));
                 return 1;
             }
             tick();
@@ -134,13 +158,13 @@ auto main(int argc, char** argv) -> int {
             auto batch = session->batch();
             for (std::size_t i = 0; i < batch_size; ++i) {
                 if (auto r = batch.put(key, payload); !r) {
-                    std::fprintf(stderr, "batch.put failed: %s\n", error_name(r.error()));
+                    std::fprintf(stderr, "batch.put failed: %s\n", zexample::error_name(r.error()));
                     return 1;
                 }
                 tick();
             }
             if (auto r = batch.flush(); !r) {
-                std::fprintf(stderr, "batch.flush failed: %s\n", error_name(r.error()));
+                std::fprintf(stderr, "batch.flush failed: %s\n", zexample::error_name(r.error()));
                 return 1;
             }
         }
