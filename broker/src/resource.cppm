@@ -3,6 +3,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -116,6 +117,26 @@ class ResourceTable {
     /// not reject one the way `on_push_batch` rejects a wildcarded publish key.
     [[nodiscard]] auto matching_queryables(std::string_view key) const
         -> const std::vector<FaceCtx>&;
+
+    /// The declaration state of every face registered on the exact resource keyed by
+    /// `canonical_key` (empty if no such resource exists). `Tables` uses this to
+    /// decide whether a *client-side* declaration on that key just appeared or just
+    /// vanished, which is what gates announcing it to the clique -- a decision that
+    /// needs the faces themselves (only `Tables` knows which are peer brokers), not
+    /// just a count.
+    ///
+    /// Borrowed from this object's storage: valid until the next mutating call. The
+    /// key must already be canonical -- callers canonicalize once at declare time.
+    [[nodiscard]] auto faces_on(std::string_view canonical_key) const -> std::span<const FaceCtx>;
+
+    /// Every declared (canonical) pattern. Used once per peer-broker link coming up,
+    /// to replay the local declaration state onto it; not a hot path.
+    [[nodiscard]] auto declared_keys() const -> std::vector<std::string>;
+
+    /// Every pattern on which `face_id` currently holds any declaration. Lets a
+    /// disconnect re-evaluate exactly the keys that face could have affected,
+    /// instead of rescanning the whole table.
+    [[nodiscard]] auto keys_for_face(FaceId face_id) const -> std::vector<std::string>;
 
     /// Number of distinct declared (canonical) patterns. Test-only introspection.
     [[nodiscard]] auto resource_count() const noexcept -> std::size_t { return by_key_.size(); }

@@ -11,9 +11,13 @@ blocking POSIX transport.
 A client (this project's `Session`, or a real `zenoh-rust` peer) talks to `zenohb`
 exactly as it would talk to `zenohd` (the reference router): connect, complete the
 InitSyn/InitAck/OpenSyn/OpenAck handshake, then exchange Declare/Push/Request/Response
-traffic. `zenohb` is a **hub** — every client face connects directly to it, there is
-no scouting, no peer-to-peer, and no multi-hop mesh/link-state routing between
-brokers.
+traffic. `zenohb` is a **hub** for its own clients — every client face connects directly to it,
+and there is no scouting or peer-to-peer at the client level. Brokers themselves can
+now be federated into a **clique** (every broker directly linked to every other), so
+a publisher and a subscriber attached to different brokers see each other; see
+`docs/CLIQUE.md`. Everything in this document describes one broker and still holds
+under federation — a peer-broker link is just another face, distinguished by
+`FaceKind`.
 
 ## Module map
 
@@ -21,6 +25,7 @@ brokers.
 | --- | --- | --- |
 | `zenoh.ke` | `src/ke/ke.cppm`/`.cpp` | Key-expression matching: `is_canon`, `canonize`, `intersects`, `includes`. Pure, no I/O — lives in `zenoh-proto`, not the broker library, since it's a codec-adjacent concern (matching `WireExpr` patterns), reused by both. `*`/`**` only (v1 scope); `$*`/`@` are an explicit gap. |
 | `zenoh.broker.resource` | `broker/src/resource.cppm`/`.cpp` | `ResourceTable`, `FaceCtx`, `FaceId`. Declared subscriber/queryable patterns and `matching_subscribers`/`matching_queryables` lookups (via `zenoh.ke::intersects`). Pure logic, no ASIO, no I/O. |
+| `zenoh.broker.membership` | `broker/src/membership.cppm`/`.cpp` | `MemberInfo`, `Membership` — clique membership, the gossip payload codec, endpoint validation, and the mutual-dial tie-break. Pure logic, no ASIO. See `docs/CLIQUE.md`. |
 | `zenoh.broker.tables` | `broker/src/tables.cppm`/`.cpp` | `Tables` — the broker's global routing state: face registry, `ResourceTable`, and query fan-out/fan-in bookkeeping, all serialized on one `asio::strand`. `FaceHandle`/`RoutedPush`/`RoutedRequest`/`RoutedResponse` are the owned, strand-crossing-safe shapes routing operates on. |
 | `zenoh.broker` | `broker/src/broker.cppm`/`.cpp` | `Broker` (bind/run/stop, the `io_context` + configurable thread pool) **and**, entirely inside `broker.cpp`'s anonymous namespace, the per-connection `Face` class and the accept loop — see "Why `Face` isn't its own module" below. |
 | `zenohb` | `broker/src/main.cpp` | CLI (`-l`/`--listen tcp/host:port`, `--threads N`) + `Broker::bind`/`run`. |
@@ -191,10 +196,12 @@ clang+libstdc++ toolchain already set up for named modules.)
   never hangs); a requester face vanishing just erases its entries (nothing left to
   forward to). `tests/test_broker.cpp` has a dedicated case proving this is genuinely
   the broker's own cleanup doing the work, not a client-side RAII coincidence.
-- **`QueryTarget` in a hub topology**: `best_matching` and `all` mean the same thing
-  here — "every directly-matching queryable" — since they only diverge with
-  multi-hop link-state routing, which a single-broker hub doesn't have.
-  `all_complete` filters to queryables that advertised `QueryableInfo.complete`.
+- **`QueryTarget`**: within a single broker, `best_matching` and `all` mean the same
+  thing — "every directly-matching queryable" — since every candidate is a local
+  client. They diverge once a clique gives a query somewhere else to go:
+  `best_matching` then prefers local queryables and crosses a peer link only if there
+  are none (`docs/CLIQUE.md`). `all_complete` filters to queryables that advertised
+  `QueryableInfo.complete`, locally and remotely alike.
 
 ## v1 simplifications (documented gaps, not accidents)
 
@@ -229,8 +236,10 @@ clang+libstdc++ toolchain already set up for named modules.)
   entirely client-side (`Getter::recv()`'s pump loop) — sufficient for correctness on
   its own; a slow queryable just means a slow reply, not a broker-side leak (the
   fan-in bookkeeping is bounded by `remove_face`, not by a timer).
-- **No scouting, no peer-to-peer, no multi-broker mesh.** `zenohb` is a single hub;
-  every face is a direct client connection.
+- **No client-level scouting or peer-to-peer.** Every *client* face is a direct
+  connection to one broker. Broker-to-broker federation exists (`docs/CLIQUE.md`) but
+  assumes a full mesh: there is no multi-hop routing and no link-state, so a dropped
+  peer link partitions that pair rather than rerouting.
 - **`$*` sub-chunk globbing and `@`-verbatim key-expression chunks** are out of scope
   for `zenoh.ke` (v1: `*`/`**` only) — matches what this project's own `WireExpr`
   usage and its interop targets actually produce.
@@ -417,11 +426,17 @@ the number of *messages* if it can be made to scale with the number of *frames* 
   (previously: 65536 queued frames, which bounded nothing in memory terms and let a
   slow consumer's queue get arbitrarily stale). `Tables` skips (drops) delivery to a
   congested face *before* ever calling `deliver()`, rather than queuing further or
-  closing the connection. **A reliable-marked Push can therefore still be dropped for
-  one specific slow consumer** — a deliberate v1 trade-off: that consumer stays
-  connected and catches up, instead of being disconnected (the original behavior, see
-  below) or stalling the producer and every other subscriber. No retransmission or
-  true flow-controlled blocking is implemented.
+  closing the connection — that consumer stays connected and catches up, instead of
+  being disconnected (the original behavior, see below) or stalling the producer and
+  every other subscriber.
+
+  **Whether a given message may be dropped this way is now the publisher's choice**,
+  carried per message as the standard Zenoh `CongestionControl` (QoS bit 3):
+  `Drop` (the default) behaves as above, `Block` is queued past the watermark and
+  never discarded, with read-throttling and a far-higher hard ceiling bounding it
+  instead. `FaceHandle::pressure` therefore has three levels rather than one bit, and
+  a clique link gets much larger watermarks than a client face. See
+  `docs/CLIQUE.md`'s "Congestion control is per message". Still no retransmission.
 - **`asio::recycling_allocator` on the per-batch `asio::post`s**, and reused (rather
   than regrown-from-empty) accumulation vectors on both sides of each hop.
 

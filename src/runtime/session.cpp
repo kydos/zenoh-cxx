@@ -300,11 +300,26 @@ auto Session::open(std::string_view endpoint) -> std::expected<Session, ZError> 
 
 auto Session::local_zid() const noexcept -> PeerId { return from_zenoh_id(local_zid_); }
 
+namespace {
+
+/// Bit 3 ("D") of the QoS byte is the standard Zenoh congestion-control flag: set
+/// means `Block` (this message must not be dropped), clear means `Drop`. Everything
+/// else in the byte -- priority in bits 2:0, express in bit 4 -- is left at its
+/// default, since this runtime implements neither.
+[[nodiscard]] auto to_qos(CongestionControl cc) noexcept -> QoS {
+    QoS qos{};
+    if (cc == CongestionControl::block) qos.inner |= 0x08;
+    return qos;
+}
+
+} // namespace
+
 auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> payload,
-                         std::optional<PeerId> target_zid) -> std::expected<void, ZError> {
+                         const PutOptions& opts) -> std::expected<void, ZError> {
     Push push{};
     push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
-    if (target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*target_zid)};
+    push.qos = to_qos(opts.congestion);
+    if (opts.target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
     Put put{};
     put.payload = payload;
     push.payload = PushBody{.body = std::move(put)};
@@ -327,11 +342,11 @@ auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> p
 }
 
 auto Session::encode_put_head(std::string_view key_expr, std::span<const std::byte> payload,
-                              std::optional<PeerId> target_zid)
-    -> std::expected<std::size_t, ZError> {
+                              const PutOptions& opts) -> std::expected<std::size_t, ZError> {
     Push push{};
     push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
-    if (target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*target_zid)};
+    push.qos = to_qos(opts.congestion);
+    if (opts.target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
     Put put{};
     put.payload = payload; // present only so the encoded length prefix is correct
     push.payload = PushBody{.body = std::move(put)};
@@ -372,8 +387,8 @@ auto Session::flush_pending() -> std::expected<void, ZError> {
     return std::unexpected(ZError::would_block); // still partially buffered
 }
 
-auto Session::put(std::string_view key_expr, std::span<const std::byte> payload,
-                  std::optional<PeerId> target_zid) -> std::expected<void, ZError> {
+auto Session::put(std::string_view key_expr, std::span<const std::byte> payload, PutOptions opts)
+    -> std::expected<void, ZError> {
     // Drain any bytes a prior try_put left buffered (blocking).
     if (pending_off_ < tx_pending_.size()) {
         if (auto r = link_.write_all(std::span(tx_pending_).subspan(pending_off_)); !r)
@@ -384,7 +399,7 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload,
 
     // Scatter-gather: encode just the header into tx_scratch_ and write it together
     // with the borrowed payload, so the payload is never copied into a staging buffer.
-    auto const head = encode_put_head(key_expr, payload, target_zid);
+    auto const head = encode_put_head(key_expr, payload, opts);
     if (!head) return std::unexpected(head.error());
 
     if (auto r = link_.writev_all(std::span(tx_scratch_).first(*head), payload); !r)
@@ -394,13 +409,13 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload,
 }
 
 auto Session::try_put(std::string_view key_expr, std::span<const std::byte> payload,
-                      std::optional<PeerId> target_zid) -> std::expected<void, ZError> {
+                      PutOptions opts) -> std::expected<void, ZError> {
     // Don't interleave a new frame ahead of buffered bytes: flush first.
     if (pending_off_ < tx_pending_.size()) {
         if (auto f = flush_pending(); !f) return std::unexpected(f.error());
     }
 
-    if (auto e = encode_put(key_expr, payload, target_zid); !e) return std::unexpected(e.error());
+    if (auto e = encode_put(key_expr, payload, opts); !e) return std::unexpected(e.error());
     std::size_t const framed =
         static_cast<std::size_t>(load_le<std::uint16_t>(tx_scratch_.data())) + 2;
     auto const batch = std::span(tx_scratch_).first(framed);
@@ -508,7 +523,7 @@ Batch::~Batch() {
         (void)session_->write_frame(std::span(buf_).first(body_len_));
 }
 
-auto Batch::put(std::string_view key_expr, std::span<const std::byte> payload)
+auto Batch::put(std::string_view key_expr, std::span<const std::byte> payload, PutOptions opts)
     -> std::expected<void, ZError> {
     if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
 
@@ -518,6 +533,8 @@ auto Batch::put(std::string_view key_expr, std::span<const std::byte> payload)
 
     Push push{};
     push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    push.qos = to_qos(opts.congestion);
+    if (opts.target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
     Put put{};
     put.payload = payload;
     push.payload = PushBody{.body = std::move(put)};
@@ -706,6 +723,7 @@ auto Session::write_request(std::uint32_t rid, std::string_view key_expr,
     req.id = rid;
     req.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
     req.target = to_query_target(opts.target);
+    req.qos = to_qos(opts.congestion);
     req.timeout = Duration::from_millis(effective_timeout_ms(opts));
     if (opts.target_zid) req.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
 
@@ -880,9 +898,9 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
                     return std::unexpected(*fault_);
                 }
                 std::vector<std::byte> payload;
-                if (req->payload.query.body)
-                    payload.assign(req->payload.query.body->payload.begin(),
-                                   req->payload.query.body->payload.end());
+                if (auto const& body = req->payload.query.body) {
+                    payload.assign(body->payload.begin(), body->payload.end());
+                }
                 PendingQuery pq{.rid = req->id,
                                 .key = *key,
                                 .params = std::string(req->payload.query.parameters),

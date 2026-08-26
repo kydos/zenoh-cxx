@@ -6,6 +6,7 @@ module;
 #include <asio/bind_executor.hpp>
 #include <asio/buffer.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/connect.hpp>
 #include <asio/detached.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
@@ -23,10 +24,12 @@ module;
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -72,6 +75,25 @@ constexpr std::uint64_t default_lease_ms = 10'000;
 // queue is allowed to get) regardless of payload size.
 constexpr std::size_t congested_high_watermark = 1U << 20; // 1 MiB queued
 constexpr std::size_t congested_low_watermark = 1U << 18;  // 256 KiB queued
+// A clique link is not one subscriber: it aggregates every client behind the broker
+// on the other end, so the budget tuned for a single slow consumer is far too tight
+// for it -- crossing it would start discarding traffic for a whole broker's worth of
+// subscribers over a transient blip.
+constexpr std::size_t router_congested_high_watermark = 16U << 20; // 16 MiB queued
+constexpr std::size_t router_congested_low_watermark = 4U << 20;   // 4 MiB queued
+// The hard ceilings, far above the watermarks. `CongestionControl::Block` traffic is
+// queued *past* the high watermark by design, and read-throttling the producers is
+// what normally keeps that bounded; these bounds are what happens when that fails --
+// a peer that has stopped draining entirely, e.g. a dead TCP connection the kernel
+// has not timed out yet. Reaching one closes the face, turning unbounded memory
+// growth into a detectable failure.
+//
+// Note the deliberate contrast with the close-on-overflow policy this broker used to
+// have (docs/BROKER.md's history section): that fired at 1024 queued *frames*, so
+// any transient production/drain mismatch became a disconnect. These sit two orders
+// of magnitude higher and are only reachable after backpressure has already failed.
+constexpr std::size_t hard_ceiling_bytes = 64U << 20;         // 64 MiB, client face
+constexpr std::size_t router_hard_ceiling_bytes = 256U << 20; // 256 MiB, clique link
 // Initial size of a Face's reusable receive buffer. Sized to hold many small
 // batches per `read_some` syscall (the point of buffering at all) without
 // committing 64 KiB per connection up front; `next_batch` grows it on demand for a
@@ -91,6 +113,28 @@ constexpr std::size_t max_decl_ids = 4096;       ///< cap on sub_ids_/qbl_ids_, 
 // asio::post's own lack of a queue bound, not a fix for a confirmed leak: a single
 // fast publisher was measured to never actually backlog the routing strand).
 constexpr std::size_t max_pending_routing_jobs = 4096;
+// Backoff bounds for re-dialling a configured peer broker. A peer that isn't up yet
+// is an ordinary startup condition in a clique (whichever broker starts first has
+// nobody to talk to), not an error, so the connector retries forever -- but it backs
+// off to `max` so a permanently-absent peer costs one connect attempt every 30s
+// rather than a spin. The `min` delay also applies after a *successful* link drops,
+// which keeps a peer that accepts and immediately closes from becoming a tight loop.
+constexpr std::uint32_t peer_reconnect_min_ms = 250;
+constexpr std::uint32_t peer_reconnect_max_ms = 30'000;
+// How often a connector parked by a duplicate-link collapse re-checks whether the
+// link that displaced it is still up. Cheap (one timer per suppressed peer) and only
+// ever reached once a working link to that peer exists.
+constexpr std::uint32_t peer_suppressed_poll_ms = 500;
+// How often the broker re-checks whether every known peer is reachable. Only a
+// changed answer is reported, so this is a polling interval, not a log rate.
+constexpr std::uint32_t partition_report_interval_ms = 5'000;
+
+// Which side of the transport handshake a Face performs. The listener side waits for
+// an InitSyn and answers InitAck/OpenAck (every client connection, and an inbound
+// peer-broker link); the dialer side drives InitSyn/OpenSyn itself, mirroring the
+// client `Session::open` sequence in src/runtime/session.cpp -- the broker only ever
+// dials another broker, never a client.
+enum class FaceRole : std::uint8_t { listener, dialer };
 
 [[nodiscard]] auto next_face_id() noexcept -> FaceId {
     static std::atomic<FaceId> next{1};
@@ -105,8 +149,13 @@ constexpr std::size_t max_pending_routing_jobs = 4096;
 class Face : public std::enable_shared_from_this<Face> {
   public:
     Face(asio::ip::tcp::socket sock, asio::strand<asio::any_io_executor> strand, FaceId id,
-         Tables* tables)
-        : sock_(std::move(sock)), strand_(std::move(strand)), id_(id), tables_(tables) {}
+         Tables* tables, FaceRole role, std::shared_ptr<std::atomic<bool>> dial_suppress = nullptr)
+        : sock_(std::move(sock)), strand_(std::move(strand)), id_(id), tables_(tables), role_(role),
+          dial_suppress_(std::move(dial_suppress)) {
+        // A dialled link is a peer broker by construction; an accepted one is a
+        // client until its InitSyn says otherwise (see handshake_listener).
+        if (role_ == FaceRole::dialer) kind_ = FaceKind::router;
+    }
 
     [[nodiscard]] auto run() -> asio::awaitable<void> {
         if (!co_await handshake()) co_return;
@@ -118,8 +167,25 @@ class Face : public std::enable_shared_from_this<Face> {
             tables.add_face(std::move(handle));
         });
 
+        // A clique link is the one connection whose silent death actually matters:
+        // it carries every client behind the peer, and the partition detection below
+        // depends on noticing it. Client faces keep the previous behaviour (liveness
+        // purely by TCP error/EOF), so nothing about them changes.
+        if (kind_ == FaceKind::router) {
+            asio::co_spawn(
+                strand_,
+                [self = shared_from_this()]() -> asio::awaitable<void> {
+                    co_await self->keepalive_loop();
+                },
+                asio::detached);
+        }
+
         co_await read_loop();
 
+        // Drop out of the congested-links count before disappearing: leaving it
+        // incremented would read-throttle every client face for the rest of the
+        // broker's life.
+        set_pressure(FacePressure::ok);
         post_to_tables([id = id_](Tables& tables) { tables.remove_face(id); });
     }
 
@@ -133,7 +199,7 @@ class Face : public std::enable_shared_from_this<Face> {
         auto const bytes = block.bytes();
         for (auto const& slice : slices) {
             if (slice.offset + slice.length <= bytes.size()) {
-                append_msg(bytes.subspan(slice.offset, slice.length));
+                append_msg(bytes.subspan(slice.offset, slice.length), slice.block);
             }
         }
         pump_tx();
@@ -143,6 +209,34 @@ class Face : public std::enable_shared_from_this<Face> {
     /// Bytes queued for this face but not yet written to the socket.
     [[nodiscard]] auto queued_bytes() const noexcept -> std::size_t {
         return tx_len_ + tx_inflight_len_;
+    }
+
+    [[nodiscard]] auto high_watermark() const noexcept -> std::size_t {
+        return kind_ == FaceKind::router ? router_congested_high_watermark
+                                         : congested_high_watermark;
+    }
+    [[nodiscard]] auto low_watermark() const noexcept -> std::size_t {
+        return kind_ == FaceKind::router ? router_congested_low_watermark : congested_low_watermark;
+    }
+    [[nodiscard]] auto hard_ceiling() const noexcept -> std::size_t {
+        return kind_ == FaceKind::router ? router_hard_ceiling_bytes : hard_ceiling_bytes;
+    }
+
+    /// Publish this face's backpressure level, keeping `Tables`'s count of congested
+    /// clique links in step with it. Only ever called from this face's own strand,
+    /// so the exchange has a single writer; the atomic is for the readers (the
+    /// routing strand, and every client face's read loop).
+    auto set_pressure(FacePressure p) -> void {
+        assert(strand_.running_in_this_thread());
+        auto const previous = pressure_->exchange(p, std::memory_order_relaxed);
+        if (previous == p || kind_ != FaceKind::router) return;
+        bool const was_behind = previous != FacePressure::ok;
+        bool const now_behind = p != FacePressure::ok;
+        if (!was_behind && now_behind) {
+            tables_->congested_router_faces().fetch_add(1, std::memory_order_relaxed);
+        } else if (was_behind && !now_behind) {
+            tables_->congested_router_faces().fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 
     /// Make room for `need` bytes in the accumulation buffer, doubling so growth is
@@ -168,15 +262,25 @@ class Face : public std::enable_shared_from_this<Face> {
     /// decode loop) and the syscall count (`pump_tx` hands the accumulated bytes to
     /// exactly one `write`, however many messages that is -- a scatter-gather write
     /// over per-message buffers instead caps out at ASIO's 64-iovec limit).
-    auto append_msg(std::span<const std::byte> body) -> void {
-        if (queued_bytes() >= congested_high_watermark) {
-            // Slow consumer: drop rather than close (see congested_high_watermark's
-            // comment). Tables should already have stopped routing new messages to
-            // this face by the time congested_ is visible on its strand; this is
-            // the defensive backstop for whatever was already in flight through
-            // that small window, so the queue can't grow past this bound.
-            congested_->store(true, std::memory_order_relaxed);
+    auto append_msg(std::span<const std::byte> body, bool block) -> void {
+        std::size_t const queued = queued_bytes();
+        if (queued >= hard_ceiling()) {
+            // Backpressure has already failed to help: this peer is not draining at
+            // all. Stop accumulating and close, rather than let one stuck link
+            // consume memory without bound (see hard_ceiling_bytes).
+            set_pressure(FacePressure::saturated);
+            close_now();
             return;
+        }
+        if (queued >= high_watermark()) {
+            // Past the watermark, droppable traffic is discarded for this face --
+            // it stays connected and catches up, and neither the producer nor any
+            // faster consumer is stalled. Traffic marked Block is queued anyway;
+            // what bounds *that* is the read-throttling this pressure level turns
+            // on for the faces feeding this one (see Tables::congested_router_faces)
+            // and, failing that, the hard ceiling above.
+            set_pressure(FacePressure::congested);
+            if (!block) return;
         }
         // Budget for one batch's content, i.e. everything after its 2-byte length
         // prefix -- the peer's advertised batch size covers the prefix too (the same
@@ -191,6 +295,7 @@ class Face : public std::enable_shared_from_this<Face> {
                 tx_len_ += body.size();
                 store_le<std::uint16_t>(tx_accum_.data() + open_batch_,
                                         static_cast<std::uint16_t>(content + body.size()));
+                if (queued_bytes() >= high_watermark()) set_pressure(FacePressure::congested);
                 return;
             }
             open_batch_ = no_open_batch; // full: this message starts a fresh batch
@@ -213,9 +318,7 @@ class Face : public std::enable_shared_from_this<Face> {
         open_batch_ = tx_len_;
         tx_len_ += 2 + hdr_len + body.size();
         frame_sn_ = (frame_sn_ + 1) & 0x0fff'ffff;
-        if (queued_bytes() >= congested_high_watermark) {
-            congested_->store(true, std::memory_order_relaxed);
-        }
+        if (queued_bytes() >= high_watermark()) set_pressure(FacePressure::congested);
     }
 
     // Posts `fn` (any callable taking `Tables&`) onto `tables_->strand()`, tracking
@@ -243,6 +346,15 @@ class Face : public std::enable_shared_from_this<Face> {
         return FaceHandle{
             .id = id_,
             .zid = zid_,
+            .kind = kind_,
+            .dialed = role_ == FaceRole::dialer,
+            .close =
+                [self = shared_from_this()] {
+                    // Always via this face's own strand: `Tables` calls this from the
+                    // routing strand, and the socket is Tier-1 state.
+                    asio::post(self->strand_, [self] { self->close_now(); });
+                },
+            .dial_suppress = dial_suppress_,
             .deliver =
                 [self = shared_from_this()](SharedBuf block, std::vector<MsgSlice> slices) {
                     asio::post(self->strand_,
@@ -252,12 +364,63 @@ class Face : public std::enable_shared_from_this<Face> {
                                                         self->enqueue_and_pump(block, slices);
                                                     }));
                 },
-            .congested = congested_};
+            .pressure = pressure_};
     }
 
-    // --- handshake (listener side; mirror of Session::open's client side) ---
+    // --- handshake ---
 
     [[nodiscard]] auto handshake() -> asio::awaitable<bool> {
+        if (role_ == FaceRole::dialer) co_return co_await handshake_dialer();
+        co_return co_await handshake_listener();
+    }
+
+    // Dialer side: the mirror of `Session::open`'s client handshake
+    // (src/runtime/session.cpp), differing only in announcing `WhatAmI::router`, so
+    // the broker on the other end classifies this face as a peer rather than a
+    // client. Used exclusively for clique links.
+    [[nodiscard]] auto handshake_dialer() -> asio::awaitable<bool> {
+        assert(strand_.running_in_this_thread());
+        sock_.set_option(asio::ip::tcp::no_delay(true));
+
+        InitSyn isyn{};
+        isyn.version = 9;
+        isyn.identifier.whatami = WhatAmI::router;
+        isyn.identifier.zid = tables_->router_zid();
+        isyn.resolution.resolution = 0x0a;
+        isyn.resolution.batch_size = 0xffff;
+        if (!co_await send_now(encode_one(isyn))) co_return false;
+
+        auto ack_bytes = co_await next_batch();
+        if (!ack_bytes) co_return false;
+        ByteReader ack_r{*ack_bytes};
+        auto ack = InitAck::decode(ack_r);
+        if (!ack || ack->version != 9) co_return false;
+        // Refuse to treat a non-router answer as a clique link: dialling something
+        // that turns out to be a client (or a foreign peer) and then routing to it
+        // under split-horizon rules would silently mis-route. Better to drop the
+        // link and let the connector retry.
+        if (ack->identifier.whatami != WhatAmI::router) co_return false;
+        zid_ = ack->identifier.zid;
+        peer_batch_size_ = ack->resolution.batch_size;
+
+        // `ack->cookie` borrows `rx_buf_` (see next_batch's contract). `encode_one`
+        // copies it into the outbound buffer here, before any further read can
+        // invalidate that borrow -- the same ordering `Session::open` relies on.
+        OpenSyn osyn{};
+        osyn.lease = Duration::from_millis(default_lease_ms);
+        osyn.sn = 0;
+        osyn.cookie = ack->cookie;
+        if (!co_await send_now(encode_one(osyn))) co_return false;
+
+        auto oack_bytes = co_await next_batch();
+        if (!oack_bytes) co_return false;
+        ByteReader oack_r{*oack_bytes};
+        if (!OpenAck::decode(oack_r)) co_return false;
+        co_return true;
+    }
+
+    // Listener side (mirror of Session::open's client side).
+    [[nodiscard]] auto handshake_listener() -> asio::awaitable<bool> {
         assert(strand_.running_in_this_thread());
         sock_.set_option(asio::ip::tcp::no_delay(true));
 
@@ -268,6 +431,12 @@ class Face : public std::enable_shared_from_this<Face> {
         if (!isyn || isyn->version != 9) co_return false;
         zid_ = isyn->identifier.zid;
         peer_batch_size_ = isyn->resolution.batch_size;
+        // Only an explicit `router` makes this a clique link. `peer` is deliberately
+        // treated as a client: a real zenoh-rust peer-mode session expects
+        // scouting/link-state machinery this broker does not implement (see
+        // docs/BROKER.md's interop note), so it must never be handed router-face
+        // semantics.
+        kind_ = isyn->identifier.whatami == WhatAmI::router ? FaceKind::router : FaceKind::client;
 
         std::random_device rd;
         std::array<std::byte, 8> cookie{};
@@ -296,6 +465,54 @@ class Face : public std::enable_shared_from_this<Face> {
         co_return true;
     }
 
+    // Sends a KeepAlive on an otherwise idle clique link, and drops the link if the
+    // peer has gone quiet for a whole lease. Without this, a peer whose host
+    // disappears (as opposed to closing cleanly) is only noticed whenever TCP
+    // eventually gives up -- minutes, typically -- during which this broker keeps
+    // routing into a black hole and reports no partition at all.
+    //
+    // Runs concurrently with the read loop on the same strand, so it never races the
+    // socket or tx state it touches.
+    [[nodiscard]] auto keepalive_loop() -> asio::awaitable<void> {
+        auto token = asio::as_tuple(asio::use_awaitable);
+        auto const period = std::chrono::milliseconds(default_lease_ms / 4);
+        auto const lease = std::chrono::milliseconds(default_lease_ms);
+        for (;;) {
+            asio::steady_timer timer{strand_, period};
+            co_await timer.async_wait(token);
+            if (!sock_.is_open()) co_return;
+
+            auto const now = std::chrono::steady_clock::now();
+            if (now - last_rx_ > lease) {
+                close_now(); // lease expired: the read loop unwinds and cleans up
+                co_return;
+            }
+            // Only when this side is otherwise idle -- ordinary traffic is proof of
+            // liveness on its own, and a busy link should not pay for extra frames.
+            if (now - last_tx_ >= period) {
+                append_keepalive();
+                pump_tx();
+            }
+        }
+    }
+
+    /// Append a bare `KeepAlive` as its own batch. Unlike a network message it is a
+    /// *transport* message, so it carries no `FrameHeader` and cannot share a frame
+    /// with anything else -- which is why it closes whatever batch was open.
+    auto append_keepalive() -> void {
+        assert(strand_.running_in_this_thread());
+        std::array<std::byte, 8> tmp{};
+        ByteWriter w{tmp};
+        if (!KeepAlive{}.encode(w)) return;
+        std::size_t const n = w.written();
+        ensure_tx_capacity(tx_len_ + 2 + n);
+        std::byte* const at = tx_accum_.data() + tx_len_;
+        store_le<std::uint16_t>(at, static_cast<std::uint16_t>(n));
+        __builtin_memcpy(at + 2, tmp.data(), n);
+        tx_len_ += 2 + n;
+        open_batch_ = no_open_batch;
+    }
+
     // --- read loop ---
 
     [[nodiscard]] auto read_loop() -> asio::awaitable<void> {
@@ -322,7 +539,9 @@ class Face : public std::enable_shared_from_this<Face> {
     // an unbounded queue growing, if that scenario is ever actually hit.
     [[nodiscard]] auto throttle_if_backlogged() -> asio::awaitable<void> {
         while (tables_->pending_routing_jobs().load(std::memory_order_relaxed) >
-               max_pending_routing_jobs) {
+                   max_pending_routing_jobs ||
+               (kind_ == FaceKind::client &&
+                tables_->congested_router_faces().load(std::memory_order_relaxed) != 0)) {
             asio::steady_timer timer{co_await asio::this_coro::executor,
                                      std::chrono::milliseconds(1)};
             co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
@@ -359,6 +578,7 @@ class Face : public std::enable_shared_from_this<Face> {
             auto [ec, n] = co_await sock_.async_read_some(
                 asio::buffer(rx_buf_.data() + rx_end_, rx_buf_.size() - rx_end_), token);
             if (ec || n == 0) co_return std::nullopt;
+            last_rx_ = std::chrono::steady_clock::now();
             rx_end_ += n;
         }
     }
@@ -493,6 +713,23 @@ class Face : public std::enable_shared_from_this<Face> {
         return out;
     }
 
+    /// Handle a Push on a reserved (`@/`) key arriving from a peer broker. Only
+    /// gossip exists today; an unrecognized internal key is ignored rather than
+    /// faulting the link, so a newer peer can add one without breaking this one.
+    auto on_internal_push(const Push& push) -> void {
+        assert(strand_.running_in_this_thread());
+        if (key_scratch_ != gossip_key) return;
+        auto const* put = std::get_if<Put>(&push.payload.body);
+        if (put == nullptr) return;
+        // The decoded payload borrows the receive buffer, which the very next read
+        // reuses -- so it must be copied before it crosses to the routing strand
+        // (the same rule every other cross-tier message here obeys).
+        std::vector<std::byte> payload(put->payload.begin(), put->payload.end());
+        post_to_tables([id = id_, payload = std::move(payload)](Tables& tables) {
+            tables.on_gossip(id, payload);
+        });
+    }
+
     /// Decodes one Push into this frame's shared outbound block and records it in
     /// `push_batch_` (see `dispatch_frame_body`) -- does not post to Tables itself.
     ///
@@ -514,6 +751,17 @@ class Face : public std::enable_shared_from_this<Face> {
         auto push = Push::decode(r);
         if (!push) return false;
         if (!resolve_key_into(push->wire_expr, key_scratch_)) return false;
+
+        // Broker-internal control traffic (clique gossip) travels as an ordinary
+        // Push on a reserved key so it can reuse this face's framing and batching.
+        // It is consumed here and never reaches `Tables`, which is what guarantees a
+        // client can neither observe it by subscribing under the prefix nor inject it
+        // by publishing there -- a Push on such a key from a *client* is simply
+        // dropped.
+        if (is_internal_key(key_scratch_)) {
+            if (kind_ == FaceKind::router) on_internal_push(*push);
+            return true;
+        }
 
         // Keep one frame's worth of composed Pushes bounded: a peer can pack a great
         // many small Pushes into one frame, and each may expand (a short resmap-
@@ -537,8 +785,11 @@ class Face : public std::enable_shared_from_this<Face> {
 
         RoutedPush msg{};
         msg.slice = *slice;
+        // Lifted out here, once, so neither the routing strand nor the transmit path
+        // has to re-decode the message to learn whether it may be dropped.
+        msg.slice.block = (push->qos.inner & 0x08) != 0;
         msg.key.assign(key_scratch_);
-        if (push->dest) msg.dest = push->dest->zid;
+        if (auto const& dest = push->dest) msg.dest = dest->zid;
         push_batch_.push_back(std::move(msg));
         return true;
     }
@@ -580,13 +831,14 @@ class Face : public std::enable_shared_from_this<Face> {
 
         RoutedRequest msg{};
         msg.origin_rid = req->id;
+        msg.qos = req->qos;
         msg.key = *key;
         msg.parameters = std::string(req->payload.query.parameters);
         msg.target = req->target;
-        if (req->payload.query.body)
-            msg.payload = std::vector<std::byte>(req->payload.query.body->payload.begin(),
-                                                 req->payload.query.body->payload.end());
-        if (req->dest) msg.dest = req->dest->zid;
+        if (auto const& body = req->payload.query.body) {
+            msg.payload = std::vector<std::byte>(body->payload.begin(), body->payload.end());
+        }
+        if (auto const& dest = req->dest) msg.dest = dest->zid;
         post_to_tables([id = id_, msg = std::move(msg)](Tables& tables) mutable {
             tables.on_request(id, std::move(msg));
         });
@@ -600,6 +852,7 @@ class Face : public std::enable_shared_from_this<Face> {
 
         RoutedResponse msg{};
         msg.local_rid = rsp->rid;
+        msg.qos = rsp->qos;
         if (auto const* reply = std::get_if<Reply>(&rsp->payload.body)) {
             auto key = resolve_key(rsp->wire_expr);
             if (!key) return false;
@@ -650,6 +903,33 @@ class Face : public std::enable_shared_from_this<Face> {
         return Interest::decode(r).has_value();
     }
 
+    // What an Undeclare{Subscriber,Queryable} is withdrawing. Two encodings coexist,
+    // and both are legitimate:
+    //
+    //  * a client identifies the declaration by its entity id, which this face
+    //    recorded when the matching Declare arrived (`ids`);
+    //  * a peer broker sends id 0 and puts the key expression in the `wire_expr`
+    //    extension, because its declarations are per-key aggregates with no entity
+    //    id to refer to.
+    //
+    // The extension wins whenever it is present: it is strictly more specific than
+    // an id lookup, and a client that chooses to send it is only ever able to affect
+    // its own declarations. Erasing the id entry regardless keeps `ids` from
+    // accumulating stale keys on that path.
+    [[nodiscard]] auto undeclared_key(const std::optional<WireExpr>& we,
+                                      std::unordered_map<std::uint32_t, std::string>& ids,
+                                      std::uint32_t decl_id) -> std::optional<std::string> {
+        if (we) {
+            ids.erase(decl_id);
+            return resolve_key(*we);
+        }
+        auto it = ids.find(decl_id);
+        if (it == ids.end()) return std::nullopt;
+        std::string key = std::move(it->second);
+        ids.erase(it);
+        return key;
+    }
+
     [[nodiscard]] auto on_declare(ByteReader& r) -> bool {
         assert(strand_.running_in_this_thread());
         auto d = Declare::decode(r);
@@ -665,33 +945,34 @@ class Face : public std::enable_shared_from_this<Face> {
         } else if (auto const* ds = std::get_if<DeclareSubscriber>(&d->body.body)) {
             auto key = resolve_key(ds->wire_expr);
             if (key && (sub_ids_.size() < max_decl_ids || sub_ids_.contains(ds->id))) {
-                sub_ids_[ds->id] = *key;
+                // A peer broker's declarations are aggregates keyed by key
+                // expression, always carrying id 0 (see Tables' declaration
+                // encoders), so remembering them by id would be meaningless -- and
+                // would let every one of them collide on the single slot 0. Their
+                // undeclares carry the key expression instead; see below.
+                if (kind_ == FaceKind::client) sub_ids_[ds->id] = *key;
                 post_to_tables([id = id_, key = *key](Tables& tables) {
                     tables.on_declare_subscriber(id, key);
                 });
             }
         } else if (auto const* us = std::get_if<UndeclareSubscriber>(&d->body.body)) {
-            if (auto it = sub_ids_.find(us->id); it != sub_ids_.end()) {
-                std::string key = std::move(it->second);
-                sub_ids_.erase(it);
-                post_to_tables([id = id_, key = std::move(key)](Tables& tables) mutable {
+            if (auto key = undeclared_key(us->wire_expr, sub_ids_, us->id)) {
+                post_to_tables([id = id_, key = std::move(*key)](Tables& tables) mutable {
                     tables.on_undeclare_subscriber(id, key);
                 });
             }
         } else if (auto const* dq = std::get_if<DeclareQueryable>(&d->body.body)) {
             auto key = resolve_key(dq->wire_expr);
             if (key && (qbl_ids_.size() < max_decl_ids || qbl_ids_.contains(dq->id))) {
-                qbl_ids_[dq->id] = *key;
+                if (kind_ == FaceKind::client) qbl_ids_[dq->id] = *key;
                 QueryableInfo const qinfo = dq->qinfo;
                 post_to_tables([id = id_, key = *key, qinfo](Tables& tables) {
                     tables.on_declare_queryable(id, key, qinfo);
                 });
             }
         } else if (auto const* uq = std::get_if<UndeclareQueryable>(&d->body.body)) {
-            if (auto it = qbl_ids_.find(uq->id); it != qbl_ids_.end()) {
-                std::string key = std::move(it->second);
-                qbl_ids_.erase(it);
-                post_to_tables([id = id_, key = std::move(key)](Tables& tables) mutable {
+            if (auto key = undeclared_key(uq->wire_expr, qbl_ids_, uq->id)) {
+                post_to_tables([id = id_, key = std::move(*key)](Tables& tables) mutable {
                     tables.on_undeclare_queryable(id, key);
                 });
             }
@@ -719,28 +1000,30 @@ class Face : public std::enable_shared_from_this<Face> {
         if (writing_ || tx_len_ == 0) return;
         tx_accum_.swap(tx_inflight_); // tx_accum_ takes over the (spent) other buffer
         tx_inflight_len_ = std::exchange(tx_len_, 0);
+        last_tx_ = std::chrono::steady_clock::now();
         open_batch_ = no_open_batch; // the batch we just handed off is closed now
         writing_ = true;
         asio::async_write(
             sock_, asio::buffer(tx_inflight_.data(), tx_inflight_len_),
             asio::bind_executor(
-                strand_,
-                asio::bind_allocator(
-                    asio::recycling_allocator<void>{},
-                    [this, self = shared_from_this()](const asio::error_code& ec, std::size_t) {
-                        writing_ = false;
-                        if (ec) {
-                            close_now();
-                            return;
-                        }
-                        // async_write transfers everything or fails -- no partial
-                        // write to carry over, unlike async_write_some.
-                        tx_inflight_len_ = 0; // storage is kept for the next swap
-                        if (queued_bytes() <= congested_low_watermark) {
-                            congested_->store(false, std::memory_order_relaxed);
-                        }
-                        pump_tx();
-                    })));
+                strand_, asio::bind_allocator(asio::recycling_allocator<void>{},
+                                              [this, self = shared_from_this()](
+                                                  const asio::error_code& ec, std::size_t) {
+                                                  writing_ = false;
+                                                  if (ec) {
+                                                      close_now();
+                                                      return;
+                                                  }
+                                                  // async_write transfers everything or fails -- no
+                                                  // partial write to carry over, unlike
+                                                  // async_write_some.
+                                                  tx_inflight_len_ =
+                                                      0; // storage is kept for the next swap
+                                                  if (queued_bytes() <= this->low_watermark()) {
+                                                      this->set_pressure(FacePressure::ok);
+                                                  }
+                                                  pump_tx();
+                                              })));
     }
 
     auto close_now() -> void {
@@ -753,9 +1036,18 @@ class Face : public std::enable_shared_from_this<Face> {
     asio::strand<asio::any_io_executor> strand_;
     FaceId id_;
     Tables* tables_; ///< not owned; Tables outlives every Face during normal operation
+    FaceRole role_;  ///< which side of the handshake this face performs
+    /// Client or peer broker. Fixed at construction for a dialled link, resolved
+    /// from the peer's InitSyn for an accepted one, and read by `build_handle` --
+    /// so it is always final before this face is ever registered with `Tables`.
+    FaceKind kind_ = FaceKind::client;
     ZenohId zid_{};
     std::uint16_t peer_batch_size_ = 0xffff;
     std::uint32_t frame_sn_ = 0;
+    /// When this face last read from, and last wrote to, its socket. Drive the
+    /// keepalive/lease logic above; touched only on this face's own strand.
+    std::chrono::steady_clock::time_point last_rx_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_tx_ = std::chrono::steady_clock::now();
 
     /// Reusable receive buffer and the window of it holding read-but-unconsumed
     /// bytes (`[rx_start_, rx_end_)`) -- see `next_batch`/`compact_rx`.
@@ -788,7 +1080,12 @@ class Face : public std::enable_shared_from_this<Face> {
     bool writing_ = false;
     /// Shared with `Tables` via `FaceHandle::congested` (see its doc comment).
     /// Always non-null: allocated once at construction, never reassigned.
-    std::shared_ptr<std::atomic<bool>> congested_ = std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<std::atomic<FacePressure>> pressure_ =
+        std::make_shared<std::atomic<FacePressure>>(FacePressure::ok);
+    /// For a dialled clique link, the flag its connector polls before re-dialling.
+    /// `Tables` sets it when this link loses a duplicate collapse, so the connector
+    /// parks instead of reconnecting into another collapse (see `FaceHandle`).
+    std::shared_ptr<std::atomic<bool>> dial_suppress_;
     std::unordered_map<std::uint16_t, std::string> resmap_;
     std::unordered_map<std::uint32_t, std::string> sub_ids_;
     std::unordered_map<std::uint32_t, std::string> qbl_ids_;
@@ -813,8 +1110,135 @@ class Face : public std::enable_shared_from_this<Face> {
 [[nodiscard]] auto accept_face(asio::ip::tcp::socket sock,
                                asio::strand<asio::any_io_executor> strand, Tables& tables)
     -> asio::awaitable<void> {
-    auto face = std::make_shared<Face>(std::move(sock), strand, next_face_id(), &tables);
+    auto face = std::make_shared<Face>(std::move(sock), strand, next_face_id(), &tables,
+                                       FaceRole::listener);
     co_await face->run();
+}
+
+// The dialled counterpart of `accept_face`: same lifecycle, dialer-side handshake.
+// Same anonymous-namespace / pass-the-strand-in discipline applies, and for the same
+// reasons -- see `accept_face`'s comment.
+[[nodiscard]] auto connect_face(asio::ip::tcp::socket sock,
+                                asio::strand<asio::any_io_executor> strand, Tables& tables,
+                                std::shared_ptr<std::atomic<bool>> dial_suppress)
+    -> asio::awaitable<void> {
+    auto face = std::make_shared<Face>(std::move(sock), strand, next_face_id(), &tables,
+                                       FaceRole::dialer, std::move(dial_suppress));
+    co_await face->run();
+}
+
+// Split `tcp/host:port`, `host:port`, or `[v6::addr]:port` into host and port. The
+// `tcp/` scheme prefix is optional (this broker speaks only TCP); anything else is
+// rejected rather than guessed at. Mirrors `Session`'s own `parse_endpoint`
+// (src/runtime/session.cpp), which lives in the client runtime library the broker
+// deliberately does not link.
+// Drives one outbound clique link forever: dial, run the face to EOF, back off,
+// dial again. Anonymous-namespace, like `accept_face`, so `asio::awaitable<T>` never
+// reaches a `.cppm`.
+//
+// The `suppress` flag is how a link that lost a duplicate collapse stops being
+// re-dialled: without it this loop would reconnect immediately, be collapsed again,
+// and flap indefinitely against a peer it already has a perfectly good link to.
+// `Tables` clears the flag when that surviving link goes away.
+[[nodiscard]] auto peer_connector(asio::strand<asio::any_io_executor> strand, Tables& tables,
+                                  std::string endpoint, std::shared_ptr<std::atomic<bool>> suppress)
+    -> asio::awaitable<void>;
+
+// The endpoint to advertise for a broker listening on `host:port`, or nullopt when
+// `host` is a wildcard -- `0.0.0.0`/`::` is not something a peer can dial, and
+// gossiping it would send the whole clique after an unusable address. A hostname is
+// taken at face value (it is presumably resolvable by whoever configured it), and an
+// IPv6 literal is bracketed so the result round-trips through `split_endpoint`.
+[[nodiscard]] auto advertisable_endpoint(std::string_view host, std::uint16_t port)
+    -> std::optional<std::string> {
+    if (port == 0) return std::nullopt;
+    asio::error_code ec;
+    auto const addr = asio::ip::make_address(std::string(host), ec);
+    if (!ec) {
+        if (addr.is_unspecified()) return std::nullopt;
+        if (addr.is_v6()) return "tcp/[" + std::string(host) + "]:" + std::to_string(port);
+    }
+    return "tcp/" + std::string(host) + ":" + std::to_string(port);
+}
+
+// Spread a backoff delay by +/-25% so peers that started together, and therefore
+// back off in lockstep, stop colliding. Seeded once per thread; the quality of the
+// randomness is irrelevant here, only that it decorrelates the retries.
+[[nodiscard]] auto jittered(std::chrono::milliseconds d) -> std::chrono::milliseconds {
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<std::int64_t> dist(-d.count() / 4, d.count() / 4);
+    return d + std::chrono::milliseconds(dist(rng));
+}
+
+[[nodiscard]] auto split_endpoint(std::string_view ep)
+    -> std::optional<std::pair<std::string, std::uint16_t>> {
+    if (ep.starts_with("tcp/")) ep.remove_prefix(4);
+    if (ep.empty()) return std::nullopt;
+
+    std::string_view host;
+    std::string_view port;
+    if (ep.front() == '[') { // bracketed IPv6 literal
+        auto const close = ep.find(']');
+        if (close == std::string_view::npos || close + 2 >= ep.size() || ep[close + 1] != ':') {
+            return std::nullopt;
+        }
+        host = ep.substr(1, close - 1);
+        port = ep.substr(close + 2);
+    } else {
+        auto const colon = ep.rfind(':');
+        if (colon == std::string_view::npos || colon == 0 || colon + 1 == ep.size()) {
+            return std::nullopt;
+        }
+        host = ep.substr(0, colon);
+        port = ep.substr(colon + 1);
+    }
+
+    std::uint32_t value = 0;
+    for (char const c : port) {
+        if (c < '0' || c > '9') return std::nullopt;
+        value = value * 10 + static_cast<std::uint32_t>(c - '0');
+        if (value > 0xffff) return std::nullopt; // also catches an overlong digit run
+    }
+    if (value == 0) return std::nullopt; // port 0 is meaningless as a dial target
+    return std::pair{std::string(host), static_cast<std::uint16_t>(value)};
+}
+
+auto peer_connector(asio::strand<asio::any_io_executor> strand, Tables& tables,
+                    std::string endpoint, std::shared_ptr<std::atomic<bool>> suppress)
+    -> asio::awaitable<void> {
+    auto const target = split_endpoint(endpoint);
+    if (!target) co_return; // unparseable: nothing worth retrying
+
+    auto token = asio::as_tuple(asio::use_awaitable);
+    auto delay = std::chrono::milliseconds(peer_reconnect_min_ms);
+    for (;;) {
+        if (suppress->load(std::memory_order_relaxed)) {
+            // A link to this peer already exists (established from the other side);
+            // idle until it goes away rather than dialling into a collapse.
+            asio::steady_timer timer{strand, std::chrono::milliseconds(peer_suppressed_poll_ms)};
+            co_await timer.async_wait(token);
+            continue;
+        }
+
+        asio::ip::tcp::resolver resolver{strand};
+        auto [rec, results] =
+            co_await resolver.async_resolve(target->first, std::to_string(target->second), token);
+        if (!rec) {
+            asio::ip::tcp::socket sock{strand};
+            auto [cec, ep] = co_await asio::async_connect(sock, results, token);
+            if (!cec) {
+                delay = std::chrono::milliseconds(peer_reconnect_min_ms);
+                co_await connect_face(std::move(sock), strand, tables, suppress);
+            }
+        }
+        // The wait applies after a successful link ends too, so a peer that accepts
+        // and immediately closes can't become a tight loop. Jittered so that the
+        // brokers of a clique, which typically start together and therefore back off
+        // in lockstep, don't keep retrying in the same instant as each other.
+        asio::steady_timer timer{strand, jittered(delay)};
+        co_await timer.async_wait(token);
+        delay = std::min(delay * 2, std::chrono::milliseconds(peer_reconnect_max_ms));
+    }
 }
 
 } // namespace
@@ -837,6 +1261,18 @@ struct Broker::Impl {
     // accept loop (Broker::run()) and Broker::stop() must reach the acceptor only via
     // this strand.
     asio::strand<asio::any_io_executor> accept_strand{ioc.get_executor()};
+    /// Seed peer endpoints from BrokerConfig. Written once by `bind` before any
+    /// thread runs the io_context, then only read (by `run`'s connector spawn), so
+    /// it needs no strand of its own.
+    std::vector<std::string> peers;
+    /// Endpoints that already have a connector coroutine. Guarded by `accept_strand`
+    /// (every insertion is posted there), which is also what serializes the seed
+    /// peers against gossip-driven dials.
+    std::set<std::string> dialing;
+    /// Last reported count of unreachable peer brokers, so the partition report
+    /// fires on change rather than repeating itself every tick. Touched only from
+    /// the routing strand (inside the posted job that reads the count).
+    std::size_t reported_unlinked = 0;
 };
 
 Broker::Broker(ZenohId router_zid)
@@ -864,6 +1300,10 @@ auto Broker::do_bind(std::string_view host, std::uint16_t port) -> bool {
 
 auto Broker::bind(std::string_view host, std::uint16_t port)
     -> std::expected<std::unique_ptr<Broker>, BindError> {
+    return bind(BrokerConfig{.listen_host = std::string(host), .listen_port = port});
+}
+
+auto Broker::bind(BrokerConfig cfg) -> std::expected<std::unique_ptr<Broker>, BindError> {
     ZenohId zid{};
     zid.len = 16;
     std::random_device rd;
@@ -874,7 +1314,22 @@ auto Broker::bind(std::string_view host, std::uint16_t port)
 
     // NOLINTNEXTLINE(*-owning-memory) -- private ctor, only callable from here.
     auto broker = std::unique_ptr<Broker>(new Broker(zid));
-    if (!broker->do_bind(host, port)) return std::unexpected(BindError::bind_failed);
+    if (!broker->do_bind(cfg.listen_host, cfg.listen_port)) {
+        return std::unexpected(BindError::bind_failed);
+    }
+    // Only recorded here: a connector needs the io_context to be running, so the
+    // dialling itself starts in `run()`.
+    broker->impl_->peers = std::move(cfg.peers);
+
+    // Resolved after `do_bind`, not from the config, so that an ephemeral
+    // (`port == 0`) listen still advertises the port it actually got.
+    std::vector<std::string> advertised;
+    if (cfg.advertise) {
+        advertised.push_back(*cfg.advertise);
+    } else if (auto derived = advertisable_endpoint(cfg.listen_host, broker->port())) {
+        advertised.push_back(std::move(*derived));
+    }
+    broker->tables.set_self_endpoints(std::move(advertised));
     return broker;
 }
 
@@ -915,6 +1370,65 @@ auto Broker::run(unsigned num_threads) -> void {
                 asio::strand<asio::any_io_executor> strand{sock.get_executor()};
                 asio::co_spawn(strand, accept_face(std::move(sock), strand, tables),
                                asio::detached);
+            }
+        },
+        asio::detached);
+
+    // Every outbound link -- seeded from the CLI or learned by gossip -- is opened
+    // through this one path, which keeps a set of endpoints already being dialled so
+    // the same peer is never connected twice from this side. The set is touched only
+    // on `accept_strand`, so it needs no lock of its own.
+    auto spawn_connector = [this, &ioc](std::string endpoint) {
+        if (!impl_->dialing.insert(endpoint).second) return; // already have a connector
+        asio::strand<asio::any_io_executor> strand{ioc.get_executor()};
+        asio::co_spawn(strand,
+                       peer_connector(strand, tables, std::move(endpoint),
+                                      std::make_shared<std::atomic<bool>>(false)),
+                       asio::detached);
+    };
+
+    // How `Tables` asks for a link once gossip teaches it about a broker it isn't
+    // connected to. Invoked from the routing strand, so it hops to `accept_strand`
+    // before touching the dialling set -- `Tables` itself never sees an executor.
+    tables.set_dial_request([this, spawn_connector](std::string endpoint) {
+        asio::post(impl_->accept_strand,
+                   [spawn_connector, endpoint = std::move(endpoint)]() mutable {
+                       spawn_connector(std::move(endpoint));
+                   });
+    });
+
+    for (auto const& peer : impl_->peers) {
+        asio::post(impl_->accept_strand,
+                   [spawn_connector, peer]() mutable { spawn_connector(peer); });
+    }
+
+    // Partition reporting. With strict split horizon a dead clique link does not
+    // reroute -- the two brokers behind it simply stop seeing each other's clients,
+    // while both stay healthy toward everyone else. Nothing about that is visible
+    // from the outside, so it is said out loud instead. Reported on change only, so
+    // a persistently unreachable peer is one line, not a stream.
+    asio::co_spawn(
+        impl_->accept_strand,
+        [this]() -> asio::awaitable<void> {
+            auto token = asio::as_tuple(asio::use_awaitable);
+            for (;;) {
+                asio::steady_timer timer{impl_->accept_strand,
+                                         std::chrono::milliseconds(partition_report_interval_ms)};
+                co_await timer.async_wait(token);
+                // The count lives on the routing strand, so read it from there.
+                asio::post(tables.strand(), [this] {
+                    std::size_t const unlinked = tables.unlinked_peer_count();
+                    if (unlinked == impl_->reported_unlinked) return;
+                    impl_->reported_unlinked = unlinked;
+                    if (unlinked == 0) {
+                        std::fprintf(stderr, "zenohb: clique complete, all peers reachable\n");
+                    } else {
+                        std::fprintf(stderr,
+                                     "zenohb: %zu known peer broker(s) unreachable -- clients "
+                                     "behind them are not visible from here\n",
+                                     unlinked);
+                    }
+                });
             }
         },
         asio::detached);

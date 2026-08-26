@@ -3,7 +3,10 @@ module;
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 export module zenoh.broker;
 
@@ -34,6 +37,28 @@ export namespace zenoh::broker {
 /// Why `Broker::bind` failed.
 enum class BindError : std::uint8_t { bad_address, bind_failed };
 
+/// How to bring a broker up, including its place in a clique (`docs/CLIQUE.md`).
+/// Plain value types only -- no ASIO appears in this interface unit, by necessity
+/// (see the module comment above).
+struct BrokerConfig {
+    /// Address to listen on for both client sessions and peer brokers; `0.0.0.0`
+    /// accepts on every interface. `port == 0` picks an ephemeral port.
+    std::string listen_host = "0.0.0.0";
+    std::uint16_t listen_port = 7447;
+    /// Seed peers to dial, as `tcp/host:port` (the `tcp/` prefix is optional).
+    /// Each is dialled on startup and re-dialled forever with capped backoff if the
+    /// link drops -- a peer that is not up yet is not an error. Both ends may name
+    /// each other; the duplicate link that produces is collapsed deterministically.
+    std::vector<std::string> peers{};
+    /// The endpoint other brokers should be told to dial this one on, gossiped
+    /// around the clique. Required when `listen_host` is a wildcard (`0.0.0.0`,
+    /// `::`), since that is not something a peer can connect to; otherwise it
+    /// defaults to `listen_host` plus the bound port. A broker with no advertisable
+    /// endpoint still takes part -- it dials out and routes normally -- it simply
+    /// cannot be dialled back, so it must be able to reach its peers itself.
+    std::optional<std::string> advertise{};
+};
+
 class Broker {
   public:
     Broker(const Broker&) = delete;
@@ -47,6 +72,12 @@ class Broker {
     /// client-side test routers bind port 0 today). Generates a fresh random router
     /// Zenoh id (same `std::random_device` idiom as `Session::open`).
     [[nodiscard]] static auto bind(std::string_view host, std::uint16_t port)
+        -> std::expected<std::unique_ptr<Broker>, BindError>;
+
+    /// Bind per `cfg`, additionally dialling every peer in `cfg.peers` once `run()`
+    /// starts (the connectors need the `io_context` to be running, so `bind` only
+    /// records them). Equivalent to the two-argument overload when `peers` is empty.
+    [[nodiscard]] static auto bind(BrokerConfig cfg)
         -> std::expected<std::unique_ptr<Broker>, BindError>;
 
     /// The bound local port (resolves an ephemeral `port=0` bind).

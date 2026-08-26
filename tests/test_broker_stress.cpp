@@ -112,14 +112,14 @@ template <class Pred> auto wait_until(Pred pred, int timeout_ms = 2000) -> bool 
     return pred();
 }
 
-// Builds a fresh, fully-formed FaceHandle: a real (non-null) `congested` flag (see
+// Builds a fresh, fully-formed FaceHandle: a real (non-null) `pressure` flag (see
 // FaceHandle's doc comment in tables.cppm -- null is only valid for a handle that was
 // never actually registered) and a `deliver` that just bumps a caller-owned counter,
 // since these synthetic-face tests never decode anything back.
 auto make_counting_face(FaceId id, int& counter) -> FaceHandle {
     FaceHandle h;
     h.id = id;
-    h.congested = std::make_shared<std::atomic<bool>>(false);
+    h.pressure = std::make_shared<std::atomic<FacePressure>>(FacePressure::ok);
     // `deliver` hands over a whole run of messages at a time (one call per face per
     // routed batch, see FaceHandle in tables.cppm), so count messages, not calls.
     h.deliver = [&counter](SharedBuf, std::vector<MsgSlice> slices) {

@@ -620,7 +620,7 @@ TEST("target_zid on put() narrows delivery to one peer, never bypassing subscrib
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
     // Targeted at B specifically: only B should ever see this one.
-    CHECK(pub->put("demo/zid", bytes("for-b"), zid_b).has_value());
+    CHECK(pub->put("demo/zid", bytes("for-b"), PutOptions{.target_zid = zid_b}).has_value());
     // Untargeted broadcast: both should see this one.
     CHECK(pub->put("demo/zid", bytes("broadcast")).has_value());
 
@@ -642,7 +642,7 @@ TEST("target_zid on put() narrows delivery to one peer, never bypassing subscrib
     PeerId bogus{};
     bogus.len = 16;
     bogus.bytes.fill(std::byte{0xAB});
-    CHECK(pub->put("demo/zid", bytes("bogus-target"), bogus).has_value());
+    CHECK(pub->put("demo/zid", bytes("bogus-target"), PutOptions{.target_zid = bogus}).has_value());
     CHECK(pub->put("demo/zid", bytes("broadcast-2")).has_value());
 
     auto a2 = sub_a->recv();
@@ -1220,7 +1220,8 @@ TEST("put() targeted at a since-disconnected zid reaches nobody, and the broker 
 
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
-    CHECK(pub->put("demo/gone/zid", bytes("for-gone-b"), zid_b).has_value());
+    CHECK(pub->put("demo/gone/zid", bytes("for-gone-b"), PutOptions{.target_zid = zid_b})
+              .has_value());
     CHECK(pub->put("demo/gone/zid", bytes("broadcast")).has_value());
 
     // A's first delivered sample must be the broadcast: proof the B-targeted put,

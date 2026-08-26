@@ -2,6 +2,7 @@ module;
 
 #include <algorithm>
 #include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -83,6 +84,32 @@ auto ResourceTable::undeclare_queryable(std::string_view keyexpr, FaceId face_id
                       [face_id](const FaceCtx& c) { return c.face_id == face_id; });
     }
     if (it->second.faces.empty()) by_key_.erase(it);
+}
+
+auto ResourceTable::faces_on(std::string_view canonical_key) const -> std::span<const FaceCtx> {
+    auto it = by_key_.find(canonical_key);
+    if (it == by_key_.end()) return {};
+    return it->second.faces;
+}
+
+auto ResourceTable::declared_keys() const -> std::vector<std::string> {
+    std::vector<std::string> out;
+    out.reserve(by_key_.size());
+    for (auto const& [key, res] : by_key_) out.push_back(key);
+    return out;
+}
+
+auto ResourceTable::keys_for_face(FaceId face_id) const -> std::vector<std::string> {
+    std::vector<std::string> out;
+    for (auto const& [key, res] : by_key_) {
+        for (auto const& fc : res.faces) {
+            if (fc.face_id == face_id) {
+                out.push_back(key);
+                break;
+            }
+        }
+    }
+    return out;
 }
 
 auto ResourceTable::face_count_for(std::string_view canonical_key) const -> std::size_t {

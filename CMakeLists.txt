@@ -156,10 +156,12 @@ target_sources(zenoh-broker
     PUBLIC
         FILE_SET CXX_MODULES FILES
             broker/src/resource.cppm
+            broker/src/membership.cppm
             broker/src/tables.cppm
             broker/src/broker.cppm
     PRIVATE
             broker/src/resource.cpp
+            broker/src/membership.cpp
             broker/src/tables.cpp
             broker/src/broker.cpp
 )

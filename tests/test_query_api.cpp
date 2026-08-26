@@ -632,7 +632,7 @@ TEST("put() with target_zid sets the dest extension on the wire") {
         router.join();
         return;
     }
-    auto r = sess->put("demo/tzid", bytes("v"), target);
+    auto r = sess->put("demo/tzid", bytes("v"), PutOptions{.target_zid = target});
     CHECK(r.has_value());
     sess->close();
     router.join();
@@ -644,6 +644,48 @@ TEST("put() with target_zid sets the dest extension on the wire") {
         CHECK(seen_zid.bytes[0] == std::byte{0x11});
         CHECK(seen_zid.bytes[1] == std::byte{0x22});
     }
+}
+
+TEST("put() carries CongestionControl on the wire as the standard QoS bit") {
+    // Bit 3 ("D") of the QoS byte is Zenoh's own CongestionControl::Block flag, not
+    // anything project-local -- so this is what makes a zenoh-rust router honour the
+    // setting too. Default (Drop) must leave the whole QoS extension elided, exactly
+    // as before this option existed.
+    std::optional<QoS> drop_qos;
+    std::optional<QoS> block_qos;
+    int seen = 0;
+
+    QueryRouter router([&](int fd) {
+        for (int i = 0; i < 2; ++i) {
+            auto batch = recv_batch(fd);
+            if (!batch) return;
+            auto r = open_frame(*batch);
+            if (!r) return;
+            auto push = Push::decode(*r);
+            if (!push) return;
+            (i == 0 ? drop_qos : block_qos) = push->qos;
+            ++seen;
+        }
+    });
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    CHECK(sess->put("demo/cc", bytes("v")).has_value());
+    CHECK(sess->put("demo/cc", bytes("v"), PutOptions{.congestion = CongestionControl::block})
+              .has_value());
+    sess->close();
+    router.join();
+
+    CHECK(seen == 2);
+    if (drop_qos) CHECK((drop_qos->inner & 0x08) == 0);
+    if (block_qos) CHECK((block_qos->inner & 0x08) != 0);
+    // Nothing else in the byte moves: priority and express stay at their defaults,
+    // since this runtime implements neither.
+    if (block_qos) CHECK(block_qos->inner == (QoS{}.inner | 0x08));
 }
 
 TEST("Session::local_zid() returns a stable, non-empty id") {

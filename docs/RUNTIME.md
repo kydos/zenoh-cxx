@@ -79,6 +79,41 @@ cannot accept the bytes right now:
   `would_block` if it still cannot drain at all, rather than interleaving a new frame
   ahead.
 
+## Congestion control and zid-targeting (`PutOptions` / `GetOptions`)
+
+`put`, `try_put`, `Batch::put` and `get` take an options struct rather than a growing
+list of trailing parameters:
+
+```cpp
+session->put("cmd/arm", payload, {.congestion = CongestionControl::block});
+session->put("telemetry/x", payload, {.target_zid = peer});   // congestion defaults to drop
+session->get("sensors/**", "", {.target = GetTarget::all,
+                                .congestion = CongestionControl::block});
+```
+
+- **`congestion`** is the standard Zenoh `CongestionControl`, carried as bit 3 ("D")
+  of the QoS extension that `Push`/`Request` already have — not a project-local flag,
+  so a `zenohd` or `zenohb` on the other end honours it identically, and a peer that
+  ignores QoS is unaffected.
+  - `drop` (the default) lets a router discard the message rather than let one slow
+    consumer stall the producer. Right for telemetry and anything the next message
+    supersedes.
+  - `block` says the message must not be discarded: the router queues it past the
+    point where it would drop and pushes back on the producer instead. Right for
+    commands, configuration, and anything a receiver cannot reconstruct later. The
+    cost is that the backpressure slows this publisher toward *every* destination,
+    not just the congested one — which is why it is per message rather than a
+    session-wide mode. See `docs/CLIQUE.md`'s "Congestion control is per message" for
+    what the broker actually does with it.
+- **`target_zid`** narrows delivery to the one peer with that Zenoh id, ANDed with
+  normal key-expression matching — a filter, never a bypass (`docs/BROKER.md`). It
+  works across a broker clique: the filter is applied by whichever broker owns that
+  peer.
+
+Priority (QoS bits 2:0) and express (bit 4) are **not** exposed: honouring them needs
+per-priority frame SNs and queues, and this runtime has a single `frame_sn_` that
+always writes `Reliability::reliable`.
+
 ## Batching
 
 `Session::batch()` returns a `Batch` that coalesces many puts into **one Frame** (one
@@ -93,7 +128,8 @@ b.put("demo/b", data2);
 b.flush();              // or let the Batch go out of scope
 ```
 
-- A `Batch::put` appends a `Push(Put)` to the in-progress frame.
+- A `Batch::put` appends a `Push(Put)` to the in-progress frame, and takes the same
+  `PutOptions` as `Session::put`.
 - When the next put would exceed the negotiated batch size, the buffered frame is
   **sent first** (blocking) and the new put begins the next frame — so an arbitrarily
   long run of puts streams out as a sequence of full frames.

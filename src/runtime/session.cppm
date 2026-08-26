@@ -152,6 +152,39 @@ enum class GetConsolidation : std::uint8_t { automatic, none, monotonic, latest 
 /// `GetConsolidation`.
 enum class GetTarget : std::uint8_t { best_matching, all, all_complete };
 
+/// What a router should do with this message when a link it needs is congested.
+///
+/// This is the standard Zenoh `CongestionControl`, carried in bit 3 of the QoS
+/// extension every `Push`/`Request` already has room for -- not a project-local
+/// setting -- so a broker that understands it treats a `zenoh-rust` publisher's
+/// choice identically to this client's.
+///
+///  - `drop` (the default) lets a router discard the message rather than let one
+///    slow consumer stall the producer or anybody else. Right for telemetry, sensor
+///    streams, and anything where the next value supersedes this one.
+///  - `block` says this message must not be discarded. A router queues it past the
+///    point where it would drop, and pushes back on whoever is producing it instead,
+///    so the loss is converted into slowdown. Right for commands, configuration, and
+///    anything a receiver cannot reconstruct from a later message.
+///
+/// The cost of `block` is that the backpressure reaches the publisher, which slows
+/// it toward *every* destination rather than only the congested one -- unavoidable
+/// for "never dropped", and the reason this is per message rather than a broker-wide
+/// mode. A genuinely stuck peer (one that stops draining altogether) is eventually
+/// disconnected rather than allowed to consume memory without bound.
+enum class CongestionControl : std::uint8_t { drop, block };
+
+/// Options for `Session::put`/`try_put`. Mirrors `GetOptions` on the query side.
+struct PutOptions {
+    /// When set, the broker narrows delivery to the one peer with this Zenoh id
+    /// (still ANDed with normal subscription matching -- never delivered to a peer
+    /// without a matching Subscriber declared). Works across a broker clique: the
+    /// filter is applied by whichever broker actually owns that peer.
+    std::optional<PeerId> target_zid{};
+    /// Whether this message may be dropped under congestion. See `CongestionControl`.
+    CongestionControl congestion = CongestionControl::drop;
+};
+
 /// Options for `Session::get`. `target_zid`, when set, is a broker-enforced filter
 /// (see `docs/BROKER.md`) narrowing which queryable(s) may answer — like `put`'s
 /// `target_zid`, it only ever narrows normal key-expression-declaration matching,
@@ -169,6 +202,9 @@ struct GetOptions {
     /// `<vector>` include under this toolchain's named-module + libc++ combination.
     std::optional<std::uint32_t> timeout_ms{};
     std::optional<PeerId> target_zid{};
+    /// Whether the query may be dropped under congestion. See `CongestionControl`.
+    /// Applies to the request travelling *out*; replies carry the same setting back.
+    CongestionControl congestion = CongestionControl::drop;
 };
 
 /// One reply delivered to a `get()` caller: either an Ok sample (`Response{Reply}`)
@@ -253,9 +289,10 @@ class Session {
     /// handed to the transport. Any bytes left pending by a prior `try_put` are
     /// flushed first. If `target_zid` is set, the broker narrows delivery to the one
     /// peer with that Zenoh id (still ANDed with normal subscription matching —
-    /// never delivered to a peer without a matching Subscriber declared).
+    /// never delivered to a peer without a matching Subscriber declared), and
+    /// `opts.congestion` selects whether it may be dropped under congestion.
     [[nodiscard]] auto put(std::string_view key_expr, std::span<const std::byte> payload,
-                           std::optional<PeerId> target_zid = {}) -> std::expected<void, ZError>;
+                           PutOptions opts = {}) -> std::expected<void, ZError>;
 
     /// Like `put`, but never blocks. Returns `ZError::would_block` only when the
     /// transport could not accept *any* bytes of the message right now (nothing was
@@ -263,8 +300,7 @@ class Session {
     /// buffered and flushed on the next call, and `try_put` returns success — the
     /// message is committed, just not fully drained yet.
     [[nodiscard]] auto try_put(std::string_view key_expr, std::span<const std::byte> payload,
-                               std::optional<PeerId> target_zid = {})
-        -> std::expected<void, ZError>;
+                               PutOptions opts = {}) -> std::expected<void, ZError>;
 
     /// Open an API-level batch bound to this session. Put operations on the batch
     /// accumulate into a single Frame and are sent as one TCP batch when it fills,
@@ -346,10 +382,9 @@ class Session {
         -> std::expected<void, ZError>;
 
     [[nodiscard]] auto encode_put(std::string_view key_expr, std::span<const std::byte> payload,
-                                  std::optional<PeerId> target_zid) -> std::expected<void, ZError>;
+                                  const PutOptions& opts) -> std::expected<void, ZError>;
     [[nodiscard]] auto encode_put_head(std::string_view key_expr,
-                                       std::span<const std::byte> payload,
-                                       std::optional<PeerId> target_zid)
+                                       std::span<const std::byte> payload, const PutOptions& opts)
         -> std::expected<std::size_t, ZError>;
     [[nodiscard]] auto flush_pending() -> std::expected<void, ZError>;
 
@@ -457,8 +492,8 @@ class Batch {
     /// Append a Put to the batch. If adding it would overflow the frame, the already
     /// buffered messages are sent first (blocking) and this Put begins the next
     /// frame. Returns `encode_error` if a single Put cannot fit in one frame.
-    [[nodiscard]] auto put(std::string_view key_expr, std::span<const std::byte> payload)
-        -> std::expected<void, ZError>;
+    [[nodiscard]] auto put(std::string_view key_expr, std::span<const std::byte> payload,
+                           PutOptions opts = {}) -> std::expected<void, ZError>;
 
     /// Send any buffered messages now (blocking). A no-op if the batch is empty.
     [[nodiscard]] auto flush() -> std::expected<void, ZError>;

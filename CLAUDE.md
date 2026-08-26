@@ -16,7 +16,9 @@ Three static libraries:
 - **`zenoh-broker`** — `zenohb`, a multithreaded ASIO-based broker/router (accepts
   many client connections, routes pub/sub and query/reply between matching faces),
   built on `zenoh-proto` only (not `zenoh` — a from-scratch listener, not another
-  client). See `docs/BROKER.md`.
+  client). See `docs/BROKER.md`. Brokers federate into a **clique** — every broker
+  directly linked to every other, with split-horizon routing, gossip membership, and
+  per-message congestion control — see `docs/CLIQUE.md`.
 
 ### Reference implementation
 
@@ -45,7 +47,9 @@ are living design docs, not historical records. `docs/STYLE.md` is the short ver
 `docs/PROTO.md` documents wire-format/codec internals; `docs/RUNTIME.md` documents the
 session/handshake/framing/subscriber behavior in detail; `docs/BROKER.md` documents
 the broker's routing semantics, its two-tier ASIO strand concurrency model, and the
-`DestinationId` (zid-targeting) wire extension.
+`DestinationId` (zid-targeting) wire extension; `docs/CLIQUE.md` documents
+broker-to-broker federation (the split-horizon invariant, gossip membership,
+aggregated declarations, and QoS-driven congestion control).
 
 ## Build
 
@@ -123,8 +127,10 @@ a real `socketpair`/loopback), `test_broker.cpp` (the broker — a real `Broker`
 loopback port 0, driven by real `Session` clients; see `docs/BROKER.md`'s "Testing"),
 `test_broker_stress.cpp` (broker scale/stress — `Tables`/`ResourceTable` at
 thousands of declarations, sustained no-loss throughput, congestion drop/recover,
-connect/disconnect churn), `test_coverage.cpp`/`test_umbrella.cpp` (fill gaps for the
-coverage gate).
+connect/disconnect churn), `test_membership.cpp` (the pure clique member table and its
+gossip codec), `test_clique.cpp` (broker-to-broker federation against several real
+`Broker`s on loopback — see `docs/CLIQUE.md`'s "Testing"),
+`test_coverage.cpp`/`test_umbrella.cpp` (fill gaps for the coverage gate).
 
 **Differential testing**: `tools/vector-gen` (a small Rust program that path-deps the
 `zenoh-rust` reference `zenoh-proto` crate) emits golden byte vectors into the
@@ -199,15 +205,20 @@ zenoh.cppm  zenoh   public umbrella; re-exports zenoh.session only (codec types 
 ```
 
 Broker (`broker/src/`, `zenoh-broker` library, links `zenoh-proto` not `zenoh`; see
-`docs/BROKER.md` for the full concurrency model / routing semantics):
+`docs/BROKER.md` for the full concurrency model / routing semantics, and
+`docs/CLIQUE.md` for broker-to-broker federation):
 
 ```
 broker/src/
-  resource.{cppm,cpp}  zenoh.broker.resource  ResourceTable, FaceCtx — declared subscriber/queryable patterns
-  tables.{cppm,cpp}    zenoh.broker.tables    Tables — global routing state on one asio::strand (Tier 2)
-  broker.{cppm,cpp}    zenoh.broker           Broker (bind/run/stop); Face + accept loop live inside broker.cpp
-                                              only (a toolchain constraint — see docs/BROKER.md)
-  main.cpp             (zenohb executable)    CLI: -l/--listen tcp/host:port, --threads N
+  resource.{cppm,cpp}   zenoh.broker.resource   ResourceTable, FaceCtx — declared subscriber/queryable patterns
+  membership.{cppm,cpp} zenoh.broker.membership Membership — clique member table, gossip payload codec,
+                                                endpoint validation, mutual-dial tie-break. Pure, no ASIO
+  tables.{cppm,cpp}     zenoh.broker.tables     Tables — global routing state on one asio::strand (Tier 2);
+                                                FaceKind (split horizon), FacePressure, declaration aggregation
+  broker.{cppm,cpp}     zenoh.broker            Broker (bind/run/stop, BrokerConfig); Face, accept loop and
+                                                peer connector live inside broker.cpp only (a toolchain
+                                                constraint — see docs/BROKER.md)
+  main.cpp              (zenohb executable)     CLI: -l/--listen, --peer, --advertise, --threads N
 ```
 
 `zenoh-proto` (util → buffer → codec → codec.ext → proto/*) is a pure leaf: no I/O,
@@ -314,12 +325,14 @@ the exact invocation sequences (router + reference binaries + this repo's).
 
 Not modeled, for lack of a runtime API rather than by choice: `z_delete` (there is no
 `Session::del` — `SampleKind::del` exists on the receive path only), a query payload
-(`z_get -p`), `declare_querier`/matching listeners, and express/congestion QoS flags.
+(`z_get -p`), `declare_querier`/matching listeners, and the express/priority QoS flags
+(congestion control *is* modeled — see `PutOptions`/`GetOptions::congestion`).
 
 `zenohb` (`broker/src/main.cpp`, always built) is the broker executable —
-`zenohb -l tcp/host:port [--threads N]`. It's the manual interop test path in the
-*other* direction: real `zenoh-rust` example binaries connecting to this project's
-own broker — see `docs/BROKER.md`'s "Manual interop test".
+`zenohb -l tcp/host:port [--peer tcp/host:port]... [--advertise tcp/host:port]
+[--threads N]`. It's the manual interop test path in the *other* direction: real
+`zenoh-rust` example binaries connecting to this project's own broker — see
+`docs/BROKER.md`'s "Manual interop test", and `docs/CLIQUE.md`'s for a federated one.
 
 ### Toolchain constraints (don't try to "fix" these — they're upstream bugs)
 
