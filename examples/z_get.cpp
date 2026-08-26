@@ -20,6 +20,7 @@
 //   z_queryable -k demo/example/zenoh-rs-queryable &     # from ../zenoh-rust
 //   ./build/clang/examples/z_get -s 'demo/example/**'
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
