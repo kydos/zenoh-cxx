@@ -1,13 +1,15 @@
 // z_put: connect to a Zenoh router and publish a value to a key expression.
 //
-// Usage: z_put [endpoint] [key] [value] [-e endpoint] [--try]
-//   endpoint         router locator, positional (default tcp/127.0.0.1:7447)
-//   key              key expression  (default demo/example/zenoh-cpp-put)
-//   value            payload string  (default "Hello from zenoh-cpp!")
-//   -e, --connect E  router endpoint (same as the positional; overrides it)
-//   --try            use try_put (non-blocking) instead of put
-//   --batch          coalesce the puts into API-level batches (one Frame per batch)
-//   --count N        publish N times on the one session (default 1)
+// Usage: z_put [OPTIONS] [endpoint] [key] [value]   (--help for the full list)
+//   -k, --key <KEY>          key expression [default: demo/example/zenoh-cpp-put]
+//   -p, --payload <PAYLOAD>  payload string [default: "Put from C++!"]
+//   --try                    use try_put (non-blocking) instead of put
+//   --batch                  coalesce the puts into API-level batches (one Frame each)
+//   --count <N>              publish N times on the one session (default 1)
+//
+// The three positional arguments (endpoint, key, value) and --try/--batch/--count are
+// extensions of this port with no reference counterpart; -k/-p mirror the reference's
+// own options and take precedence over the positional key/value.
 //
 // Verify with the reference subscriber:
 //   zenohd -l tcp/127.0.0.1:7447 &
@@ -22,42 +24,42 @@
 
 import zenoh;
 
+#include "zexample.hpp"
+
 namespace {
 
-auto as_bytes(std::string_view s) -> std::span<const std::byte> {
-    return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
-}
-
-auto error_name(zenoh::ZError e) -> const char* {
-    switch (e) {
-    case zenoh::ZError::would_block:
-        return "would_block";
-    case zenoh::ZError::connection_closed:
-        return "connection_closed";
-    case zenoh::ZError::io_error:
-        return "io_error";
-    case zenoh::ZError::protocol_error:
-        return "protocol_error";
-    case zenoh::ZError::encode_error:
-        return "encode_error";
-    case zenoh::ZError::bad_endpoint:
-        return "bad_endpoint";
-    case zenoh::ZError::already_subscribed:
-        return "already_subscribed";
-    case zenoh::ZError::already_queryable:
-        return "already_queryable";
-    case zenoh::ZError::query_timeout:
-        return "query_timeout";
-    }
-    return "unknown";
+auto usage(const char* argv0) -> void {
+    std::printf("Usage: %s [OPTIONS] [endpoint] [key] [value]\n\n"
+                "Options:\n"
+                "  -k, --key <KEY>\n"
+                "          The key expression to write to"
+                " [default: demo/example/zenoh-cpp-put]\n"
+                "  -p, --payload <PAYLOAD>\n"
+                "          The payload to write [default: \"Put from C++!\"]\n"
+                "\n"
+                "Extensions of this port, with no counterpart in the reference example:\n"
+                "  [endpoint] [key] [value]\n"
+                "          Positional forms of --connect, --key and --payload\n"
+                "      --try\n"
+                "          Use the non-blocking try_put instead of put\n"
+                "      --batch\n"
+                "          Coalesce the puts into API-level batches (one Frame per batch)\n"
+                "      --count <N>\n"
+                "          Publish N times on the one session [default: 1]\n",
+                argv0);
+    zexample::print_common_help();
 }
 
 } // namespace
 
 auto main(int argc, char** argv) -> int {
-    std::string endpoint = "tcp/127.0.0.1:7447";
-    std::string key = "test/thr";
-    std::string value = "01234567";
+    if (zexample::wants_help(argc, argv)) {
+        usage(argv[0]);
+        return 0;
+    }
+    zexample::CommonArgs common;
+    std::string key = "demo/example/zenoh-cpp-put";
+    std::string value = "Put from C++!";
     bool use_try = false;
     bool use_batch = false;
     int count = 1;
@@ -65,31 +67,55 @@ auto main(int argc, char** argv) -> int {
     int positional = 0;
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
-        if ((arg == "-e" || arg == "--connect") && i + 1 < argc) {
-            endpoint = argv[++i];
-            if (positional == 0) positional = 1; // consume the positional endpoint slot
+        // -e is handled here rather than by parse_common so that giving it explicitly
+        // still consumes the positional endpoint slot, as it always has.
+        if (arg == "-e" || arg == "--connect") {
+            const char* value_arg = zexample::option_value(argc, argv, i);
+            if (value_arg == nullptr) return 1;
+            common.endpoint = value_arg;
+            if (positional == 0) positional = 1;
+        } else if (arg == "-k" || arg == "--key") {
+            const char* value_arg = zexample::option_value(argc, argv, i);
+            if (value_arg == nullptr) return 1;
+            key = value_arg;
+        } else if (arg == "-p" || arg == "--payload") {
+            const char* value_arg = zexample::option_value(argc, argv, i);
+            if (value_arg == nullptr) return 1;
+            value = value_arg;
         } else if (arg == "--try") {
             use_try = true;
         } else if (arg == "--batch") {
             use_batch = true;
-        } else if (arg == "--count" && i + 1 < argc) {
-            count = std::atoi(argv[++i]);
-        } else if (positional == 0) {
-            endpoint = arg;
+        } else if (arg == "--count") {
+            const char* value_arg = zexample::option_value(argc, argv, i);
+            if (value_arg == nullptr) return 1;
+            count = std::atoi(value_arg);
+        } else if (!arg.empty() && arg.front() != '-' && positional == 0) {
+            common.endpoint = arg;
             ++positional;
-        } else if (positional == 1) {
+        } else if (!arg.empty() && arg.front() != '-' && positional == 1) {
             key = arg;
             ++positional;
-        } else if (positional == 2) {
+        } else if (!arg.empty() && arg.front() != '-' && positional == 2) {
             value = arg;
             ++positional;
+        } else {
+            switch (zexample::parse_common(argc, argv, i, common)) {
+            case zexample::Arg::consumed:
+                break;
+            case zexample::Arg::fatal:
+                return 1;
+            case zexample::Arg::unrecognized:
+                return zexample::unknown_option(argv[0], arg);
+            }
         }
     }
+    const std::string& endpoint = common.endpoint;
 
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
         std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
-                     error_name(session.error()));
+                     zexample::error_name(session.error()));
         return 1;
     }
     std::printf("Connected to %s\n", endpoint.c_str());
@@ -98,24 +124,24 @@ auto main(int argc, char** argv) -> int {
         auto batch = session->batch();
         for (int i = 0; i < count; ++i) {
             std::string const payload = count > 1 ? value + " #" + std::to_string(i) : value;
-            if (auto r = batch.put(key, as_bytes(payload)); !r) {
+            if (auto r = batch.put(key, zexample::as_bytes(payload)); !r) {
                 std::fprintf(stderr, "batch.put('%s') failed: %s\n", key.c_str(),
-                             error_name(r.error()));
+                             zexample::error_name(r.error()));
                 return 1;
             }
         }
         if (auto r = batch.flush(); !r) {
-            std::fprintf(stderr, "batch.flush() failed: %s\n", error_name(r.error()));
+            std::fprintf(stderr, "batch.flush() failed: %s\n", zexample::error_name(r.error()));
             return 1;
         }
     } else {
         for (int i = 0; i < count; ++i) {
             std::string const payload = count > 1 ? value + " #" + std::to_string(i) : value;
-            auto result = use_try ? session->try_put(key, as_bytes(payload))
-                                  : session->put(key, as_bytes(payload));
+            auto result = use_try ? session->try_put(key, zexample::as_bytes(payload))
+                                  : session->put(key, zexample::as_bytes(payload));
             if (!result) {
                 std::fprintf(stderr, "%s('%s') failed: %s\n", use_try ? "try_put" : "put",
-                             key.c_str(), error_name(result.error()));
+                             key.c_str(), zexample::error_name(result.error()));
                 return result.error() == zenoh::ZError::would_block ? 2 : 1;
             }
             // std::printf("%s('%s') = '%s'\n", use_try ? "try_put" : "put", key.c_str(),

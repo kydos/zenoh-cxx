@@ -3,10 +3,9 @@
 // in rounds of N, prints `msg/s` per round, and exits after M rounds (printing a final
 // summary).
 //
-// Usage: z_sub_thr [options]
-//   -e, --connect E  router endpoint (default tcp/127.0.0.1:7447)
-//   -s, --samples M  number of throughput measurements before exit (default 10)
-//   -n, --number N   messages per measurement round (default 100000)
+// Usage: z_sub_thr [OPTIONS]    (run with --help for the full option list)
+//   -s, --samples <SAMPLES>  throughput measurements before exit [default: 10]
+//   -n, --number <NUMBER>    messages per measurement round [default: 100000]
 //
 // Measure against the publisher (this project's z_pub_thr or the reference):
 //   zenohd -l tcp/127.0.0.1:7447 &
@@ -24,30 +23,19 @@
 
 import zenoh;
 
+#include "zexample.hpp"
+
 namespace {
 
-auto error_name(zenoh::ZError e) -> const char* {
-    switch (e) {
-    case zenoh::ZError::would_block:
-        return "would_block";
-    case zenoh::ZError::connection_closed:
-        return "connection_closed";
-    case zenoh::ZError::io_error:
-        return "io_error";
-    case zenoh::ZError::protocol_error:
-        return "protocol_error";
-    case zenoh::ZError::encode_error:
-        return "encode_error";
-    case zenoh::ZError::bad_endpoint:
-        return "bad_endpoint";
-    case zenoh::ZError::already_subscribed:
-        return "already_subscribed";
-    case zenoh::ZError::already_queryable:
-        return "already_queryable";
-    case zenoh::ZError::query_timeout:
-        return "query_timeout";
-    }
-    return "unknown";
+auto usage(const char* argv0) -> void {
+    std::printf("Usage: %s [OPTIONS]\n\n"
+                "Options:\n"
+                "  -s, --samples <SAMPLES>\n"
+                "          Number of throughput measurements before exiting [default: 10]\n"
+                "  -n, --number <NUMBER>\n"
+                "          Number of messages in each measurement [default: 100000]\n",
+                argv0);
+    zexample::print_common_help();
 }
 
 using Clock = std::chrono::steady_clock;
@@ -98,28 +86,44 @@ class Stats {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    if (zexample::wants_help(argc, argv)) {
+        usage(argv[0]);
+        return 0;
+    }
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    std::string endpoint = "tcp/127.0.0.1:7447";
+    zexample::CommonArgs common;
     std::size_t samples = 10;    // m: number of measurement rounds before exit
     std::size_t number = 100000; // n: messages per round
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
-        if ((arg == "-e" || arg == "--connect") && i + 1 < argc) {
-            endpoint = argv[++i];
-        } else if ((arg == "-s" || arg == "--samples") && i + 1 < argc) {
-            samples = std::strtoul(argv[++i], nullptr, 10);
-        } else if ((arg == "-n" || arg == "--number") && i + 1 < argc) {
-            number = std::strtoul(argv[++i], nullptr, 10);
+        if (arg == "-s" || arg == "--samples") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            samples = std::strtoul(value, nullptr, 10);
+        } else if (arg == "-n" || arg == "--number") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            number = std::strtoul(value, nullptr, 10);
+        } else {
+            switch (zexample::parse_common(argc, argv, i, common)) {
+            case zexample::Arg::consumed:
+                break;
+            case zexample::Arg::fatal:
+                return 1;
+            case zexample::Arg::unrecognized:
+                return zexample::unknown_option(argv[0], arg);
+            }
         }
     }
+    const std::string& endpoint = common.endpoint;
     if (number == 0) number = 1;
 
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
         std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
-                     error_name(session.error()));
+                     zexample::error_name(session.error()));
         return 1;
     }
 
@@ -136,7 +140,7 @@ auto main(int argc, char** argv) -> int {
         },
         zenoh::SubscriberOptions{.capacity = 8192});
     if (!sub) {
-        std::fprintf(stderr, "declare_subscriber failed: %s\n", error_name(sub.error()));
+        std::fprintf(stderr, "declare_subscriber failed: %s\n", zexample::error_name(sub.error()));
         return 1;
     }
 
@@ -144,7 +148,7 @@ auto main(int argc, char** argv) -> int {
     // Drive the receive pump; the callback fires per sample and exits after M rounds.
     if (auto r = session->run(); !r) {
         if (r.error() != zenoh::ZError::connection_closed)
-            std::fprintf(stderr, "run failed: %s\n", error_name(r.error()));
+            std::fprintf(stderr, "run failed: %s\n", zexample::error_name(r.error()));
     }
     return 0;
 }

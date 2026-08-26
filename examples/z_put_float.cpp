@@ -1,10 +1,9 @@
 // z_put_float: connect to a Zenoh router and publish a floating-point value to a key
 // expression. The C++23 equivalent of zenoh-rust's z_put_float.rs.
 //
-// Usage: z_put_float [options]
-//   -e, --connect E  router endpoint (default tcp/127.0.0.1:7447)
-//   -k, --key K      key expression  (default demo/example/zenoh-cpp-put)
-//   -p, --payload P  the double to write (default pi)
+// Usage: z_put_float [OPTIONS]  (run with --help for the full option list)
+//   -k, --key <KEY>          key expression [default: demo/example/zenoh-cpp-put]
+//   -p, --payload <PAYLOAD>  the double to write [default: pi]
 //
 // The reference serializes the f64 with zenoh-ext's `z_serialize`, which writes the
 // raw little-endian bytes of the double (`f64::to_le_bytes()`) — 8 bytes, no tag or
@@ -27,30 +26,19 @@
 
 import zenoh;
 
+#include "zexample.hpp"
+
 namespace {
 
-auto error_name(zenoh::ZError e) -> const char* {
-    switch (e) {
-    case zenoh::ZError::would_block:
-        return "would_block";
-    case zenoh::ZError::connection_closed:
-        return "connection_closed";
-    case zenoh::ZError::io_error:
-        return "io_error";
-    case zenoh::ZError::protocol_error:
-        return "protocol_error";
-    case zenoh::ZError::encode_error:
-        return "encode_error";
-    case zenoh::ZError::bad_endpoint:
-        return "bad_endpoint";
-    case zenoh::ZError::already_subscribed:
-        return "already_subscribed";
-    case zenoh::ZError::already_queryable:
-        return "already_queryable";
-    case zenoh::ZError::query_timeout:
-        return "query_timeout";
-    }
-    return "unknown";
+auto usage(const char* argv0) -> void {
+    std::printf("Usage: %s [OPTIONS]\n\n"
+                "Options:\n"
+                "  -k, --key <KEY>\n"
+                "          The key expression to write to [default: demo/example/zenoh-cpp-put]\n"
+                "  -p, --payload <PAYLOAD>\n"
+                "          The double to write [default: 3.141592653589793]\n",
+                argv0);
+    zexample::print_common_help();
 }
 
 // Serialize a double the way zenoh-ext's `z_serialize` does: 8 little-endian bytes.
@@ -64,33 +52,50 @@ auto serialize_f64(double value) -> std::array<std::byte, sizeof(double)> {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
-    std::string endpoint = "tcp/127.0.0.1:7447";
+    if (zexample::wants_help(argc, argv)) {
+        usage(argv[0]);
+        return 0;
+    }
+    zexample::CommonArgs common;
     std::string key = "demo/example/zenoh-cpp-put";
     double payload = std::numbers::pi;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
-        if ((arg == "-e" || arg == "--connect") && i + 1 < argc) {
-            endpoint = argv[++i];
-        } else if ((arg == "-k" || arg == "--key") && i + 1 < argc) {
-            key = argv[++i];
-        } else if ((arg == "-p" || arg == "--payload") && i + 1 < argc) {
-            payload = std::strtod(argv[++i], nullptr);
+        if (arg == "-k" || arg == "--key") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            key = value;
+        } else if (arg == "-p" || arg == "--payload") {
+            const char* value = zexample::option_value(argc, argv, i);
+            if (value == nullptr) return 1;
+            payload = std::strtod(value, nullptr);
+        } else {
+            switch (zexample::parse_common(argc, argv, i, common)) {
+            case zexample::Arg::consumed:
+                break;
+            case zexample::Arg::fatal:
+                return 1;
+            case zexample::Arg::unrecognized:
+                return zexample::unknown_option(argv[0], arg);
+            }
         }
     }
+    const std::string& endpoint = common.endpoint;
 
     std::printf("Opening session...\n");
     auto session = zenoh::Session::open(endpoint);
     if (!session) {
         std::fprintf(stderr, "open(%s) failed: %s\n", endpoint.c_str(),
-                     error_name(session.error()));
+                     zexample::error_name(session.error()));
         return 1;
     }
 
     std::printf("Putting Float ('%s': '%g')...\n", key.c_str(), payload);
     auto const bytes = serialize_f64(payload);
     if (auto r = session->put(key, std::span<const std::byte>{bytes}); !r) {
-        std::fprintf(stderr, "put('%s') failed: %s\n", key.c_str(), error_name(r.error()));
+        std::fprintf(stderr, "put('%s') failed: %s\n", key.c_str(),
+                     zexample::error_name(r.error()));
         return 1;
     }
 
