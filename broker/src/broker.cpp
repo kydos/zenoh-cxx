@@ -616,20 +616,36 @@ class Face : public std::enable_shared_from_this<Face> {
     // --- data-phase batch/frame decode + dispatch ---
 
     // Returns false to stop the read loop (EOF-equivalent fault); true to keep going.
+    //
+    // A batch holds a *sequence* of transport messages, not one: the reference packs a
+    // KeepAlive (or Close, or a second Frame) into whichever batch is currently
+    // staging -- zenoh-rust's `TransmissionPipeline::push_transport_message` appends
+    // to the batch already carrying a frame. Walking the whole batch is what keeps
+    // `[Frame][Push][KeepAlive]` from being read as a desync (which used to drop the
+    // connection) and `[KeepAlive][Frame][Declare]` from silently discarding the
+    // declaration behind the keepalive.
     [[nodiscard]] auto process_batch(std::span<const std::byte> batch) -> bool {
-        if (batch.empty()) return true;
         ByteReader r{batch};
-        auto pk = r.peek();
-        if (!pk) return false;
-        std::uint8_t const mid = std::to_integer<std::uint8_t>(*pk) & mid_mask;
+        while (r.remaining() > 0) {
+            auto pk = r.peek();
+            if (!pk) return false;
+            std::uint8_t const mid = std::to_integer<std::uint8_t>(*pk) & mid_mask;
 
-        if (mid == FrameHeader::id) {
-            if (!FrameHeader::decode(r)) return false;
-            return dispatch_frame_body(r, batch);
+            if (mid == FrameHeader::id) {
+                if (!FrameHeader::decode(r)) return false;
+                if (!dispatch_frame_body(r, batch)) return false;
+            } else if (mid == KeepAlive::id) {
+                if (!KeepAlive::decode(r)) return false;
+            } else if (mid == Close::id) {
+                return false; // peer closed the session
+            } else {
+                // Unknown *transport* message: no length we can trust, so the rest of
+                // this batch is unreadable. Tolerated for forward-compat -- the byte
+                // stream stays in sync because batches are length-prefixed.
+                return true;
+            }
         }
-        if (mid == KeepAlive::id) return true;
-        if (mid == Close::id) return false; // peer closed the session
-        return true;                        // unknown top-level batch: tolerate (forward-compat)
+        return true;
     }
 
     // `batch` is the whole enclosing batch `r` reads from, passed through so a Push
@@ -656,6 +672,12 @@ class Face : public std::enable_shared_from_this<Face> {
                 return false;
             }
             std::uint8_t const mid = std::to_integer<std::uint8_t>(*pk) & mid_mask;
+            // The frame's body ends at the first id that is not a network message:
+            // that byte is the next *transport* message in the batch. Leave `r` on it
+            // and let `process_batch` resume there -- this mirrors zenoh-rust's
+            // `Frame::read`, which rewinds its reader when a network-message decode
+            // fails, and is exact because the two id spaces are disjoint by design.
+            if (!is_network_mid(mid)) break;
 
             if (mid == Push::id) {
                 if (!on_push(r, batch)) {
@@ -680,7 +702,10 @@ class Face : public std::enable_shared_from_this<Face> {
                     return false;
                 }
             } else {
-                flush_pushes(); // unknown mid-frame message: cannot be length-skipped safely
+                // A network message this broker does not route (OAM): no length to
+                // skip, so the cursor cannot get past it. Fault the face rather than
+                // guess, exactly as before this loop understood transport messages.
+                flush_pushes();
                 return false;
             }
         }

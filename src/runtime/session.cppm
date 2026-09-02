@@ -405,8 +405,14 @@ class Session {
     /// never merely because a shortened wait timed out.
     [[nodiscard]] auto pump_step(std::optional<std::int32_t> max_wait_ms = std::nullopt)
         -> std::expected<void, ZError>;
-    /// Decode + post network messages from the in-progress frame cursor until a
-    /// strand is full or the frame is exhausted.
+    /// Walk the received batch from the cursor, decoding and posting each message,
+    /// until a strand is full or the batch is exhausted.
+    ///
+    /// A batch is a sequence of *transport* messages (Frame, KeepAlive, Close), and a
+    /// Frame's body is the run of *network* messages that follows it — which ends at
+    /// the first id that is not a network one (`is_network_mid`), not at the end of
+    /// the batch. Both kinds are handled by this one loop, so a KeepAlive packed
+    /// after a frame is just the next iteration.
     [[nodiscard]] auto dispatch_cursor() -> std::expected<void, ZError>;
     /// Resolve a received `WireExpr` to an owned key string (via the resmap).
     [[nodiscard]] auto resolve_key(const WireExpr& we) -> std::expected<std::string, ZError>;
@@ -459,8 +465,8 @@ class Session {
     std::size_t pending_off_ = 0;         ///< how much of tx_pending_ is already sent
 
     std::vector<std::byte> rx_buf_{}; ///< current received TCP batch
-    std::size_t rx_pos_ = 0;          ///< dispatch cursor into rx_buf_ (frame body)
-    std::size_t rx_end_ = 0;          ///< end of the in-progress frame body (==pos: none)
+    std::size_t rx_pos_ = 0;          ///< dispatch cursor into rx_buf_
+    std::size_t rx_end_ = 0;          ///< end of the in-progress batch (==pos: none)
     std::unordered_map<std::uint16_t, std::string> resmap_; ///< router keyexpr id -> key
     std::optional<ZError> fault_{};     ///< sticky terminal fault (stream desynced)
     std::uint32_t next_entity_id_ = 0;  ///< monotonic subscriber/queryable entity id

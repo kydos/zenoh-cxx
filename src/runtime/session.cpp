@@ -959,13 +959,36 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
             if (auto it = pending_gets_.find(rf->rid); it != pending_gets_.end())
                 it->second->final = true;
             rx_pos_ = rx_end_ - r.remaining();
+        } else if (mid == FrameHeader::id) {
+            // The next transport message in this batch: a new frame. Its body simply
+            // continues this loop -- nothing in the dispatch below depends on frame
+            // context, and the SN is the transport's business, not the dispatcher's.
+            if (!FrameHeader::decode(r)) {
+                fault_ = ZError::protocol_error;
+                return std::unexpected(*fault_);
+            }
+            rx_pos_ = rx_end_ - r.remaining();
+        } else if (mid == KeepAlive::id) {
+            if (!KeepAlive::decode(r)) {
+                fault_ = ZError::protocol_error;
+                return std::unexpected(*fault_);
+            }
+            rx_pos_ = rx_end_ - r.remaining();
+        } else if (mid == Close::id) {
+            fault_ = ZError::connection_closed; // router closed the session
+            return std::unexpected(*fault_);
         } else {
-            // Unknown network message mid-frame: cannot be length-skipped safely.
+            // Anything else -- an unknown transport message, or a network message a
+            // client never routes (OAM, Request) -- carries no length, so the cursor
+            // cannot be advanced past it and the rest of the batch is unreadable.
+            // Sticky fault, as before: guessing is how a decoder starts inventing
+            // messages out of payload bytes. (zenoh-rust ends the link here too --
+            // `read_messages` fails once a byte decodes as neither kind.)
             fault_ = ZError::protocol_error;
             return std::unexpected(*fault_);
         }
     }
-    rx_pos_ = rx_end_ = 0; // frame fully consumed
+    rx_pos_ = rx_end_ = 0; // batch fully consumed
     return {};
 }
 
@@ -1002,35 +1025,26 @@ auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expecte
     }
     if (*len == 0) return {};
 
-    ByteReader r{std::span(rx_buf_).first(*len)};
-    auto pk = r.peek();
-    if (!pk) {
-        fault_ = ZError::protocol_error;
-        return std::unexpected(*fault_);
-    }
-    std::uint8_t const mid = std::to_integer<std::uint8_t>(*pk) & mid_mask;
-    if (mid == FrameHeader::id) {
-        if (!FrameHeader::decode(r)) {
-            fault_ = ZError::protocol_error;
-            return std::unexpected(*fault_);
-        }
-        rx_pos_ = *len - r.remaining(); // body starts just after the frame header
-        rx_end_ = *len;
-        return dispatch_cursor();
-    }
-    if (mid == KeepAlive::id) return {}; // router keepalive — ignore
-    if (mid == Close::id) {              // router closed the session
-        fault_ = ZError::connection_closed;
-        return std::unexpected(*fault_);
-    }
-    return {}; // unknown top-level batch: tolerate for forward-compat
+    // A batch is a *sequence* of transport messages, not one message: the reference
+    // packs a KeepAlive (or a Close, or a second Frame) into whatever batch is
+    // currently staging -- see zenoh-rust's `TransmissionPipeline::push_transport_
+    // message`. Handing the whole batch to one cursor loop is what keeps
+    // `[Frame][Push][KeepAlive]` from looking like a desync and `[KeepAlive][Frame]`
+    // from silently discarding the frame behind it.
+    rx_pos_ = 0;
+    rx_end_ = *len;
+    return dispatch_cursor();
 }
 
 auto Session::sub_recv() -> std::expected<Sample, ZError> {
     for (;;) {
         if (!sub_) return std::unexpected(ZError::connection_closed);
         if (auto s = sub_->strand.pop()) return std::move(*s);
-        if (auto r = pump_step(); !r) return std::unexpected(r.error());
+        // A pump that ends in an error may still have posted messages from the same
+        // batch before hitting it -- a graceful Close, for instance, is routinely
+        // packed in behind a frame. Hand those to the caller first; the error is
+        // sticky, so it is still waiting once the queue drains.
+        if (auto r = pump_step(); !r && sub_->strand.empty()) return std::unexpected(r.error());
     }
 }
 
@@ -1040,7 +1054,11 @@ auto Session::qbl_recv() -> std::expected<IncomingQuery, ZError> {
         if (auto pq = qbl_->strand.pop())
             return IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
                                  std::move(pq->payload));
-        if (auto r = pump_step(); !r) return std::unexpected(r.error());
+        // A pump that ends in an error may still have posted messages from the same
+        // batch before hitting it -- a graceful Close, for instance, is routinely
+        // packed in behind a frame. Hand those to the caller first; the error is
+        // sticky, so it is still waiting once the queue drains.
+        if (auto r = pump_step(); !r && qbl_->strand.empty()) return std::unexpected(r.error());
     }
 }
 

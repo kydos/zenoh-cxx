@@ -498,3 +498,120 @@ TEST("an idle subscriber emits a KeepAlive within the lease") {
     router.join();
     CHECK(saw_keepalive.load());
 }
+
+// --- batch framing: a TCP batch is a *sequence* of transport messages ---
+//
+// The reference packs a KeepAlive (or a Close, or a second Frame) into whichever
+// batch is currently staging -- zenoh-rust's `TransmissionPipeline::push_transport_
+// message` appends to the batch that already carries a frame. Before these cases the
+// session read exactly one transport message per batch: a trailing KeepAlive was
+// mistaken for a network message and set the sticky protocol fault (killing the
+// session for good), and a *leading* one made the frame behind it disappear.
+
+TEST("a KeepAlive packed after a frame does not fault the session") {
+    SubRouter router([](int fd) {
+        auto body = build_frame(100, [](ByteWriter& w) { put_msg(w, "demo/a", "one"); });
+        auto const ka = encode_body(KeepAlive{});
+        body.insert(body.end(), ka.begin(), ka.end());
+        send_batch(fd, body);
+        // A second, ordinary batch: proves the session is still usable afterwards
+        // rather than merely having survived the first one.
+        send_batch(fd, build_frame(101, [](ByteWriter& w) { put_msg(w, "demo/b", "two"); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+
+    auto a = sub->recv();
+    CHECK(a.has_value());
+    if (a) CHECK(a->key_expr() == "demo/a" && str(a->payload()) == "one");
+    auto b = sub->recv();
+    CHECK(b.has_value());
+    if (b) CHECK(b->key_expr() == "demo/b" && str(b->payload()) == "two");
+    sess->close();
+    router.join();
+}
+
+TEST("a KeepAlive packed before a frame does not discard the frame") {
+    SubRouter router([](int fd) {
+        auto body = encode_body(KeepAlive{});
+        auto const frame = build_frame(100, [](ByteWriter& w) { put_msg(w, "demo/a", "one"); });
+        body.insert(body.end(), frame.begin(), frame.end());
+        send_batch(fd, body);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+
+    auto a = sub->recv();
+    CHECK(a.has_value());
+    if (a) CHECK(a->key_expr() == "demo/a" && str(a->payload()) == "one");
+    sess->close();
+    router.join();
+}
+
+TEST("two frames in one batch both deliver") {
+    SubRouter router([](int fd) {
+        auto body = build_frame(100, [](ByteWriter& w) { put_msg(w, "demo/a", "one"); });
+        auto const second = build_frame(101, [](ByteWriter& w) { put_msg(w, "demo/b", "two"); });
+        body.insert(body.end(), second.begin(), second.end());
+        send_batch(fd, body);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+
+    auto a = sub->recv();
+    CHECK(a.has_value());
+    if (a) CHECK(a->key_expr() == "demo/a");
+    auto b = sub->recv();
+    CHECK(b.has_value());
+    if (b) CHECK(b->key_expr() == "demo/b");
+    sess->close();
+    router.join();
+}
+
+TEST("a Close packed after a frame is honoured, and the frame still delivers") {
+    SubRouter router([](int fd) {
+        auto body = build_frame(100, [](ByteWriter& w) { put_msg(w, "demo/a", "one"); });
+        Close close{};
+        auto const c = encode_body(close);
+        body.insert(body.end(), c.begin(), c.end());
+        send_batch(fd, body);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+
+    auto a = sub->recv();
+    CHECK(a.has_value());
+    if (a) CHECK(a->key_expr() == "demo/a");
+    auto b = sub->recv(); // the Close that rode along in the same batch
+    CHECK(!b.has_value() && b.error() == ZError::connection_closed);
+    sess->close();
+    router.join();
+}

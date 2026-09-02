@@ -35,6 +35,25 @@ enum class Reliability : std::uint8_t { best_effort = 0, reliable = 1 };
 /// Mask for the 5-bit message id in a header byte (bits 4:0); bits 7:5 are flags.
 inline constexpr std::uint8_t mid_mask = 0x1f;
 
+/// True when `mid` (already masked with `mid_mask`) names a *network* message.
+///
+/// The protocol keeps the network ids (0x19..0x1f: Interest, ResponseFinal, Response,
+/// Request, Push, Declare, OAM) disjoint from the transport ids (0x00..0x07: OAM,
+/// Init, Open, Close, KeepAlive, Frame, Fragment, Join) precisely so the two can be
+/// told apart by inspection -- the reference implementation marks the constraint with
+/// a "WARNING: it's crucial that these IDs do NOT collide" on both id tables.
+///
+/// That is what makes a batch decodable: a TCP batch is a *sequence* of transport
+/// messages, and a Frame's body runs to the first byte that is not a network message,
+/// not to the end of the batch. A receiver walks the batch, and when it is inside a
+/// frame it ends that frame the moment this returns false, then resumes reading
+/// transport messages from the same byte. (zenoh-rust reaches the same point from the
+/// other side: `Frame::read` tries to decode a network message and rewinds the reader
+/// when it fails.) See `docs/RUNTIME.md` and `docs/BROKER.md`.
+[[nodiscard]] inline constexpr auto is_network_mid(std::uint8_t mid) noexcept -> bool {
+    return mid >= 0x19 && mid <= 0x1f;
+}
+
 /// Query reply-consolidation strategy (1 wire byte when present).
 enum class ConsolidationMode : std::uint8_t { automatic = 0, none = 1, monotonic = 2, latest = 3 };
 

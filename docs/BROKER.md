@@ -156,6 +156,17 @@ clang+libstdc++ toolchain already set up for named modules.)
 
 ## Routing semantics
 
+- **Batch framing**: a TCP batch holds a *sequence* of transport messages, so
+  `Face::process_batch` walks it to the end rather than dispatching on its first
+  message, and `dispatch_frame_body` stops at the first id that is not a network
+  message (`is_network_mid`, network `0x19..0x1f` vs transport `0x00..0x07` — the two
+  spaces are disjoint by design). This is not a corner case: zenoh-rust's
+  `TransmissionPipeline::push_transport_message` appends a `KeepAlive`/`Close` to
+  whichever batch is currently staging, including one that already carries a frame,
+  so `[Frame][Push][KeepAlive]` is routine traffic. Handling only the first message
+  used to make that shape fault the face — i.e. the broker disconnected conforming
+  clients — and made `[KeepAlive][Frame][Declare]` silently drop the declaration. An
+  id that can be neither routed nor length-skipped still faults the face.
 - **Push**: the inbound `wire_expr` is resolved to an owned key (supporting both
   `scope == 0` literal and `scope != 0` per-face `resmap_` lookup — a `Face` tracks
   its own peer's `DeclareKeyExpr`/`UndeclareKeyExpr` traffic, the same shape as the

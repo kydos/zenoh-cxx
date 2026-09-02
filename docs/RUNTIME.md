@@ -47,6 +47,19 @@ that follow (per-batch, max 65535). A published sample is one batch:
 [u16 LE len] [FrameHeader 0x05] [Push 0x1d | M | N] [WireExpr] [Put 0x01] [payload]
 ```
 
+A batch is a **sequence of transport messages**, not a single one, and this matters
+on receive: the reference appends a `KeepAlive` (or a `Close`, or a fresh
+`FrameHeader`) to whichever batch is currently staging — including one that already
+carries a frame — so `[Frame][Push][KeepAlive]` and `[KeepAlive][Frame][Push]` are
+both ordinary traffic from a real `zenohd`. A frame's body therefore ends at the
+first id that is **not** a network message rather than at the end of the batch. The
+two id spaces are disjoint by design for exactly this purpose — network `0x19..0x1f`,
+transport `0x00..0x07` — which is what `zenoh::is_network_mid` tests; zenoh-rust
+reaches the same point from the other side, by decoding a network message and
+rewinding its reader when that fails. `Session::dispatch_cursor` walks both kinds in
+one loop, so an id it cannot length-skip is still a sticky `protocol_error`, but a
+transport message riding behind a frame is not.
+
 - `FrameHeader`: reliable (R flag set), per-channel SN starting at `initial_sn` and
   incrementing by 1 (mod the U32 resolution mask `0x0FFFFFFF`).
 - `Push`: literal `WireExpr{scope:0, mapping:Sender, suffix:key}` — a basic put needs

@@ -1462,3 +1462,143 @@ TEST("Two concurrent get()s on one session never cross-deliver each other's "
     t1.join();
     t2.join();
 }
+
+// --- batch framing: a TCP batch is a *sequence* of transport messages ---
+//
+// zenoh-rust's TransmissionPipeline::push_transport_message appends a KeepAlive (or
+// Close, or a fresh Frame header when reliability/priority changes) to whichever
+// batch is currently staging -- including one that already carries a frame. The
+// broker used to dispatch on the batch's *first* message only: a trailing KeepAlive
+// was then read as a network message, hit dispatch_frame_body's unknown-mid branch
+// and **dropped the connection**, while a leading one made everything behind it
+// vanish silently. These cases assert on counters, not on timing.
+
+// One FrameHeader + one Declare(DeclareSubscriber) on `key`, as raw bytes.
+[[nodiscard]] auto frame_declare_sub(std::string_view key, std::uint32_t sn, std::uint32_t id)
+    -> std::vector<std::byte> {
+    FrameHeader fh{};
+    fh.reliability = Reliability::reliable;
+    fh.sn = sn;
+
+    Declare dec{};
+    DeclareSubscriber ds{};
+    ds.id = id;
+    ds.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key};
+    dec.body = DeclareBody{.body = ds};
+
+    std::vector<std::byte> buf(256 + key.size());
+    ByteWriter w{buf};
+    if (!fh.encode(w) || !dec.encode(w)) return {};
+    return {buf.data(), buf.data() + w.written()};
+}
+
+TEST("a KeepAlive packed after a Frame neither drops the face nor loses the frame") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    auto c = RawClient::connect(tb.broker->port());
+    CHECK(c.has_value());
+    if (!c) return;
+    CHECK(wait_until([&] { return on_strand(tables, [&] { return tables.face_count(); }) == 1; }));
+
+    auto body = frame_declare_sub("probe/ka-after", 0, 1);
+    auto const ka = RawClient::encode_body(KeepAlive{});
+    body.insert(body.end(), ka.begin(), ka.end());
+    CHECK(c->send_batch(body));
+
+    // The declaration behind the frame took effect ...
+    CHECK(wait_until([&] {
+        return on_strand(tables, [&] { return tables.resource_face_count("probe/ka-after"); }) == 1;
+    }));
+    // ... and the face survived the trailing KeepAlive (it used to be dropped here).
+    CHECK(on_strand(tables, [&] { return tables.face_count(); }) == 1);
+}
+
+TEST("a KeepAlive packed before a Frame does not discard the frame") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    auto c = RawClient::connect(tb.broker->port());
+    CHECK(c.has_value());
+    if (!c) return;
+    CHECK(wait_until([&] { return on_strand(tables, [&] { return tables.face_count(); }) == 1; }));
+
+    auto body = RawClient::encode_body(KeepAlive{});
+    auto const frame = frame_declare_sub("probe/ka-before", 0, 1);
+    body.insert(body.end(), frame.begin(), frame.end());
+    CHECK(c->send_batch(body));
+
+    CHECK(wait_until([&] {
+        return on_strand(tables, [&] { return tables.resource_face_count("probe/ka-before"); }) ==
+               1;
+    }));
+    CHECK(on_strand(tables, [&] { return tables.face_count(); }) == 1);
+}
+
+TEST("two Frames in one batch both apply") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    auto c = RawClient::connect(tb.broker->port());
+    CHECK(c.has_value());
+    if (!c) return;
+    CHECK(wait_until([&] { return on_strand(tables, [&] { return tables.face_count(); }) == 1; }));
+
+    auto body = frame_declare_sub("probe/f1", 0, 1);
+    auto const second = frame_declare_sub("probe/f2", 1, 2);
+    body.insert(body.end(), second.begin(), second.end());
+    CHECK(c->send_batch(body));
+
+    CHECK(wait_until([&] {
+        return on_strand(tables, [&] { return tables.resource_face_count("probe/f1"); }) == 1 &&
+               on_strand(tables, [&] { return tables.resource_face_count("probe/f2"); }) == 1;
+    }));
+    CHECK(on_strand(tables, [&] { return tables.face_count(); }) == 1);
+}
+
+TEST("a Push and a KeepAlive in one batch still routes the Push") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    using namespace zenoh;
+    auto sub_sess = Session::open(tb.endpoint());
+    CHECK(sub_sess.has_value());
+    if (!sub_sess) return;
+    auto sub = sub_sess->declare_subscriber("probe/push/**");
+    CHECK(sub.has_value());
+    if (!sub) return;
+    CHECK(wait_until([&] {
+        return on_strand(tb.broker->tables, [&] {
+                   return tb.broker->tables.resource_face_count("probe/push/**");
+               }) == 1;
+    }));
+
+    auto pub = RawClient::connect(tb.broker->port());
+    CHECK(pub.has_value());
+    if (!pub) return;
+
+    FrameHeader fh{};
+    fh.reliability = Reliability::reliable;
+    fh.sn = 0;
+    Push push{};
+    push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = "probe/push/a"};
+    Put put{};
+    put.payload = bytes("payload");
+    push.payload = PushBody{.body = std::move(put)};
+
+    std::vector<std::byte> buf(512);
+    ByteWriter w{buf};
+    CHECK(fh.encode(w).has_value());
+    CHECK(push.encode(w).has_value());
+    std::vector<std::byte> body(buf.data(), buf.data() + w.written());
+    auto const ka = RawClient::encode_body(KeepAlive{});
+    body.insert(body.end(), ka.begin(), ka.end());
+    CHECK(pub->send_batch(body));
+
+    auto s = sub->recv();
+    CHECK(s.has_value());
+    if (s) CHECK(s->key_expr() == "probe/push/a" && str(s->payload()) == "payload");
+}
