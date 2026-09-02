@@ -1,7 +1,7 @@
 # zenoh
 
-[![CI](https://github.com/kydos/zenoh/actions/workflows/ci.yml/badge.svg)](https://github.com/kydos/zenoh/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/kydos/zenoh/branch/main/graph/badge.svg)](https://codecov.io/gh/kydos/zenoh)
+[![CI](https://github.com/kydos/zenoh-cxx/actions/workflows/ci.yml/badge.svg)](https://github.com/kydos/zenoh-cxx/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/kydos/zenoh-cxx/branch/main/graph/badge.svg)](https://codecov.io/gh/kydos/zenoh-cxx)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![code style: clang-format](https://img.shields.io/badge/code%20style-clang--format-blue.svg)](.clang-format)

@@ -36,6 +36,6 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          slug: kydos/zenoh
+          slug: kydos/zenoh-cxx
           files: build/linux-coverage/coverage.lcov
           fail_ci_if_error: false
