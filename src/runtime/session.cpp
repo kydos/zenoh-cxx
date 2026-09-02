@@ -1098,16 +1098,18 @@ auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expecte
         return {};
     }
 
-    auto len = recv_batch_step();
-    if (!len) {
-        fault_ = len.error();
+    auto step = recv_batch_step();
+    if (!step) {
+        fault_ = step.error();
         return std::unexpected(*fault_);
     }
+    auto const& arrived = *step;
     // Still arriving: the progress is held on the session, so returning here is safe
     // and lets the caller re-check its own deadline (and us send a keepalive on the
     // next idle wait) instead of blocking inside a half-read batch.
-    if (!*len) return {};
-    if (**len == 0) return {};
+    if (!arrived.has_value()) return {};
+    std::size_t const len = *arrived;
+    if (len == 0) return {};
 
     // A batch is a *sequence* of transport messages, not one message: the reference
     // packs a KeepAlive (or a Close, or a second Frame) into whatever batch is
@@ -1116,7 +1118,7 @@ auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expecte
     // `[Frame][Push][KeepAlive]` from looking like a desync and `[KeepAlive][Frame]`
     // from silently discarding the frame behind it.
     rx_pos_ = 0;
-    rx_end_ = **len;
+    rx_end_ = len;
     if (auto progressed = dispatch_cursor(); !progressed) {
         return std::unexpected(progressed.error());
     }
