@@ -1602,3 +1602,89 @@ TEST("a Push and a KeepAlive in one batch still routes the Push") {
     CHECK(s.has_value());
     if (s) CHECK(s->key_expr() == "probe/push/a" && str(s->payload()) == "payload");
 }
+
+// The id->key map a face keeps for its peer's declarations is capped at
+// `max_decl_ids` *entries*, which silently assumed the binding is one-to-one. It is
+// not: re-declaring one id with a different key overwrote the entry while
+// ResourceTable gained a brand-new resource, so the old key became unreachable by any
+// undeclare the client could send. One client, one id and N keys was an unbounded
+// leak -- and each declare also invalidates the match memo, so every later publish
+// rescanned all N resources on the single global routing strand.
+TEST("rebinding one declaration id to many keys does not accumulate resources") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    auto c = RawClient::connect(tb.broker->port());
+    CHECK(c.has_value());
+    if (!c) return;
+    CHECK(wait_until([&] { return on_strand(tables, [&] { return tables.face_count(); }) == 1; }));
+
+    constexpr int declares = 300;
+    for (int i = 0; i < declares; ++i) {
+        auto const key = "probe/rebind/" + std::to_string(i);
+        CHECK(c->send_batch(frame_declare_sub(key, static_cast<std::uint32_t>(i), /*id=*/1)));
+    }
+
+    // The last key declared is the one that is live ...
+    auto const last = "probe/rebind/" + std::to_string(declares - 1);
+    CHECK(wait_until(
+        [&] { return on_strand(tables, [&] { return tables.resource_face_count(last); }) == 1; }));
+    // ... and it is the *only* one: each rebinding undeclared its predecessor.
+    CHECK(on_strand(tables, [&] { return tables.resource_count(); }) == 1);
+}
+
+// Nothing used to bound the query fan-out bookkeeping. A queryable is under no
+// obligation to answer, and until it does -- or its face disconnects -- every request
+// keeps a `fanout_remaining_` entry plus a `pending_queries_` entry per target, so a
+// client that declares a queryable, never replies, and then asks with fresh rids grew
+// both maps for as long as it cared to. (docs/BROKER.md claimed disconnect-bounded
+// cleanup meant "not a broker-side leak"; that only holds if the peer disconnects.)
+// The budget now sheds over-limit requests with an immediate ResponseFinal, which the
+// requester sees as a get() with no replies rather than a hang.
+TEST("the broker bounds in-flight query fan-out from one face") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    using namespace zenoh;
+    // A queryable that never answers.
+    auto qbl_sess = Session::open(tb.endpoint());
+    CHECK(qbl_sess.has_value());
+    if (!qbl_sess) return;
+    auto qbl = qbl_sess->declare_queryable("probe/fanout/**");
+    CHECK(qbl.has_value());
+    if (!qbl) return;
+    CHECK(wait_until([&] {
+        return on_strand(tables, [&] { return tables.resource_face_count("probe/fanout/**"); }) ==
+               1;
+    }));
+
+    // A requester that issues distinct rids and never waits for a reply. Getters are
+    // kept alive so nothing is cancelled client-side; the point is the broker's maps.
+    auto req_sess = Session::open(tb.endpoint());
+    CHECK(req_sess.has_value());
+    if (!req_sess) return;
+
+    constexpr int requests = 600;
+    std::vector<Getter> getters;
+    getters.reserve(requests);
+    for (int i = 0; i < requests; ++i) {
+        auto g = req_sess->get("probe/fanout/x", "", GetOptions{.timeout_ms = 60000});
+        if (!g) break;
+        getters.push_back(std::move(*g));
+    }
+
+    // Whatever the broker accepted, it is bounded -- and bounded by the per-face
+    // budget, not merely by however many the client happened to send.
+    CHECK(wait_until([&] { return on_strand(tables, [&] { return tables.fanout_count(); }) > 0; }));
+    auto const fanouts = on_strand(tables, [&] { return tables.fanout_count(); });
+    CHECK(fanouts <= Tables::max_pending_fanouts_per_face);
+    CHECK(fanouts <= Tables::max_pending_fanouts);
+
+    // And the budget is returned when the requester goes away.
+    req_sess->close();
+    getters.clear();
+    CHECK(
+        wait_until([&] { return on_strand(tables, [&] { return tables.fanout_count(); }) == 0; }));
+}

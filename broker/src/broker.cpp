@@ -108,6 +108,14 @@ constexpr std::size_t max_push_block_bytes = std::size_t{256} * 1024;
 constexpr std::size_t max_key_len = 0xffff;      ///< mirrors Session's resolve_key bound
 constexpr std::size_t max_resmap_entries = 4096; ///< mirrors Session's resmap_ bound
 constexpr std::size_t max_decl_ids = 4096;       ///< cap on sub_ids_/qbl_ids_, same rationale
+/// Cap on simultaneously-dialled peer endpoints.
+///
+/// Membership allows 1024 members x 8 endpoints, and every endpoint learned by gossip
+/// spawns a connector that retries forever -- so an untrusted (or merely confused)
+/// gossip source could otherwise leave this broker permanently dialling thousands of
+/// attacker-chosen host:port pairs, and `Membership` has no removal by design. A real
+/// clique dials one endpoint per peer; this leaves two orders of magnitude of room.
+constexpr std::size_t max_dialing = 256;
 // Bound on Tables::pending_routing_jobs() before a Face pauses its own reads --
 // see Face::throttle_if_backlogged for the rationale (defensive hardening against
 // asio::post's own lack of a queue bound, not a fix for a confirmed leak: a single
@@ -966,6 +974,28 @@ class Face : public std::enable_shared_from_this<Face> {
     // an id lookup, and a client that chooses to send it is only ever able to affect
     // its own declarations. Erasing the id entry regardless keeps `ids` from
     // accumulating stale keys on that path.
+    /// Remember `key` as the current binding of declaration id `decl_id`, undeclaring
+    /// whatever that id was bound to before.
+    ///
+    /// The id->key map is capped at `max_decl_ids` *entries*, which silently assumed
+    /// the binding was one-to-one. It is not: re-declaring the same id with a
+    /// different key overwrote the entry here while `ResourceTable` gained a whole new
+    /// resource, leaving the old key with no id any undeclare could name. One client,
+    /// one id and N keys was therefore an unbounded resource-table leak -- and worse
+    /// than memory, since every declare invalidates the match memo and each publish
+    /// then rescans every resource on the single routing strand.
+    auto rebind_decl_id(std::unordered_map<std::uint32_t, std::string>& ids, std::uint32_t decl_id,
+                        const std::string& key, void (Tables::*undeclare)(FaceId, std::string_view))
+        -> void {
+        auto const prev = ids.find(decl_id);
+        if (prev != ids.end() && prev->second != key) {
+            post_to_tables([id = id_, old = prev->second, undeclare](Tables& tables) {
+                (tables.*undeclare)(id, old);
+            });
+        }
+        ids[decl_id] = key;
+    }
+
     [[nodiscard]] auto undeclared_key(const std::optional<WireExpr>& we,
                                       std::unordered_map<std::uint32_t, std::string>& ids,
                                       std::uint32_t decl_id) -> std::optional<std::string> {
@@ -1000,7 +1030,8 @@ class Face : public std::enable_shared_from_this<Face> {
                 // encoders), so remembering them by id would be meaningless -- and
                 // would let every one of them collide on the single slot 0. Their
                 // undeclares carry the key expression instead; see below.
-                if (kind_ == FaceKind::client) sub_ids_[ds->id] = *key;
+                if (kind_ == FaceKind::client)
+                    rebind_decl_id(sub_ids_, ds->id, *key, &Tables::on_undeclare_subscriber);
                 post_to_tables([id = id_, key = *key](Tables& tables) {
                     tables.on_declare_subscriber(id, key);
                 });
@@ -1014,7 +1045,8 @@ class Face : public std::enable_shared_from_this<Face> {
         } else if (auto const* dq = std::get_if<DeclareQueryable>(&d->body.body)) {
             auto key = resolve_key(dq->wire_expr);
             if (key && (qbl_ids_.size() < max_decl_ids || qbl_ids_.contains(dq->id))) {
-                if (kind_ == FaceKind::client) qbl_ids_[dq->id] = *key;
+                if (kind_ == FaceKind::client)
+                    rebind_decl_id(qbl_ids_, dq->id, *key, &Tables::on_undeclare_queryable);
                 QueryableInfo const qinfo = dq->qinfo;
                 post_to_tables([id = id_, key = *key, qinfo](Tables& tables) {
                     tables.on_declare_queryable(id, key, qinfo);
@@ -1466,6 +1498,12 @@ auto Broker::run(unsigned num_threads) -> void {
     // the same peer is never connected twice from this side. The set is touched only
     // on `accept_strand`, so it needs no lock of its own.
     auto spawn_connector = [this, &ioc](std::string endpoint) {
+        // Rejected here rather than inside the coroutine: `peer_connector` returns
+        // immediately on an unparseable endpoint, which used to leave the endpoint in
+        // `dialing` forever -- so a peer that later gossiped a *valid* address for the
+        // same string could never be dialled.
+        if (!split_endpoint(endpoint)) return;
+        if (impl_->dialing.size() >= max_dialing) return;    // see max_dialing
         if (!impl_->dialing.insert(endpoint).second) return; // already have a connector
         asio::strand<asio::any_io_executor> strand{ioc.get_executor()};
         asio::co_spawn(strand,

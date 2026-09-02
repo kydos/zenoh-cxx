@@ -204,6 +204,17 @@ class SubRouter {
         // Half-close (FIN after the pushed data) so the client reads all samples before
         // observing EOF, without an abrupt close() risking an RST.
         ::shutdown(fd, SHUT_WR);
+        // Then drain whatever the client still sends (its Close, a keepalive) before
+        // close(). Closing a socket that still has unread data in its receive queue
+        // makes the kernel send an RST instead of finishing the FIN exchange, and an
+        // RST lets the peer's stack discard data it has received but not yet handed to
+        // the application -- i.e. samples this router already sent. That was a rare
+        // whole-suite flake, only ever seen with the machine under load.
+        timeval drain_tv{.tv_sec = 0, .tv_usec = 200000};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &drain_tv, sizeof(drain_tv));
+        std::array<std::byte, 512> sink{};
+        while (::recv(fd, sink.data(), sink.size(), 0) > 0) {
+        }
         ::close(fd);
     }
 

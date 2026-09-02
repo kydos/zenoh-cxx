@@ -452,6 +452,20 @@ class Tables {
             std::count_if(faces_.begin(), faces_.end(),
                           [](const auto& kv) { return kv.second.kind == FaceKind::router; }));
     }
+    /// Ceiling on `fanout_remaining_`, i.e. on queries in flight across the whole
+    /// broker, and on how much of that budget any one face may hold.
+    ///
+    /// Nothing else bounds these maps. A queryable is under no obligation to answer,
+    /// and until it does — or its face disconnects — each unanswered request keeps one
+    /// `fanout_remaining_` entry plus one `pending_queries_` entry per target. A client
+    /// that declares a queryable on `**`, never replies, and then issues requests with
+    /// fresh rids grows both without limit; `remove_face` is the only thing that ever
+    /// reclaims them, which makes the real bound "until the peer chooses to
+    /// disconnect". A request past the budget is answered with an immediate
+    /// `ResponseFinal`, so its `get()` terminates with no replies rather than hanging.
+    static constexpr std::size_t max_pending_fanouts = 65536;
+    static constexpr std::size_t max_pending_fanouts_per_face = 8192;
+
     [[nodiscard]] auto pending_query_count() const noexcept -> std::size_t {
         assert(strand_.running_in_this_thread());
         return pending_queries_.size();
@@ -559,6 +573,12 @@ class Tables {
     std::uint32_t next_local_rid_ = 0; ///< monotonic, shared across all forwarded Requests
     std::map<QueryKey, QueryKey> pending_queries_; ///< (answering face,local rid) -> origin
     std::map<QueryKey, int> fanout_remaining_;     ///< origin -> outstanding answer count
+    /// How much of that budget each requesting face currently holds. Kept in step
+    /// with `fanout_remaining_` by `release_fanout`.
+    std::unordered_map<FaceId, std::size_t> face_fanouts_;
+    /// Erase one fan-out entry, returning `fanout_remaining_`'s next iterator, and
+    /// give its slot back to the requesting face's budget.
+    auto release_fanout(std::map<QueryKey, int>::iterator it) -> std::map<QueryKey, int>::iterator;
     /// Per-face delivery accumulator for the batch currently being routed. A member
     /// (rather than a local) purely to reuse its allocation across calls: only the
     /// first `used` slots of any given `on_push_batch` are live, and nothing outlives

@@ -244,9 +244,17 @@ clang+libstdc++ toolchain already set up for named modules.)
   source info/attachment — is carried over). The `scope == 0` path has no such gap:
   it copies the received bytes verbatim.
 - **No broker-side query timeout enforcement.** `GetOptions::timeout_ms` is enforced
-  entirely client-side (`Getter::recv()`'s pump loop) — sufficient for correctness on
-  its own; a slow queryable just means a slow reply, not a broker-side leak (the
-  fan-in bookkeeping is bounded by `remove_face`, not by a timer).
+  entirely client-side (`Getter::recv()`'s pump loop), so a query the queryable never
+  answers keeps its fan-in bookkeeping (`pending_queries_` + `fanout_remaining_`)
+  until that face disconnects. This section used to call that "not a broker-side
+  leak" because `remove_face` reclaims it — but that makes the bound "whenever the
+  peer feels like disconnecting", which is not a bound at all against a client that
+  declares a queryable, never replies, and keeps asking with fresh rids. The maps are
+  therefore capped (`Tables::max_pending_fanouts`, and
+  `max_pending_fanouts_per_face` so one face cannot spend everyone's budget); a
+  request past the cap is answered immediately with a `ResponseFinal`, i.e. its
+  `get()` returns no replies instead of hanging. A steady-timer expiry keyed on
+  `Request::timeout` remains the proper fix and is not implemented.
 - **No client-level scouting or peer-to-peer.** Every *client* face is a direct
   connection to one broker. Broker-to-broker federation exists (`docs/CLIQUE.md`) but
   assumes a full mesh: there is no multi-hop routing and no link-state, so a dropped

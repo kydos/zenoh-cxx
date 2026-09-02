@@ -1648,12 +1648,22 @@ TEST("a router face torn down while congested leaves the congested count at zero
         runner.join();
         return;
     }
+    // try_put, not put: once the peer's queue crosses the watermark the broker
+    // read-throttles its publishers, and a blocking put would then sit in the kernel
+    // instead of driving the queue up. Loop against a deadline rather than a fixed
+    // count so a busy machine cannot turn "slower" into "failed".
     std::vector<std::byte> const payload(60000, std::byte{0xab});
     auto& counter = tables.congested_router_faces();
-    for (int i = 0; i < 400 && counter.load(std::memory_order_relaxed) == 0; ++i) {
-        if (!pub->put("wedge/x", payload)) break;
+    auto const fill_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (counter.load(std::memory_order_relaxed) == 0 &&
+           std::chrono::steady_clock::now() < fill_deadline) {
+        auto const r = pub->try_put("wedge/x", payload);
+        if (!r) {
+            if (r.error() != zenoh::ZError::would_block) break;        // link gone
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // socket full; let it drain
+        }
     }
-    CHECK(wait_until([&] { return counter.load(std::memory_order_relaxed) == 1; }));
+    CHECK(counter.load(std::memory_order_relaxed) == 1);
 
     // Tear the wedged face down mid-flight and let the deliveries already posted to
     // its strand land afterwards.

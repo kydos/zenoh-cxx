@@ -493,7 +493,7 @@ auto Tables::remove_face(FaceId id) -> void {
             auto fit = fanout_remaining_.find({origin_face, origin_rid});
             if (fit != fanout_remaining_.end()) {
                 if (--fit->second <= 0) {
-                    fanout_remaining_.erase(fit);
+                    release_fanout(fit);
                     if (auto oit = faces_.find(origin_face); oit != faces_.end()) {
                         deliver_one(oit->second, encode_response_final(origin_rid, qos_block()),
                                     /*block=*/true);
@@ -511,11 +511,12 @@ auto Tables::remove_face(FaceId id) -> void {
     // defensively in case one was left keyed by this now-gone face.
     for (auto it = fanout_remaining_.begin(); it != fanout_remaining_.end();) {
         if (it->first.first == id) {
-            it = fanout_remaining_.erase(it);
+            it = release_fanout(it);
         } else {
             ++it;
         }
     }
+    face_fanouts_.erase(id); // the face is gone; so is its share of the budget
 }
 
 // The four declaration handlers share one shape: canonicalize once (so the key used
@@ -691,6 +692,18 @@ auto Tables::on_request(FaceId from, RoutedRequest msg) -> void {
         return;
     }
 
+    // Refuse to register more in-flight queries than the budget allows -- globally,
+    // and per face so one requester cannot consume everyone else's share. Answering
+    // immediately with a ResponseFinal terminates the caller's get() with no replies,
+    // which is the same thing it would see if no queryable matched; the alternative
+    // is a map that grows for as long as a peer keeps asking (see the constants).
+    if (fanout_remaining_.size() >= max_pending_fanouts ||
+        face_fanouts_[from] >= max_pending_fanouts_per_face) {
+        deliver_one(origin_it->second, encode_response_final(msg.origin_rid, qos_block()),
+                    /*block=*/true);
+        return;
+    }
+
     int fanned_out = 0;
     for (auto const& fc : candidates) {
         auto fit = faces_.find(fc.face_id);
@@ -718,6 +731,7 @@ auto Tables::on_request(FaceId from, RoutedRequest msg) -> void {
         return;
     }
     fanout_remaining_[origin] = fanned_out;
+    ++face_fanouts_[from];
 }
 
 auto Tables::on_response(FaceId from, RoutedResponse msg) -> void {
@@ -734,6 +748,19 @@ auto Tables::on_response(FaceId from, RoutedResponse msg) -> void {
     // ResponseFinal.
 }
 
+auto Tables::release_fanout(std::map<QueryKey, int>::iterator it)
+    -> std::map<QueryKey, int>::iterator {
+    assert(strand_.running_in_this_thread());
+    if (auto fc = face_fanouts_.find(it->first.first); fc != face_fanouts_.end()) {
+        if (fc->second <= 1) {
+            face_fanouts_.erase(fc);
+        } else {
+            --fc->second;
+        }
+    }
+    return fanout_remaining_.erase(it);
+}
+
 auto Tables::on_response_final(FaceId from, std::uint32_t local_rid) -> void {
     assert(strand_.running_in_this_thread());
     auto it = pending_queries_.find({from, local_rid});
@@ -744,7 +771,7 @@ auto Tables::on_response_final(FaceId from, std::uint32_t local_rid) -> void {
     auto fit = fanout_remaining_.find(origin);
     if (fit == fanout_remaining_.end()) return;
     if (--fit->second > 0) return;
-    fanout_remaining_.erase(fit);
+    release_fanout(fit);
 
     if (auto oit = faces_.find(origin.first); oit != faces_.end()) {
         deliver_one(oit->second, encode_response_final(origin.second, qos_block()),
