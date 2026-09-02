@@ -44,8 +44,8 @@ inline constexpr std::uint8_t ext_flag_more = 1u << 7;
 /// Build an extension header byte from its fields.
 [[nodiscard]] inline auto ext_header_byte(std::uint8_t id, ExtKind kind, bool mandatory,
                                           bool more) noexcept -> std::byte {
-    std::uint8_t h =
-        static_cast<std::uint8_t>((id & ext_id_mask) | static_cast<std::uint8_t>(kind));
+    std::uint8_t h = static_cast<std::uint8_t>((unsigned{id} & unsigned{ext_id_mask}) |
+                                               unsigned{static_cast<std::uint8_t>(kind)});
     if (mandatory) h |= ext_flag_mandatory;
     if (more) h |= ext_flag_more;
     return static_cast<std::byte>(h);

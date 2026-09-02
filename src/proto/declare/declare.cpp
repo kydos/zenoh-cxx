@@ -26,7 +26,8 @@ namespace {
 [[nodiscard]] auto put_optional_wire_expr_ext(ByteWriter& w, std::uint8_t msg_id, std::uint32_t id,
                                               const std::optional<WireExpr>& we) noexcept
     -> std::expected<void, CodecError> {
-    auto const h = static_cast<std::uint8_t>(msg_id | (we.has_value() ? declare_flag::z : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{msg_id} | flag_if(we.has_value(), declare_flag::z));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
     if (we)
@@ -61,8 +62,9 @@ namespace {
 } // namespace
 
 auto DeclareKeyExpr::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
-    auto const h = static_cast<std::uint8_t>(mid | (wire_expr.is_sender() ? declare_flag::m : 0) |
-                                             (wire_expr.has_suffix() ? declare_flag::n : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{mid} | flag_if(wire_expr.is_sender(), declare_flag::m) |
+                                  flag_if(wire_expr.has_suffix(), declare_flag::n));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
     return wire_expr.encode_body(w);
@@ -93,8 +95,9 @@ auto UndeclareKeyExpr::decode(ByteReader& r) noexcept
 }
 
 auto DeclareSubscriber::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
-    auto const h = static_cast<std::uint8_t>(mid | (wire_expr.is_sender() ? declare_flag::m : 0) |
-                                             (wire_expr.has_suffix() ? declare_flag::n : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{mid} | flag_if(wire_expr.is_sender(), declare_flag::m) |
+                                  flag_if(wire_expr.has_suffix(), declare_flag::n));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
     return wire_expr.encode_body(w);
@@ -123,9 +126,9 @@ auto UndeclareSubscriber::decode(ByteReader& r) noexcept
 
 auto DeclareQueryable::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     bool const e_qi = !(qinfo == QueryableInfo{});
-    auto const h = static_cast<std::uint8_t>(mid | (e_qi ? declare_flag::z : 0) |
-                                             (wire_expr.is_sender() ? declare_flag::m : 0) |
-                                             (wire_expr.has_suffix() ? declare_flag::n : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{mid} | flag_if(e_qi, declare_flag::z) |
+                                             flag_if(wire_expr.is_sender(), declare_flag::m) |
+                                             flag_if(wire_expr.has_suffix(), declare_flag::n));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
     ZTRY(wire_expr.encode_body(w));
@@ -167,8 +170,9 @@ auto UndeclareQueryable::decode(ByteReader& r) noexcept
 }
 
 auto DeclareToken::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
-    auto const h = static_cast<std::uint8_t>(mid | (wire_expr.is_sender() ? declare_flag::m : 0) |
-                                             (wire_expr.has_suffix() ? declare_flag::n : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{mid} | flag_if(wire_expr.is_sender(), declare_flag::m) |
+                                  flag_if(wire_expr.has_suffix(), declare_flag::n));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
     return wire_expr.encode_body(w);
@@ -210,8 +214,8 @@ auto Declare::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_nid = !(nodeid == NodeId{});
     bool const z = e_qos || e_ts || e_nid;
 
-    auto const h =
-        static_cast<std::uint8_t>(mid | (z ? declare_flag::z : 0) | (has_id ? declare_flag::i : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{mid} | flag_if(z, declare_flag::z) |
+                                             flag_if(has_id, declare_flag::i));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     if (has_id) ZTRY(put_uint(w, *id));
 

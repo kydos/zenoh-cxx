@@ -8,7 +8,7 @@ module;
 export module zenoh.util;
 
 // Foundational, dependency-free utilities: the codec error type, single-byte
-// header bit-field access, and little-endian load/store helpers.
+// header bit-field access and assembly, and little-endian load/store helpers.
 export namespace zenoh {
 
 /// Error codes shared across the buffer and codec layers.
@@ -38,16 +38,33 @@ struct ByteField {
 
     /// Extract this field's value from header byte `b`.
     [[nodiscard]] static constexpr auto get(std::byte b) noexcept -> std::uint8_t {
-        return static_cast<std::uint8_t>((std::to_integer<std::uint8_t>(b) >> Shift) & mask);
+        return static_cast<std::uint8_t>((std::to_integer<unsigned>(b) >> Shift) & unsigned{mask});
     }
 
     /// Set this field's value in header byte `b`, leaving other bits untouched.
     static constexpr auto set(std::byte& b, std::uint8_t v) noexcept -> void {
-        b = static_cast<std::byte>(
-            (std::to_integer<std::uint8_t>(b) & static_cast<std::uint8_t>(~shifted_mask)) |
-            static_cast<std::uint8_t>((v & mask) << Shift));
+        // Computed in `unsigned`, not `std::uint8_t`: see `flag_if` below for why the
+        // promotion is spelled out. `kept` stays within a byte because `b` does.
+        unsigned const kept = std::to_integer<unsigned>(b) & ~unsigned{shifted_mask};
+        unsigned const field = (unsigned{v} & unsigned{mask}) << Shift;
+        b = static_cast<std::byte>(kept | field);
     }
 };
+
+/// A header flag contributed only when `on` holds, and `0` otherwise.
+///
+/// The idiom it replaces -- `mid | (z ? flag_z : 0)` -- is correct but signed: a
+/// `std::uint8_t` operand of `|`/`&`/`<<` is promoted to `int`, and the conditional's
+/// common type is `int` too, so a header byte assembled that way is built out of
+/// signed intermediates. That is indistinguishable, to a reader or to
+/// `bugprone-signed-bitwise`, from the sign-extension mistakes the check exists to
+/// catch. Returning `unsigned` keeps the assembly unsigned end to end -- pair it with
+/// `unsigned{id}` for the message id, and the whole expression stays unsigned:
+///
+///     auto const h = static_cast<std::uint8_t>(unsigned{mid} | flag_if(z, flag_z));
+[[nodiscard]] constexpr auto flag_if(bool on, std::uint8_t flag) noexcept -> unsigned {
+    return on ? unsigned{flag} : 0U;
+}
 
 /// Load an unsigned integer stored little-endian at `p` (sizeof(T) bytes).
 ///

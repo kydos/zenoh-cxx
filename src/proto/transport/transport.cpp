@@ -26,9 +26,9 @@ auto InitIdentifier::encode(ByteWriter& w) const noexcept -> std::expected<void,
     // zid length is 1..16, stored as len-1 in the high nibble; an empty id would
     // underflow to 0xf (decoding back as 16) and corrupt the stream, so reject it.
     if (zid.len == 0 || zid.len > 16) return std::unexpected(CodecError::malformed);
-    std::uint8_t const nibble = static_cast<std::uint8_t>((zid.len - 1) & 0x0f);
-    std::uint8_t const h =
-        static_cast<std::uint8_t>((nibble << 4) | (static_cast<std::uint8_t>(whatami) & 0x03));
+    std::uint8_t const nibble = static_cast<std::uint8_t>((unsigned{zid.len} - 1U) & 0x0f);
+    std::uint8_t const h = static_cast<std::uint8_t>(
+        (unsigned{nibble} << 4) | (unsigned{static_cast<std::uint8_t>(whatami)} & 0x03));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     return put_raw(w, zid.view());
 }
@@ -39,7 +39,7 @@ auto InitIdentifier::decode(ByteReader& r) noexcept -> std::expected<InitIdentif
     std::uint8_t const w = h & 0x03;
     if (w > 2) return std::unexpected(CodecError::malformed); // 0b11 is not a valid WhatAmI
     i.whatami = static_cast<WhatAmI>(w);
-    std::uint8_t const zlen = static_cast<std::uint8_t>(((h >> 4) & 0x0f) + 1);
+    std::uint8_t const zlen = static_cast<std::uint8_t>(((unsigned{h} >> 4) & 0x0f) + 1);
     auto const s = ZTRY(r.read_slice(zlen));
     i.zid.len = zlen;
     std::ranges::copy(s, i.zid.bytes.begin());
@@ -72,7 +72,8 @@ auto InitAck::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_patch = !(patch == Patch{});
     bool const z = e_qos || e_qoslink || e_auth || e_mlink || e_lowlat || e_comp || e_patch;
 
-    auto const h = static_cast<std::uint8_t>(id | flag_a | (s ? flag_s : 0) | (z ? flag_z : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{id} | flag_a | flag_if(s, flag_s) | flag_if(z, flag_z));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
 
     ZTRY(w.write_byte(static_cast<std::byte>(version)));
@@ -165,7 +166,8 @@ auto InitSyn::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_patch = !(patch == Patch{});
     bool const z = e_qos || e_qoslink || e_auth || e_mlink || e_lowlat || e_comp || e_patch;
 
-    auto const h = static_cast<std::uint8_t>(id | (s ? flag_s : 0) | (z ? flag_z : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{id} | flag_if(s, flag_s) | flag_if(z, flag_z));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(w.write_byte(static_cast<std::byte>(version)));
     ZTRY(identifier.encode(w));
@@ -243,8 +245,8 @@ auto InitSyn::decode(ByteReader& r) noexcept -> std::expected<InitSyn, CodecErro
 // --- Close / KeepAlive ---
 
 auto Close::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
-    auto const h =
-        static_cast<std::uint8_t>(id | (behaviour == CloseBehaviour::session ? flag_s : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{id} |
+                                             flag_if(behaviour == CloseBehaviour::session, flag_s));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     return w.write_byte(static_cast<std::byte>(reason));
 }
@@ -273,7 +275,8 @@ auto KeepAlive::decode(ByteReader& r) noexcept -> std::expected<KeepAlive, Codec
 auto FrameHeader::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     bool const rel = reliability == Reliability::reliable;
     bool const q = !(qos == QoS{});
-    auto const h = static_cast<std::uint8_t>(id | (q ? flag_z : 0) | (rel ? flag_r : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{id} | flag_if(q, flag_z) | flag_if(rel, flag_r));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, sn));
     if (q) ZTRY(put_ext_u64(w, 0x1, /*mandatory=*/true, false, qos.inner));
@@ -314,7 +317,8 @@ auto OpenSyn::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_comp = compression.has_value();
     bool const z = e_qos || e_auth || e_msyn || e_mack || e_lowlat || e_comp;
 
-    auto const h = static_cast<std::uint8_t>(id | (z ? flag_z : 0) | (t ? flag_t : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{id} | flag_if(z, flag_z) | flag_if(t, flag_t));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, lease.wire_value()));
     ZTRY(put_uint(w, sn));
@@ -392,7 +396,8 @@ auto OpenAck::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_comp = compression.has_value();
     bool const z = e_qos || e_auth || e_msyn || e_mack || e_lowlat || e_comp;
 
-    auto const h = static_cast<std::uint8_t>(id | flag_a | (z ? flag_z : 0) | (t ? flag_t : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{id} | flag_a | flag_if(z, flag_z) | flag_if(t, flag_t));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, lease.wire_value()));
     ZTRY(put_uint(w, sn));

@@ -57,3 +57,16 @@ Checks: >
 # instead of the bare directory name).
 HeaderFilterRegex: '(src/|broker/|include/zenoh/)'
 FormatStyle: file
+CheckOptions:
+  # A wire codec is bit twiddling against literal masks and shifts -- `h & 0x0f`,
+  # `nibble << 4`. Those literals are `int`, so by default every one of them is a
+  # signed operand and the check fires on the notation rather than on anything
+  # dangerous (clang-tidy 23 reports ~45 such sites here; 19, which CI runs, reports
+  # none of them). This is upstream's knob for exactly that: a *positive literal*
+  # operand carries no sign surprise, while a signed variable, a signed
+  # sub-expression, or a negative literal -- the sign-extension and
+  # implementation-defined-shift bugs the check exists for -- is still reported.
+  # Those the codec avoids in the code itself: `zenoh::flag_if` and `unsigned{...}`
+  # keep header-byte assembly unsigned end to end instead of relying on promotion.
+  - key: bugprone-signed-bitwise.IgnorePositiveIntegerLiterals
+    value: true

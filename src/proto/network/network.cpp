@@ -31,8 +31,8 @@ auto Put::encode_head(ByteWriter& w) const noexcept -> std::expected<void, Codec
     bool const has_at = attachment.has_value();
     bool const z = has_si || has_at;
 
-    auto const h =
-        static_cast<std::uint8_t>(id | (z ? flag_z : 0) | (e ? flag_x6 : 0) | (t ? flag_x5 : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{id} | flag_if(z, flag_z) |
+                                             flag_if(e, flag_x6) | flag_if(t, flag_x5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
 
     if (t) ZTRY(timestamp->encode(w));
@@ -95,7 +95,8 @@ auto Del::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError
     bool const has_at = attachment.has_value();
     bool const z = has_si || has_at;
 
-    auto const h = static_cast<std::uint8_t>(id | (z ? flag_z : 0) | (t ? flag_x5 : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{id} | flag_if(z, flag_z) | flag_if(t, flag_x5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     if (t) ZTRY(timestamp->encode(w));
     if (has_si)
@@ -146,8 +147,8 @@ auto Push::encode_head(ByteWriter& w) const noexcept -> std::expected<void, Code
     bool const dst = dest.has_value();
     bool const z = q || ts || nid || dst;
 
-    auto const h =
-        static_cast<std::uint8_t>(id | (z ? flag_z : 0) | (m ? flag_x6 : 0) | (n ? flag_x5 : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{id} | flag_if(z, flag_z) |
+                                             flag_if(m, flag_x6) | flag_if(n, flag_x5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(wire_expr.encode_body(w));
 
@@ -218,8 +219,8 @@ auto Query::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecErr
     bool const e_att = attachment.has_value();
     bool const z = e_si || e_body || e_att;
 
-    auto const h =
-        static_cast<std::uint8_t>(id | (z ? flag_z : 0) | (p ? flag_x6 : 0) | (c ? flag_x5 : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{id} | flag_if(z, flag_z) |
+                                             flag_if(p, flag_x6) | flag_if(c, flag_x5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     if (c) ZTRY(w.write_byte(static_cast<std::byte>(static_cast<std::uint8_t>(consolidation))));
     if (p) ZTRY(put_prefixed_str(w, parameters));
@@ -281,7 +282,8 @@ auto Query::decode(ByteReader& r) noexcept -> std::expected<Query, CodecError> {
 auto Err::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     bool const e = !(encoding == Encoding{});
     bool const e_si = sinfo.has_value();
-    auto const h = static_cast<std::uint8_t>(id | (e_si ? flag_z : 0) | (e ? flag_x6 : 0));
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{id} | flag_if(e_si, flag_z) | flag_if(e, flag_x6));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     if (e) ZTRY(encoding.encode(w));
     if (e_si)
@@ -320,7 +322,7 @@ auto Err::decode(ByteReader& r) noexcept -> std::expected<Err, CodecError> {
 
 auto Reply::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     bool const c = consolidation != ConsolidationMode::automatic;
-    auto const h = static_cast<std::uint8_t>(id | (c ? flag_x5 : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{id} | flag_if(c, flag_x5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     if (c) ZTRY(w.write_byte(static_cast<std::byte>(static_cast<std::uint8_t>(consolidation))));
     return payload.encode(w);
@@ -363,8 +365,8 @@ auto Request::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecE
     bool const e_dest = dest.has_value();
     bool const z = e_qos || e_ts || e_nid || e_tgt || e_bud || e_to || e_dest;
 
-    auto const h =
-        static_cast<std::uint8_t>(mid | (z ? flag_z : 0) | (m ? flag_x6 : 0) | (n ? flag_x5 : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{mid} | flag_if(z, flag_z) |
+                                             flag_if(m, flag_x6) | flag_if(n, flag_x5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
     ZTRY(wire_expr.encode_body(w));
@@ -456,8 +458,8 @@ auto Response::encode(ByteWriter& w) const noexcept -> std::expected<void, Codec
     bool const e_rid = respid.has_value();
     bool const z = e_qos || e_ts || e_rid;
 
-    auto const h =
-        static_cast<std::uint8_t>(id | (z ? flag_z : 0) | (m ? flag_x6 : 0) | (n ? flag_x5 : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{id} | flag_if(z, flag_z) |
+                                             flag_if(m, flag_x6) | flag_if(n, flag_x5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, rid));
     ZTRY(wire_expr.encode_body(w));
@@ -518,7 +520,7 @@ auto ResponseFinal::encode(ByteWriter& w) const noexcept -> std::expected<void, 
     bool const e_ts = timestamp.has_value();
     bool const z = e_qos || e_ts;
 
-    auto const h = static_cast<std::uint8_t>(id | (z ? flag_z : 0));
+    auto const h = static_cast<std::uint8_t>(unsigned{id} | flag_if(z, flag_z));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, rid));
 

@@ -37,6 +37,16 @@ namespace {
     }
 }
 
+/// True when `revents` carries any of `events`.
+///
+/// poll(2) reports a `short` bitmask and names its bits with `int` macros, so the
+/// direct `pfd.revents & POLLIN` is signed bit math; masking in `unsigned` says what
+/// is meant and keeps `bugprone-signed-bitwise` about real sign bugs (see
+/// `zenoh::flag_if`).
+[[nodiscard]] constexpr auto any_event(short revents, int events) noexcept -> bool {
+    return (static_cast<unsigned>(revents) & static_cast<unsigned>(events)) != 0;
+}
+
 /// Block until `fd` is ready for `events` (POLLIN/POLLOUT). Retries on EINTR.
 [[nodiscard]] auto wait_ready(int fd, short events) noexcept -> std::expected<void, IoError> {
     for (;;) {
@@ -46,7 +56,7 @@ namespace {
             if (errno == EINTR) continue;
             return std::unexpected(IoError::failed);
         }
-        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        if (any_event(pfd.revents, POLLERR | POLLHUP | POLLNVAL)) {
             return std::unexpected(IoError::closed);
         }
         return {};
@@ -103,7 +113,9 @@ auto TcpLink::connect(const std::string& host, std::uint16_t port) noexcept
 auto TcpLink::set_nonblocking() noexcept -> std::expected<void, IoError> {
     int const flags = ::fcntl(fd_, F_GETFL, 0);
     if (flags < 0) return std::unexpected(IoError::failed);
-    if (::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) return std::unexpected(IoError::failed);
+    // fcntl's flag word is a signed int; OR the bit in unsigned, then hand it back.
+    int const nonblocking = static_cast<int>(static_cast<unsigned>(flags) | O_NONBLOCK);
+    if (::fcntl(fd_, F_SETFL, nonblocking) < 0) return std::unexpected(IoError::failed);
     return {};
 }
 
@@ -213,8 +225,8 @@ auto TcpLink::poll_readable(int timeout_ms) noexcept -> std::expected<bool, IoEr
         if (n == 0) return false; // timed out, still no data
         // POLLIN takes priority over POLLHUP: a half-closed peer (FIN) that also left
         // buffered data sets both, and we must read the data before surfacing the EOF.
-        if ((pfd.revents & POLLIN) != 0) return true; // readable (EOF read_exact reports closed)
-        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        if (any_event(pfd.revents, POLLIN)) return true; // readable (EOF read_exact reports closed)
+        if (any_event(pfd.revents, POLLERR | POLLHUP | POLLNVAL)) {
             return std::unexpected(IoError::closed);
         }
         return true;

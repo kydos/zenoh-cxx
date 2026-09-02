@@ -23,7 +23,7 @@ auto EntityGlobalId::encode_body(ByteWriter& w) const noexcept -> std::expected<
     // 16-byte id fits in 4 bits. An empty id would underflow len-1 to 0xf (decoding
     // back as 16) and silently corrupt the stream, so reject it.
     if (zid.len == 0 || zid.len > 16) return std::unexpected(CodecError::malformed);
-    std::uint8_t const nibble = static_cast<std::uint8_t>((zid.len - 1) & 0x0f);
+    std::uint8_t const nibble = static_cast<std::uint8_t>((unsigned{zid.len} - 1U) & 0x0f);
     ZTRY(w.write_byte(static_cast<std::byte>(static_cast<std::uint8_t>(nibble << 4))));
     ZTRY(put_raw(w, zid.view()));
     return put_uint(w, eid);
@@ -46,7 +46,7 @@ auto DestinationId::encode_body(ByteWriter& w) const noexcept -> std::expected<v
     // Same nibble-encoded-length shape as EntityGlobalId::encode_body, minus the
     // trailing eid; see that function's comment for the len==0/len>16 rationale.
     if (zid.len == 0 || zid.len > 16) return std::unexpected(CodecError::malformed);
-    std::uint8_t const nibble = static_cast<std::uint8_t>((zid.len - 1) & 0x0f);
+    std::uint8_t const nibble = static_cast<std::uint8_t>((unsigned{zid.len} - 1U) & 0x0f);
     ZTRY(w.write_byte(static_cast<std::byte>(static_cast<std::uint8_t>(nibble << 4))));
     return put_raw(w, zid.view());
 }

@@ -213,7 +213,8 @@ rather than changing the repo.
 ### Module layering (acyclic, one folder per functional area under `src/`)
 
 ```
-util/    zenoh.util             ByteField<Shift,Bits> header bit descriptors, ZTRY macro, LE helpers
+util/    zenoh.util             ByteField<Shift,Bits> header bit descriptors, flag_if (unsigned
+                                header assembly), ZTRY macro, LE helpers
 buffer/  zenoh.buffer           ByteReader/ByteWriter (concrete cursors over std::span), Readable/Writable concepts
 codec/   zenoh.varint           VLE u64 (1-9 byte LEB128-style), branch-lean encode/decode
          zenoh.codec            primitive codecs: u8/VLE-int/array<byte,N>/prefixed-or-remainder span & string_view/optional<T>
@@ -294,6 +295,14 @@ unit; message bodies are large enough that this cost is negligible.
   fields) are ordinary `std::optional<T>` members with a short `while`/`switch` decode
   loop per message, not a generic ID-dispatch framework. If you're adding a new
   message or field, follow this pattern — don't introduce a generic engine.
+- **Header bytes are assembled in `unsigned`**:
+  `static_cast<std::uint8_t>(unsigned{mid} | flag_if(z, flag_z))`, not
+  `mid | (z ? flag_z : 0)`. Narrow unsigned operands of `|`/`&`/`<<` promote to `int`,
+  so the terse form builds a header out of signed intermediates — correct, but
+  indistinguishable from a sign-extension bug to a reader or to
+  `bugprone-signed-bitwise` (which reports it from clang-tidy 20 on). `flag_if` lives
+  in `zenoh.util`; literal masks and shift counts (`h & 0x0f`, `<< 4`) stay as they
+  are.
 - **Every function/member function uses trailing return type** (`auto f(args) -> R`);
   constructors/destructors are exempt (`docs/STYLE.md`).
 - **Documentation**: every `.cppm`/`.cpp` gets a one-paragraph file header; every

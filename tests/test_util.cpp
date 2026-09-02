@@ -4,6 +4,7 @@ import zenoh.util;
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 using namespace zenoh;
 
@@ -27,6 +28,22 @@ TEST("ByteField set overwrites only its own bits") {
     Lo::set(h, 0x3);
     CHECK(Lo::get(h) == 0x3);
     CHECK(Hi::get(h) == 0xF); // untouched
+}
+
+TEST("flag_if contributes a flag only when its condition holds") {
+    constexpr std::uint8_t flag_z = 0x80;
+    constexpr std::uint8_t flag_m = 0x40;
+
+    CHECK(flag_if(true, flag_z) == 0x80u);
+    CHECK(flag_if(false, flag_z) == 0u);
+
+    // The idiom it exists for: a header byte assembled without ever going signed.
+    constexpr std::uint8_t mid = 0x1d;
+    auto const h =
+        static_cast<std::uint8_t>(unsigned{mid} | flag_if(true, flag_z) | flag_if(false, flag_m));
+    CHECK(h == (0x80 | 0x1d));
+    static_assert(std::is_same_v<decltype(flag_if(true, flag_z)), unsigned>);
+    static_assert(flag_if(true, flag_m) == 0x40u); // usable in constant expressions
 }
 
 TEST("store_le / load_le round-trip and byte order") {

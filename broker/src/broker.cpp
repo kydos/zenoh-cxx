@@ -898,7 +898,8 @@ class Face : public std::enable_shared_from_this<Face> {
         assert(strand_.running_in_this_thread());
         auto pk = r.peek();
         if (!pk) return false;
-        std::uint8_t const mode_bits = (std::to_integer<std::uint8_t>(*pk) >> 5) & 0x3;
+        auto const mode_bits =
+            static_cast<std::uint8_t>((std::to_integer<unsigned>(*pk) >> 5) & 0x3);
         if (mode_bits == 0) return InterestFinal::decode(r).has_value();
         return Interest::decode(r).has_value();
     }

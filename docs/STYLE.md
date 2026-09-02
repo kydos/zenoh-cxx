@@ -28,6 +28,12 @@ Constructors/destructors are exempt. (See `RESTRUCTURE.md`/memory.)
   `clang -Wdocumentation` (which understands declarations) — not a regex lint, since
   the `export namespace { ... }` form exports without per-entity `export` keywords.
 
+## Bit math
+Header bytes are assembled in `unsigned`, never through the promotion of narrow
+unsigned operands: `static_cast<std::uint8_t>(unsigned{mid} | flag_if(z, flag_z))`,
+not `mid | (z ? flag_z : 0)`. `zenoh::flag_if(cond, flag)` yields the flag or `0U`.
+Literal masks and shift counts (`h & 0x0f`, `nibble << 4`) need no such dressing.
+
 ## Errors & buffers
 `std::expected<T, CodecError>` on the codec path (no exceptions) with the `ZTRY`
 short-circuit macro. The codec reads/writes the concrete `ByteReader`/`ByteWriter`

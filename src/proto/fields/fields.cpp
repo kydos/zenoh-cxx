@@ -70,7 +70,7 @@ auto WireExpr::decode_body(ByteReader& r, bool m, bool n) noexcept
 
 auto WireExpr::encode_full(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
     std::uint8_t const flags =
-        static_cast<std::uint8_t>((is_sender() ? 0b10 : 0) | (has_suffix() ? 0b01 : 0));
+        static_cast<std::uint8_t>(flag_if(is_sender(), 0b10) | flag_if(has_suffix(), 0b01));
     ZTRY(w.write_byte(static_cast<std::byte>(flags)));
     ZTRY(put_uint(w, scope));
     if (has_suffix()) return put_raw(w, as_bytes(suffix));

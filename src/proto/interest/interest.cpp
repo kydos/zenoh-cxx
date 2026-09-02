@@ -46,8 +46,8 @@ auto Interest::encode(ByteWriter& w) const noexcept -> std::expected<void, Codec
     bool const e_nid = !(nodeid == NodeId{});
     bool const z = e_qos || e_ts || e_nid;
 
-    auto const h =
-        static_cast<std::uint8_t>(mid | (z ? flag_z : 0) | (static_cast<std::uint8_t>(mode) << 5));
+    auto const h = static_cast<std::uint8_t>(unsigned{mid} | flag_if(z, flag_z) |
+                                             (unsigned{static_cast<std::uint8_t>(mode)} << 5));
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
     ZTRY(inner.encode(w));
@@ -66,7 +66,7 @@ auto Interest::decode(ByteReader& r) noexcept -> std::expected<Interest, CodecEr
     bool has_ext = (h & flag_z) != 0;
 
     Interest it{};
-    it.mode = static_cast<InterestMode>((h >> 5) & 0x3);
+    it.mode = static_cast<InterestMode>((unsigned{h} >> 5) & 0x3);
     it.id = ZTRY(get_uint_as<std::uint32_t>(r));
     it.inner = ZTRY(InterestInner::decode(r));
 
@@ -99,7 +99,7 @@ auto InterestFinal::encode(ByteWriter& w) const noexcept -> std::expected<void, 
     bool const e_nid = !(nodeid == NodeId{});
     bool const z = e_qos || e_ts || e_nid;
 
-    auto const h = static_cast<std::uint8_t>(mid | (z ? flag_z : 0)); // MODE = 0
+    auto const h = static_cast<std::uint8_t>(unsigned{mid} | flag_if(z, flag_z)); // MODE = 0
     ZTRY(w.write_byte(static_cast<std::byte>(h)));
     ZTRY(put_uint(w, id));
 
