@@ -21,7 +21,20 @@
 #     `impl/foo.ipp` bodies file that re-includes `foo.hpp` (guarded by the normal
 #     include guard, so it's not an actual cycle) -- a standard header-only-library
 #     idiom, not a bug in code this project owns.
+#
+# The list is anchored with a leading `-*` so the enabled set is exactly what is
+# written here on every clang-tidy version. Without it the set is version-dependent:
+# clang-tidy's built-in default is `clang-analyzer-*`, and clang-tidy 19 (what CI
+# runs) *appends* a file-level `Checks` to that default, while a current clang-tidy
+# (23) does not -- so the static analyzer ran on CI and nowhere else. It is
+# deliberately off: its path-sensitive reports land *inside* vendored
+# third_party/asio headers (uninitialized fields in Asio's any_executor/awaitable
+# machinery) on paths that start in broker/src, and such a report cannot be
+# suppressed -- clang-tidy keeps a header diagnostic whenever any note on the path
+# refers to code we own, so neither HeaderFilterRegex, --exclude-header-filter, nor
+# compiling Asio as a system include silences it.
 Checks: >
+  -*,
   bugprone-*,
   -bugprone-exception-escape,
   -bugprone-easily-swappable-parameters,
