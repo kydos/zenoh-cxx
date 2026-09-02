@@ -663,8 +663,16 @@ TEST("a callback that undeclares its own subscriber mid-drain does not crash") {
     }
     self = &*sub;
 
-    CHECK(sess->run_once().has_value()); // used to crash here
-    CHECK(delivered == 1);               // and no further samples after the undeclare
+    // Pump until the first sample lands: run_once() no longer blocks inside a
+    // half-arrived batch, so it can legitimately return having made no progress yet.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (delivered == 0 && std::chrono::steady_clock::now() < deadline) {
+        if (!sess->run_once()) break; // used to crash here
+    }
+    CHECK(delivered == 1); // and no further samples after the undeclare
+    // Draining again must stay safe now that the registration is gone.
+    (void)sess->run_once();
+    CHECK(delivered == 1);
 
     sess->close();
     router.join();
