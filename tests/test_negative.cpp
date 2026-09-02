@@ -12,10 +12,12 @@ import zenoh.util;
 
 #include "ztest.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <variant>
 #include <vector>
 
 using namespace zenoh;
@@ -239,4 +241,99 @@ TEST("Timestamp::decode rejects an empty id") {
 
     std::array<std::byte, 3> const too_long{std::byte{0x2a}, std::byte{0x11}, std::byte{0x00}};
     CHECK(rejects<Timestamp>(too_long)); // 17 > 16
+}
+
+// An extension's KIND decides how many bytes it occupies, so a decoder that
+// dispatches on the id alone and then reads the shape it expects consumes the wrong
+// number of bytes when a peer sends a known id with a different kind: a Unit read as
+// a ZStruct swallows a length byte plus that many bytes of what follows; a ZStruct
+// read as a U64 leaves its body to be re-parsed as the next extension header. Nothing
+// reads out of bounds, but the rest of the batch is desynchronized -- and a broker
+// re-encodes and forwards the mangled result. The reference rejects this structurally
+// (it compares the whole header byte bar the Z flag against a constant that bakes in
+// the encoding), so accepting it was also an interop divergence.
+TEST("a known extension id sent with the wrong KIND is rejected") {
+    // Del + ext id 2 as *Unit* (0x02) where the decoder expects a ZStruct attachment.
+    // Pre-fix this consumed 0x03 as a length and swallowed aa bb cc.
+    std::array<std::byte, 6> const unit_for_zstruct{std::byte{0x82}, std::byte{0x02},
+                                                    std::byte{0x03}, std::byte{0xaa},
+                                                    std::byte{0xbb}, std::byte{0xcc}};
+    CHECK(rejects<Del>(unit_for_zstruct));
+
+    // Push + ext id 1 as Unit (0x11, mandatory) where a U64 QoS is expected: the
+    // reader used to take the following byte as the VLE value.
+    std::array<std::byte, 4> const unit_for_u64{std::byte{0x9d}, std::byte{0x00}, std::byte{0x11},
+                                                std::byte{0x05}};
+    CHECK(rejects<Push>(unit_for_u64));
+}
+
+// A Declare body that defines no extensions of its own still has to *read* the chain
+// the Z bit announces. Five of them (DeclareKeyExpr, UndeclareKeyExpr,
+// DeclareSubscriber, DeclareToken, DeclareFinal) ignored it, leaving the extension
+// bytes in the reader to be misparsed as the next declaration -- the reference calls
+// extension::skip_all for exactly these.
+TEST("a Declare body honours the Z bit even with no extensions of its own") {
+    // DeclareSubscriber (mid 2 | Z), id 1, scope 0, then a non-mandatory Unit ext,
+    // then a DeclareFinal. The whole thing must decode as two bodies, in order.
+    std::array<std::byte, 5> const bytes{std::byte{0x82}, std::byte{0x01}, std::byte{0x00},
+                                         std::byte{0x0e}, std::byte{0x1a}};
+    ByteReader r{bytes};
+    auto first = DeclareBody::decode(r);
+    CHECK(first.has_value());
+    if (first) CHECK(std::holds_alternative<DeclareSubscriber>(first->body));
+    CHECK(r.remaining() == 1); // pre-fix: 2, the ext byte was left behind
+    auto second = DeclareBody::decode(r);
+    CHECK(second.has_value());
+    if (second) CHECK(std::holds_alternative<DeclareFinal>(second->body));
+
+    // A *mandatory* unknown extension is rejected, as everywhere else in the codec.
+    std::array<std::byte, 4> const mandatory{std::byte{0x82}, std::byte{0x01}, std::byte{0x00},
+                                             std::byte{0x1e}};
+    CHECK(rejects<DeclareSubscriber>(mandatory));
+}
+
+// Interest and InterestFinal share mid 0x19 and are told apart by the 2-bit MODE
+// field. InterestFinal enforced its half (MODE == 0); Interest did not, so it decoded
+// an InterestFinal's bytes and then read the *next* message's first byte as its own
+// InterestInner options.
+TEST("Interest rejects MODE=0, which is InterestFinal") {
+    std::array<std::byte, 2> const final_bytes{std::byte{0x19}, std::byte{0x05}};
+    CHECK(rejects<Interest>(final_bytes));
+    // The same bytes are a perfectly good InterestFinal.
+    ByteReader r{final_bytes};
+    CHECK(InterestFinal::decode(r).has_value());
+
+    // And encode is symmetric: a final_ Interest would emit bytes a correct
+    // dispatcher hands to the other decoder.
+    std::array<std::byte, 64> buf{};
+    ByteWriter w{buf};
+    Interest it{};
+    it.mode = InterestMode::final_;
+    CHECK(!it.encode(w).has_value());
+}
+
+// Every other narrowed field in this codec rejects a wire value that does not fit
+// (get_uint_as<T>/read_ext_uint<T>); Encoding silently truncated to u16. That decodes
+// to a different encoding than the wire carried and re-encodes to different bytes --
+// and because Put/Err elide the E flag for a default encoding, an id truncating to 0
+// drops the field entirely when a broker relays the message.
+TEST("Encoding rejects an id wider than u16") {
+    // combined = 0x20000 -> id 65536, no schema.
+    std::array<std::byte, 3> const too_wide{std::byte{0x80}, std::byte{0x80}, std::byte{0x08}};
+    ByteReader r{too_wide};
+    CHECK(!Encoding::decode(r).has_value());
+
+    // The boundary still decodes, and round-trips byte-identically.
+    std::array<std::byte, 3> const max_id{std::byte{0xfe}, std::byte{0xff}, std::byte{0x07}};
+    ByteReader r2{max_id};
+    auto e = Encoding::decode(r2);
+    CHECK(e.has_value());
+    if (e) {
+        CHECK(e->id == 0xffff && !e->has_schema);
+        std::array<std::byte, 16> buf{};
+        ByteWriter w{buf};
+        CHECK(e->encode(w).has_value());
+        CHECK(w.written() == max_id.size());
+        CHECK(std::equal(max_id.begin(), max_id.end(), buf.begin()));
+    }
 }

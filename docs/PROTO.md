@@ -64,6 +64,21 @@ scouting (`Scout`/`Hello`) → network/transport `Oam` → `Join`.
   parameters) are UTF-8-validated (`invalid_field`), matching the reference's
   `&str` decode. Use `get_uint_as<T>` / `read_ext_uint<T>` for narrowed fields.
   (Reserved header flag bits are tolerated/ignored for forward compatibility.)
+- **Extensions are checked by KIND, not just by id.** The KIND bits determine an
+  extension's length, so reading a known id as the shape the decoder *expected*
+  rather than the shape the peer *sent* desynchronizes everything after it —
+  `read_ext_{unit,u64,zstruct}` therefore reject a header whose KIND is not theirs
+  (`take_ext_header`). The reference gets this structurally: its typed readers compare
+  the whole header byte bar the Z flag, so id, mandatory bit and encoding must all
+  match. This codec deliberately does not police the mandatory bit, which cannot
+  affect framing.
+- **A body with no extensions of its own still reads the chain.** If the Z bit is set,
+  the extensions are consumed (skipping unknown non-mandatory ones, rejecting
+  mandatory ones) — otherwise they are left to be misparsed as the next message.
+- One deliberate divergence from the reference: an `Encoding` id wider than `u16` is
+  `malformed` here, where the reference bounds the VLE to `u32` and then truncates.
+  Truncating changes the message and, since `Put`/`Err` elide a default encoding,
+  can drop the field entirely when a broker re-encodes on relay.
 
 ## Adding a message
 

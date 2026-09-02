@@ -41,6 +41,10 @@ auto InterestInner::decode(ByteReader& r) noexcept -> std::expected<InterestInne
 }
 
 auto Interest::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+    // Symmetric with decode: bytes with MODE == 0 belong to `InterestFinal`, so
+    // emitting them from here would produce a message a correct dispatcher routes to
+    // the other decoder -- and reads as something else entirely.
+    if (mode == InterestMode::final_) return std::unexpected(CodecError::malformed);
     bool const e_qos = !(qos == QoS{});
     bool const e_ts = timestamp.has_value();
     bool const e_nid = !(nodeid == NodeId{});
@@ -66,6 +70,11 @@ auto Interest::decode(ByteReader& r) noexcept -> std::expected<Interest, CodecEr
     bool has_ext = (h & flag_z) != 0;
 
     Interest it{};
+    // MODE == 0 is `InterestFinal`, a different message that shares this mid and
+    // carries no body. Decoding it here would read the *next* message's first byte as
+    // this one's `InterestInner` options and desynchronize the frame. `InterestFinal`
+    // enforces the mirror image of this check (its MODE bits must be zero).
+    if ((h & InterestFinal::mode_mask) == 0) return std::unexpected(CodecError::malformed);
     it.mode = static_cast<InterestMode>((unsigned{h} >> 5) & 0x3);
     it.id = ZTRY(get_uint_as<std::uint32_t>(r));
     it.inner = ZTRY(InterestInner::decode(r));

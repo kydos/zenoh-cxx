@@ -4,6 +4,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <ranges>
 #include <span>
 #include <string_view>
@@ -57,7 +58,18 @@ auto Encoding::decode(ByteReader& r) noexcept -> std::expected<Encoding, CodecEr
     Encoding e{};
     auto const combined = ZTRY(get_uint(r));
     e.has_schema = (combined & 1u) != 0;
-    e.id = static_cast<std::uint16_t>(combined >> 1);
+    // Reject rather than truncate, matching how every other narrowed field in this
+    // codec behaves (`get_uint_as<T>`/`read_ext_uint<T>`, and docs/PROTO.md's rule).
+    // A silent narrowing here decodes to a *different* encoding than the wire carried
+    // and re-encodes to different bytes -- and since Put/Err elide the E flag when the
+    // encoding is default, an id that truncates to 0 drops the field entirely on
+    // relay. A deliberate divergence: the reference bounds this VLE to u32 and then
+    // truncates to its u16 EncodingId, so it accepts (and mangles) ids we refuse.
+    auto const raw_id = combined >> 1;
+    if (raw_id > std::numeric_limits<std::uint16_t>::max()) {
+        return std::unexpected(CodecError::malformed);
+    }
+    e.id = static_cast<std::uint16_t>(raw_id);
     if (e.has_schema) e.schema = ZTRY(get_prefixed(r));
     return e;
 }

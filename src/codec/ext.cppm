@@ -106,10 +106,36 @@ template <class EncodeBody>
 
 // --- readers (header already peeked; these consume it) ---
 
+/// Consume an extension header byte, checking it really is of kind `expected`.
+///
+/// The KIND bits decide how many bytes the extension occupies, so a decoder that
+/// dispatches on the id alone and then reads the shape it *expects* will consume the
+/// wrong number of bytes when a peer sends a known id with a different kind: a Unit
+/// read as a ZStruct swallows a length byte plus that many bytes of whatever follows,
+/// and a ZStruct read as a U64 leaves its body to be re-parsed as the next extension
+/// header. Neither reads out of bounds — every read is bounds-checked — but both
+/// desynchronize the rest of the batch, and a broker then re-encodes and forwards the
+/// mangled result.
+///
+/// The reference makes the same check structurally: its typed readers compare
+/// `iext::eid(header)` — the whole byte bar the Z flag — against a constant that
+/// bakes in the id, the mandatory bit *and* the encoding, so a kind mismatch is a
+/// `DidntRead`. This codebase checks the id (by dispatching on it) and the kind, but
+/// deliberately not the mandatory bit: getting M wrong cannot desynchronize anything,
+/// since the kind alone determines the extension's length.
+[[nodiscard]] inline auto take_ext_header(ByteReader& r, ExtKind expected) noexcept
+    -> std::expected<void, CodecError> {
+    auto const b = ZTRY(r.read_byte());
+    if ((std::to_integer<std::uint8_t>(b) & ext_kind_mask) != static_cast<std::uint8_t>(expected)) {
+        return std::unexpected(CodecError::malformed);
+    }
+    return {};
+}
+
 /// Read a U64 extension value.
 [[nodiscard]] inline auto read_ext_u64(ByteReader& r) noexcept
     -> std::expected<std::uint64_t, CodecError> {
-    ZTRY(r.read_byte()); // discard header
+    ZTRY(take_ext_header(r, ExtKind::u64));
     return decode_vle(r);
 }
 
@@ -124,17 +150,16 @@ template <std::unsigned_integral T>
     return static_cast<T>(v);
 }
 
-/// Consume a Unit extension's header.
+/// Consume a Unit extension's header. `malformed` if its KIND is not Unit.
 [[nodiscard]] inline auto read_ext_unit(ByteReader& r) noexcept -> std::expected<void, CodecError> {
-    ZTRY(r.read_byte());
-    return {};
+    return take_ext_header(r, ExtKind::unit);
 }
 
 /// Consume header + VLE(len) and return the `len`-byte body as a borrowed slice
 /// (decode it from a sub-`ByteReader`).
 [[nodiscard]] inline auto read_ext_zstruct(ByteReader& r) noexcept
     -> std::expected<std::span<const std::byte>, CodecError> {
-    ZTRY(r.read_byte()); // discard header
+    ZTRY(take_ext_header(r, ExtKind::zstruct));
     auto const n = ZTRY(decode_vle(r));
     return r.read_slice(static_cast<std::size_t>(n));
 }

@@ -37,6 +37,25 @@ namespace {
 }
 
 // Decode id (u32) + optional WireExpr ext 0x0f.
+/// Consume the extension chain of a body that defines no extensions of its own.
+///
+/// A body without extensions still has to *read* them: Z says a chain follows, and
+/// leaving it in the reader means the next `DeclareBody::decode` (or the next network
+/// message in the frame) starts on an extension header and misparses. Unknown
+/// non-mandatory extensions are skipped and a mandatory one is rejected, exactly as
+/// the sibling bodies do -- and as the reference's `extension::skip_all` does for
+/// these same bodies.
+[[nodiscard]] auto skip_ext_chain(ByteReader& r, bool has_ext) noexcept
+    -> std::expected<void, CodecError> {
+    while (has_ext) {
+        auto const eh = ZTRY(peek_ext_header(r));
+        if (eh.mandatory) return std::unexpected(CodecError::malformed);
+        ZTRY(skip_ext(r, eh.kind));
+        has_ext = eh.more;
+    }
+    return {};
+}
+
 [[nodiscard]] auto get_id_and_optional_wire_expr(ByteReader& r, std::uint8_t msg_id) noexcept
     -> std::expected<std::pair<std::uint32_t, std::optional<WireExpr>>, CodecError> {
     std::uint8_t const h = std::to_integer<std::uint8_t>(ZTRY(r.read_byte()));
@@ -77,6 +96,7 @@ auto DeclareKeyExpr::decode(ByteReader& r) noexcept -> std::expected<DeclareKeyE
     d.id = ZTRY(get_uint_as<std::uint16_t>(r));
     d.wire_expr =
         ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
+    ZTRY(skip_ext_chain(r, (h & declare_flag::z) != 0));
     return d;
 }
 
@@ -91,6 +111,7 @@ auto UndeclareKeyExpr::decode(ByteReader& r) noexcept
     if ((h & mid_mask) != mid) return std::unexpected(CodecError::malformed);
     UndeclareKeyExpr d{};
     d.id = ZTRY(get_uint_as<std::uint16_t>(r));
+    ZTRY(skip_ext_chain(r, (h & declare_flag::z) != 0));
     return d;
 }
 
@@ -111,6 +132,7 @@ auto DeclareSubscriber::decode(ByteReader& r) noexcept
     d.id = ZTRY(get_uint_as<std::uint32_t>(r));
     d.wire_expr =
         ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
+    ZTRY(skip_ext_chain(r, (h & declare_flag::z) != 0));
     return d;
 }
 
@@ -185,6 +207,7 @@ auto DeclareToken::decode(ByteReader& r) noexcept -> std::expected<DeclareToken,
     d.id = ZTRY(get_uint_as<std::uint32_t>(r));
     d.wire_expr =
         ZTRY(WireExpr::decode_body(r, (h & declare_flag::m) != 0, (h & declare_flag::n) != 0));
+    ZTRY(skip_ext_chain(r, (h & declare_flag::z) != 0));
     return d;
 }
 
@@ -204,6 +227,7 @@ auto DeclareFinal::encode(ByteWriter& w) const noexcept -> std::expected<void, C
 auto DeclareFinal::decode(ByteReader& r) noexcept -> std::expected<DeclareFinal, CodecError> {
     std::uint8_t const h = std::to_integer<std::uint8_t>(ZTRY(r.read_byte()));
     if ((h & mid_mask) != mid) return std::unexpected(CodecError::malformed);
+    ZTRY(skip_ext_chain(r, (h & declare_flag::z) != 0));
     return DeclareFinal{};
 }
 
