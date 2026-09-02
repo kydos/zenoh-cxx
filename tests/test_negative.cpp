@@ -337,3 +337,42 @@ TEST("Encoding rejects an id wider than u16") {
         CHECK(std::equal(max_id.begin(), max_id.end(), buf.begin()));
     }
 }
+
+// A ZStruct extension declares its body length, and the sub-reader is bounded to it,
+// so trailing bytes inside the body cannot desynchronize the outer stream. They are
+// still wrong: the message decodes as if they were absent and re-encodes shorter than
+// it arrived, so a broker relaying it silently rewrites the peer's bytes. Fixed-shape
+// bodies now require exact consumption (Attachment and Value's payload are defined as
+// "the rest of the slice" and are meant to consume it).
+TEST("a fixed-shape extension body with trailing bytes is rejected") {
+    // A SourceInfo body (Del's ext id 1, a ZStruct), and the same body declared one
+    // byte longer with a junk byte appended.
+    SourceInfo si{};
+    si.id.zid.len = 1;
+    si.id.zid.bytes[0] = std::byte{0x11};
+    si.id.eid = 3;
+    si.sn = 9;
+    std::array<std::byte, 64> body_buf{};
+    ByteWriter bw{body_buf};
+    CHECK(si.encode_body(bw).has_value());
+    auto const body = std::span(body_buf).first(bw.written());
+
+    auto build = [&](std::size_t declared_len, bool trailing) {
+        std::vector<std::byte> out;
+        out.push_back(std::byte{0x82});                      // Del, Z set
+        out.push_back(std::byte{0x41});                      // ext id 1, ZStruct kind
+        out.push_back(static_cast<std::byte>(declared_len)); // body length
+        out.insert(out.end(), body.begin(), body.end());
+        if (trailing) out.push_back(std::byte{0x0c});
+        return out;
+    };
+
+    CHECK(rejects<Del>(build(body.size() + 1, /*trailing=*/true)));
+
+    // The honest encoding still decodes, and carries the SourceInfo.
+    auto const good = build(body.size(), /*trailing=*/false);
+    ByteReader r{good};
+    auto del = Del::decode(r);
+    CHECK(del.has_value());
+    if (del) CHECK(del->sinfo.has_value());
+}

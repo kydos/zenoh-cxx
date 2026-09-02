@@ -18,6 +18,7 @@
 // (re-running this whole binary under ThreadSanitizer) is for, per docs/BROKER.md.
 import zenoh.broker;
 import zenoh.ke;
+import zenoh.proto.exts;
 import zenoh;
 
 #include "ztest.hpp"
@@ -652,4 +653,53 @@ TEST("Broker handles a higher-N concurrent multi-session query/reply load under 
 
     for (int r = 0; r < num_requesters; ++r) CHECK(req_ok[r]);
     for (int i = 0; i < num_queryables; ++i) CHECK(qbl_ok[i]);
+}
+
+// A face that matches through several declarations is deduplicated to one entry, and
+// that entry has to carry the *union* of what those declarations say. Keeping only the
+// first one encountered both loses information and makes the answer depend on
+// `by_key_`'s unordered_map iteration order, which can flip on any rehash: a face with
+// an incomplete `a/*` and a complete `a/**` would be visible to a
+// QueryTarget::all_complete query, or not, by luck.
+//
+// The exact-hash path makes that deterministic to assert: a query key that *is* one of
+// the declared patterns always takes the incomplete entry first, so a first-wins
+// implementation always reports complete=false here, and a folding one always reports
+// complete=true.
+TEST("a face matching through several queryable declarations folds to one complete entry") {
+    ResourceTable table;
+    constexpr FaceId face = 7;
+
+    CHECK(table.declare_queryable("probe/fold/*", face,
+                                  zenoh::QueryableInfo{.complete = false, .distance = 5}));
+    CHECK(table.declare_queryable("probe/fold/**", face,
+                                  zenoh::QueryableInfo{.complete = true, .distance = 2}));
+
+    // Exactly the first-declared (incomplete) pattern: the exact-hash lookup yields it
+    // before the wildcard scan reaches the complete one.
+    auto const& matches = table.matching_queryables("probe/fold/*");
+    int seen = 0;
+    for (auto const& fc : matches) {
+        if (fc.face_id != face) continue;
+        ++seen;
+        CHECK(fc.queryable);
+        CHECK(fc.qinfo.complete);      // folded in from `probe/fold/**`
+        CHECK(fc.qinfo.distance == 2); // nearest of the two
+    }
+    CHECK(seen == 1); // deduplicated, not dropped and not duplicated
+
+    // And the same holds for a key that only the wildcard scan can match, with enough
+    // unrelated declarations in the table to force a rehash along the way.
+    for (int i = 0; i < 500; ++i) {
+        CHECK(table.declare_queryable("filler/" + std::to_string(i),
+                                      face + 1 + static_cast<FaceId>(i), zenoh::QueryableInfo{}));
+    }
+    auto const& deep = table.matching_queryables("probe/fold/x/y");
+    int deep_seen = 0;
+    for (auto const& fc : deep) {
+        if (fc.face_id != face) continue;
+        ++deep_seen;
+        CHECK(fc.qinfo.complete);
+    }
+    CHECK(deep_seen == 1);
 }

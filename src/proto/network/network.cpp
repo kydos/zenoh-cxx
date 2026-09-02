@@ -71,6 +71,7 @@ auto Put::decode(ByteReader& r) noexcept -> std::expected<Put, CodecError> {
         case 0x1: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             p.sinfo = ZTRY(SourceInfo::decode_body(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3:
@@ -122,6 +123,7 @@ auto Del::decode(ByteReader& r) noexcept -> std::expected<Del, CodecError> {
         case 0x1: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             d.sinfo = ZTRY(SourceInfo::decode_body(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x2:
@@ -188,6 +190,7 @@ auto Push::decode(ByteReader& r) noexcept -> std::expected<Push, CodecError> {
         case 0x2: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             p.timestamp = ZTRY(Timestamp::decode(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3:
@@ -196,6 +199,7 @@ auto Push::decode(ByteReader& r) noexcept -> std::expected<Push, CodecError> {
         case 0x4: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             p.dest = ZTRY(DestinationId::decode_body(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         default:
@@ -258,6 +262,7 @@ auto Query::decode(ByteReader& r) noexcept -> std::expected<Query, CodecError> {
         case 0x1: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             q.sinfo = ZTRY(SourceInfo::decode_body(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3: {
@@ -306,6 +311,7 @@ auto Err::decode(ByteReader& r) noexcept -> std::expected<Err, CodecError> {
         case 0x1: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             x.sinfo = ZTRY(SourceInfo::decode_body(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         default:
@@ -415,6 +421,7 @@ auto Request::decode(ByteReader& r) noexcept -> std::expected<Request, CodecErro
         case 0x2: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             req.timestamp = ZTRY(Timestamp::decode(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3:
@@ -435,6 +442,7 @@ auto Request::decode(ByteReader& r) noexcept -> std::expected<Request, CodecErro
         case 0x7: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             req.dest = ZTRY(DestinationId::decode_body(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         default:
@@ -495,11 +503,13 @@ auto Response::decode(ByteReader& r) noexcept -> std::expected<Response, CodecEr
         case 0x2: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             rsp.timestamp = ZTRY(Timestamp::decode(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             rsp.respid = ZTRY(EntityGlobalId::decode_body(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         default:
@@ -547,6 +557,7 @@ auto ResponseFinal::decode(ByteReader& r) noexcept -> std::expected<ResponseFina
         case 0x2: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             rf.timestamp = ZTRY(Timestamp::decode(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         default:

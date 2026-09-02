@@ -88,6 +88,7 @@ auto Interest::decode(ByteReader& r) noexcept -> std::expected<Interest, CodecEr
         case 0x2: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             it.timestamp = ZTRY(Timestamp::decode(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3:
@@ -137,6 +138,7 @@ auto InterestFinal::decode(ByteReader& r) noexcept -> std::expected<InterestFina
         case 0x2: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             it.timestamp = ZTRY(Timestamp::decode(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3:

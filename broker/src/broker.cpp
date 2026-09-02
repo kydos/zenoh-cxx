@@ -826,6 +826,7 @@ class Face : public std::enable_shared_from_this<Face> {
         // what's accumulated and start a fresh block rather than growing one without
         // limit.
         if (push_used_ >= max_push_block_bytes) flush_push_batch();
+        reset_push_block_if_shared();
 
         std::optional<MsgSlice> slice;
         if (push->wire_expr.scope == 0) {
@@ -874,8 +875,26 @@ class Face : public std::enable_shared_from_this<Face> {
         push_batch_.clear();
         push_batch_.reserve(count);
         push_used_ = 0;
+        // NOT tested here: the post above holds a reference by construction, and
+        // `asio::post` never runs its handler inline, so `unique()` is false on every
+        // single flush -- the block was dropped and reallocated every frame, which is the
+        // opposite of the intended reuse (and contradicted docs/BROKER.md's "allocates
+        // nothing at all in steady state"). The check belongs at the point of *use*,
+        // where the routing strand has usually finished with the previous batch: see
+        // `reset_push_block_if_shared`, called before the next frame's first Push.
+    }
+
+    /// Start the next frame on a block nothing else still holds.
+    ///
+    /// Called when a frame's composition begins, not when the previous one is handed
+    /// off: by then the routing strand has typically consumed the earlier batch, so the
+    /// refcount is back to one and the buffer is genuinely reusable. A block that has
+    /// grown oversized is also dropped here rather than kept for the life of the face.
+    auto reset_push_block_if_shared() -> void {
+        assert(strand_.running_in_this_thread());
+        if (push_used_ != 0) return; // mid-frame: the block is in use
         if (!push_block_.unique() || push_block_.capacity() > max_push_block_bytes) {
-            push_block_ = SharedBuf{}; // still in flight, or grown oversized: start over
+            push_block_ = SharedBuf{};
         }
     }
 

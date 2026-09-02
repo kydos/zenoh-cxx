@@ -151,10 +151,29 @@ auto ResourceTable::matching(MatchCache& cache, std::string_view key, bool want_
     // though its `key` may itself be a pattern (e.g. get()'s "demo/example/**") --
     // an exact hash hit only fires when a declaration exists on that identical
     // string, which is still a correct match (a pattern intersects itself).
+    // A face that matches through several declarations appears once, with the union
+    // of what those declarations say. Keeping only the first one seen would be
+    // *ordering-dependent* -- `by_key_` is an unordered_map, so which of a face's
+    // matching declarations "wins" can change when the table rehashes -- and it loses
+    // information: a face with `a/*` (incomplete) and `a/**` (complete) would answer a
+    // `QueryTarget::all_complete` query for `a/x/y` or not depending on iteration
+    // order. Folding is both deterministic and the honest answer to "does this face
+    // have a complete queryable matching this key".
+    auto add = [&out](const FaceCtx& fc) {
+        if (auto* dup = find_face(out, fc.face_id)) {
+            dup->subscriber = dup->subscriber || fc.subscriber;
+            dup->queryable = dup->queryable || fc.queryable;
+            dup->qinfo.complete = dup->qinfo.complete || fc.qinfo.complete;
+            dup->qinfo.distance = std::min(dup->qinfo.distance, fc.qinfo.distance);
+            return;
+        }
+        out.push_back(fc);
+    };
+
     auto const exact = by_key_.find(key);
     if (exact != by_key_.end()) {
         for (auto const& fc : exact->second.faces) {
-            if (want_queryable ? fc.queryable : fc.subscriber) out.push_back(fc);
+            if (want_queryable ? fc.queryable : fc.subscriber) add(fc);
         }
     }
     for (auto const& [declared_key, res] : by_key_) {
@@ -165,8 +184,7 @@ auto ResourceTable::matching(MatchCache& cache, std::string_view key, bool want_
             // A face with two+ overlapping declared subscriptions must still be
             // delivered to exactly once per message (mirrors the reference router's
             // route dedup by destination face id, not by matched resource).
-            if (find_face(out, fc.face_id) != nullptr) continue;
-            out.push_back(fc);
+            add(fc);
         }
     }
     return cache.entries.emplace(std::string(key), std::move(out)).first->second;

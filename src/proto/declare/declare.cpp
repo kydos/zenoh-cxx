@@ -68,6 +68,7 @@ namespace {
         if (eh.id == 0x0f) {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             we = ZTRY(WireExpr::decode_full(sub));
+            ZTRY(ext_body_fully_read(sub));
         } else if (eh.mandatory) {
             return std::unexpected(CodecError::malformed);
         } else {
@@ -269,6 +270,7 @@ auto Declare::decode(ByteReader& r) noexcept -> std::expected<Declare, CodecErro
         case 0x2: {
             ByteReader sub{ZTRY(read_ext_zstruct(r))};
             d.timestamp = ZTRY(Timestamp::decode(sub));
+            ZTRY(ext_body_fully_read(sub));
             break;
         }
         case 0x3:

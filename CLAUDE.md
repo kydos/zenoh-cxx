@@ -23,7 +23,9 @@ Three static libraries:
 ### Reference implementation
 
 [eclipse-zenoh/zenoh](https://github.com/eclipse-zenoh/zenoh) (Rust) is the
-protocol/behavior reference, checked out locally at `../zenoh-rust`. Use it both to
+protocol/behavior reference, checked out locally as a sibling of this repo's root —
+`../../zenoh-rust` from a worktree such as `zenoh-cxx/main` (the codec lives in
+`commons/zenoh-codec`, the transport in `io/zenoh-transport`). Use it both to
 validate behavior and to test this codebase:
 
 - **Wire format**: `tools/vector-gen` path-deps the reference's `zenoh-proto` crate

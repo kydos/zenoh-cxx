@@ -164,6 +164,21 @@ template <std::unsigned_integral T>
     return r.read_slice(static_cast<std::size_t>(n));
 }
 
+/// `malformed` unless a length-delimited extension body was consumed exactly.
+///
+/// A ZStruct extension declares its body length, and `read_ext_zstruct` bounds the
+/// sub-reader to it, so trailing bytes cannot desynchronize the *outer* stream the way
+/// they would in the reference (which decodes such bodies straight from the main
+/// reader). They are still wrong: the message decodes as if they were not there and
+/// re-encodes shorter than it arrived, so a broker relaying it silently rewrites the
+/// peer's bytes. Applied to fixed-shape bodies only -- Attachment and `Value`'s payload
+/// are defined as "the rest of the slice" and are meant to consume it.
+[[nodiscard]] inline auto ext_body_fully_read(const ByteReader& sub) noexcept
+    -> std::expected<void, CodecError> {
+    if (sub.remaining() != 0) return std::unexpected(CodecError::malformed);
+    return {};
+}
+
 /// Discard an unrecognized (non-mandatory) extension by kind.
 [[nodiscard]] inline auto skip_ext(ByteReader& r, ExtKind kind) noexcept
     -> std::expected<void, CodecError> {
