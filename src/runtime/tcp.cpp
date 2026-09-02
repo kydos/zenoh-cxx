@@ -195,6 +195,17 @@ auto TcpLink::write_some(std::span<const std::byte> data) noexcept
     return off;
 }
 
+auto TcpLink::read_some(std::span<std::byte> out) noexcept -> std::expected<std::size_t, IoError> {
+    for (;;) {
+        ssize_t const n = ::recv(fd_, out.data(), out.size(), 0);
+        if (n > 0) return static_cast<std::size_t>(n);
+        if (n == 0) return std::unexpected(IoError::closed);
+        if (errno == EINTR) continue; // restart on signal interruption
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return std::unexpected(IoError::would_block);
+        return std::unexpected(errno_to_io(errno));
+    }
+}
+
 auto TcpLink::read_exact(std::span<std::byte> out) noexcept -> std::expected<void, IoError> {
     std::size_t off = 0;
     while (off < out.size()) {

@@ -405,15 +405,34 @@ class Session {
     /// never merely because a shortened wait timed out.
     [[nodiscard]] auto pump_step(std::optional<std::int32_t> max_wait_ms = std::nullopt)
         -> std::expected<void, ZError>;
+    /// Read as much of the next batch as the socket has right now.
+    ///
+    /// Returns the batch's body length once it is complete, `nullopt` when it is still
+    /// arriving (progress is kept in `rx_hdr_`/`rx_need_`/`rx_fill_`, so the caller can
+    /// go and do something else and come back), or an error for a real failure. Never
+    /// blocks.
+    [[nodiscard]] auto recv_batch_step() -> std::expected<std::optional<std::size_t>, ZError>;
     /// Walk the received batch from the cursor, decoding and posting each message,
-    /// until a strand is full or the batch is exhausted.
+    /// until a strand is full or the batch is exhausted. Returns `false` when it
+    /// stopped because a strand was full — the cursor is left where it is, and the
+    /// caller must free space (`drain_handlers`, or the application calling `recv`)
+    /// before there is any point retrying.
     ///
     /// A batch is a sequence of *transport* messages (Frame, KeepAlive, Close), and a
     /// Frame's body is the run of *network* messages that follows it — which ends at
     /// the first id that is not a network one (`is_network_mid`), not at the end of
     /// the batch. Both kinds are handled by this one loop, so a KeepAlive packed
     /// after a frame is just the next iteration.
-    [[nodiscard]] auto dispatch_cursor() -> std::expected<void, ZError>;
+    [[nodiscard]] auto dispatch_cursor() -> std::expected<bool, ZError>;
+    /// Deliver everything queued for handler-backed subscribers/queryables/gets.
+    ///
+    /// Callback-style registrations need no application call to drain, so *any* pump
+    /// caller can and must drain them — not just `run_once`. Otherwise a full callback
+    /// subscriber strand head-of-line blocks the shared receive cursor: a `get()`
+    /// pumping for its reply would re-decode the same undeliverable sample forever
+    /// (measured: 200k no-progress iterations in 1.2 s) and time out with its reply
+    /// already sitting in the receive buffer.
+    auto drain_handlers() -> void;
     /// Resolve a received `WireExpr` to an owned key string (via the resmap).
     [[nodiscard]] auto resolve_key(const WireExpr& we) -> std::expected<std::string, ZError>;
     /// Pull the next sample (drives `pump_step` until the strand yields). For `Subscriber`.
@@ -467,6 +486,20 @@ class Session {
     std::vector<std::byte> rx_buf_{}; ///< current received TCP batch
     std::size_t rx_pos_ = 0;          ///< dispatch cursor into rx_buf_
     std::size_t rx_end_ = 0;          ///< end of the in-progress batch (==pos: none)
+    /// Partially-received batch, so the pump can leave one half-arrived and come back.
+    ///
+    /// Reading a batch used to mean two blocking `read_exact`s. Once the 2-byte length
+    /// prefix had been consumed, the session was committed to waiting for the whole
+    /// body with no timeout: a peer that announces 100 bytes, sends 5 and stalls
+    /// froze the pump — `get()` deadlines went unnoticed, no keepalive went out, and
+    /// the router eventually dropped us for lease expiry. Timing out and discarding
+    /// the partial read is not an option either: those bytes are gone from the socket,
+    /// so the byte stream would desynchronize. Keeping the progress is what makes
+    /// returning to the caller safe.
+    std::array<std::byte, 2> rx_hdr_{}; ///< length prefix as it arrives
+    std::size_t rx_hdr_fill_ = 0;       ///< bytes of `rx_hdr_` received (0..2)
+    std::size_t rx_need_ = 0;           ///< body length once the prefix is complete
+    std::size_t rx_fill_ = 0;           ///< bytes of the body already in `rx_buf_`
     std::unordered_map<std::uint16_t, std::string> resmap_; ///< router keyexpr id -> key
     std::optional<ZError> fault_{};     ///< sticky terminal fault (stream desynced)
     std::uint32_t next_entity_id_ = 0;  ///< monotonic subscriber/queryable entity id

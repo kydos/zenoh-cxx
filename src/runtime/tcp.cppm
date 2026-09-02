@@ -58,8 +58,20 @@ class TcpLink {
         -> std::expected<std::size_t, IoError>;
 
     /// Read exactly `out.size()` bytes, blocking as needed (polls POLLIN on EAGAIN).
+    ///
+    /// Only for the handshake, which is blocking by design. The data phase must not
+    /// use it: once a partial batch has been consumed from the socket, this waits for
+    /// the rest with no timeout, so a peer that stalls mid-batch freezes the pump —
+    /// past any `get()` deadline, and with no keepalive going out. Use `read_some`.
     [[nodiscard]] auto read_exact(std::span<std::byte> out) noexcept
         -> std::expected<void, IoError>;
+
+    /// Read whatever is available right now, up to `out.size()` bytes, without
+    /// blocking; returns how many were read (never 0). `would_block` when nothing is
+    /// available, `closed` on EOF. The read counterpart of `write_some`, and what lets
+    /// the receive pump resume a half-arrived batch instead of blocking inside it.
+    [[nodiscard]] auto read_some(std::span<std::byte> out) noexcept
+        -> std::expected<std::size_t, IoError>;
 
     /// Wait up to `timeout_ms` for the socket to become readable. Returns `true` if it
     /// is readable, `false` if the timeout elapsed first, or `closed`/`failed` on a

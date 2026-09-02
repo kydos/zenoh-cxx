@@ -703,3 +703,177 @@ TEST("Session::local_zid() returns a stable, non-empty id") {
     sess->close();
     router.join();
 }
+
+// A callback subscriber whose strand fills up used to head-of-line block the shared
+// receive cursor for *every* consumer: get() pumps the same cursor, so it re-decoded
+// the undeliverable sample on every iteration (200k no-progress pumps in 1.2 s, at
+// 100% CPU) and timed out with its reply already sitting in the receive buffer.
+// Callback registrations need no application call to drain, so any pump caller now
+// drains them and retries.
+TEST("a full callback-subscriber strand does not block a concurrent get()") {
+    QueryRouter router([&](int fd) {
+        auto batch = recv_batch(fd); // DeclareSubscriber
+        if (!batch) return;
+        auto req_batch = recv_batch(fd); // the Request
+        if (!req_batch) return;
+        auto r = open_frame(*req_batch);
+        if (!r) return;
+        auto req = Request::decode(*r);
+        if (!req) return;
+
+        // One batch: four pushes (capacity is 2, so the strand fills), then the reply
+        // and its final. Everything the client needs is in the buffer at once.
+        send_batch(fd, build_frame(1, [&](ByteWriter& w) {
+                       for (int i = 0; i < 4; ++i) {
+                           Push push{};
+                           push.wire_expr =
+                               WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = "demo/s"};
+                           Put put{};
+                           put.payload = bytes("sample");
+                           push.payload = PushBody{.body = std::move(put)};
+                           (void)push.encode(w);
+                       }
+                       Response rsp{};
+                       rsp.rid = req->id;
+                       rsp.wire_expr =
+                           WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = "demo/q"};
+                       Put rput{};
+                       rput.payload = bytes("reply");
+                       rsp.payload.body = Reply{.payload = PushBody{.body = rput}};
+                       (void)rsp.encode(w);
+                       ResponseFinal rf{};
+                       rf.rid = req->id;
+                       (void)rf.encode(w);
+                   }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    });
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    int delivered = 0;
+    auto sub = sess->declare_subscriber(
+        "demo/**", [&](const Sample&) { ++delivered; }, SubscriberOptions{.capacity = 2});
+    CHECK(sub.has_value());
+
+    auto getter = sess->get("demo/q", "", GetOptions{.timeout_ms = 700});
+    CHECK(getter.has_value());
+    if (!getter) {
+        sess->close();
+        router.join();
+        return;
+    }
+    auto reply = getter->recv(); // used to return query_timeout after 700 ms
+    CHECK(reply.has_value());
+    if (reply && *reply) CHECK(str((*reply)->sample().payload()) == "reply");
+    // The get() no longer waits on the subscriber: draining it is what unblocked the
+    // cursor, so some samples are already delivered by the time the reply arrives.
+    CHECK(delivered > 0);
+    // And none were dropped -- the rest are queued, and the next pump hands them over.
+    (void)sess->run_once(); // may report the router's EOF; the samples come first
+    CHECK(delivered == 4);
+
+    sess->close();
+    router.join();
+}
+
+// A peer that announces a batch and then stalls mid-body used to freeze the pump:
+// recv_batch consumed the 2-byte length prefix and then blocked in read_exact with no
+// timeout, so the get()'s own deadline went unnoticed (the call returned only when the
+// peer eventually closed) and no keepalive went out in the meantime. The receive path
+// now keeps the partial batch on the session and returns to its caller instead --
+// discarding the partial read was never an option, since those bytes are gone from the
+// socket and the stream would desynchronize.
+TEST("a peer stalling mid-batch does not outlast the get() deadline") {
+    QueryRouter router([&](int fd) {
+        auto batch = recv_batch(fd); // the Request
+        if (!batch) return;
+        // Announce 100 bytes, send 5, then sit on it.
+        std::array<std::byte, 2> len{};
+        store_le<std::uint16_t>(len.data(), 100);
+        std::array<std::byte, 5> partial{};
+        (void)::send(fd, len.data(), len.size(), 0);
+        (void)::send(fd, partial.data(), partial.size(), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    });
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto getter = sess->get("demo/stalled", "", GetOptions{.timeout_ms = 200});
+    CHECK(getter.has_value());
+    if (!getter) {
+        sess->close();
+        router.join();
+        return;
+    }
+
+    auto const start = std::chrono::steady_clock::now();
+    auto r = getter->recv();
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    CHECK(!r.has_value() && r.error() == ZError::query_timeout);
+    CHECK(elapsed < 1000); // pre-fix: blocked until the router closed, ~2500 ms
+
+    sess->close();
+    router.join();
+}
+
+// GetOptions::timeout_ms is a uint32 of milliseconds, so a caller may legitimately
+// pass something like 34 days as "effectively no timeout". Getter::recv() bounds each
+// pump to what is left of that deadline, computed as an int64 and then narrowed to the
+// int32 poll() takes -- with no clamp, so past ~24.8 days it wrapped negative, std::min
+// kept the negative, and poll() reads a negative timeout as "wait forever". The session
+// then stopped emitting keepalives entirely and the router dropped it on lease expiry.
+TEST("a very long get() timeout still lets keepalives out") {
+    std::atomic<bool> saw_keepalive{false};
+
+    QueryRouter router([&](int fd) {
+        auto batch = recv_batch(fd); // the Request
+        if (!batch) return;
+        // The client's keepalive cadence is lease/4 = 2.5 s. Wait past it, then hang
+        // up either way -- that is what releases the blocked recv() below.
+        timeval tv{.tv_sec = 4, .tv_usec = 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        while (auto b = recv_batch(fd)) {
+            ByteReader r{*b};
+            auto pk = r.peek();
+            if (!pk) break;
+            if ((std::to_integer<std::uint8_t>(*pk) & mid_mask) == KeepAlive::id) {
+                saw_keepalive = true;
+                break;
+            }
+        }
+    });
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto getter = sess->get("demo/forever", "", GetOptions{.timeout_ms = 3'000'000'000U});
+    CHECK(getter.has_value());
+    if (!getter) {
+        sess->close();
+        router.join();
+        return;
+    }
+
+    // recv() is what drives the clamped pump. It cannot return on its own here -- the
+    // deadline is ~34 days away -- so it blocks until the router hangs up, which is
+    // exactly the behaviour under test: the keepalive has to go out meanwhile.
+    auto r = getter->recv();
+    CHECK(!r.has_value()); // released by the router's close, not by the deadline
+    CHECK(saw_keepalive.load());
+
+    sess->close();
+    router.join();
+}

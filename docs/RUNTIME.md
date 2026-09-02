@@ -38,6 +38,32 @@ opener/client:
 The socket is **blocking during the handshake** (request/response), then switched to
 **non-blocking** for the data phase so `try_put` can detect backpressure.
 
+## Receiving: never block inside a batch
+
+`pump_step` reads with `TcpLink::read_some` and keeps a partially-arrived batch on the
+session (`rx_hdr_`/`rx_need_`/`rx_fill_`), so it can return to its caller and resume
+later. That matters because the alternative — two blocking `read_exact`s — commits the
+session to waiting for the whole body the moment the 2-byte length prefix is consumed:
+a peer that announces 100 bytes, sends 5 and stalls used to freeze the pump, past any
+`get()` deadline and with no keepalive going out, until it eventually closed. Timing
+out and *discarding* the partial read is not an alternative — those bytes are gone from
+the socket, so the byte stream would desynchronize. `read_exact` remains, for the
+handshake, which is blocking by design.
+
+A full subscriber/queryable strand pauses the dispatch cursor rather than dropping the
+message, and `dispatch_cursor` reports that it stalled. Any pump caller then drains
+*callback-backed* registrations (`drain_handlers`) and retries, because those need no
+application call to drain: without that, a callback subscriber whose queue filled would
+head-of-line block the shared cursor for everyone, and a `get()` pumping for its reply
+would spin re-decoding the same undeliverable sample until it timed out with the reply
+already in the buffer. A **pull**-style strand nobody is draining still blocks the
+cursor — that is inherent to one cursor plus bounded queues — but the pump paces itself
+instead of spinning, and the application calling `recv()` is what unblocks it.
+
+Every terminal error is reported *after* whatever the same pump already delivered:
+`sub_recv`/`qbl_recv`/`run_once` hand over queued messages first and surface the fault
+once the queue drains. A `Close` packed in behind a frame is the routine case.
+
 ## TCP framing
 
 Each TCP batch is prefixed by a **2-byte little-endian length** covering the bytes

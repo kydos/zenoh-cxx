@@ -787,8 +787,15 @@ auto Session::get_recv(std::uint32_t rid) -> std::expected<std::optional<GetRepl
         auto const remaining_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(it->second->deadline - now)
                 .count();
-        if (auto p = pump_step(static_cast<std::int32_t>(remaining_ms)); !p)
-            return std::unexpected(p.error());
+        // Clamped, not just narrowed: `remaining_ms` is an int64, and a timeout beyond
+        // ~24.8 days (well inside the uint32 milliseconds GetOptions accepts) wrapped
+        // negative here. std::min then kept the negative, and poll() reads a negative
+        // timeout as "wait forever" -- so the longest timeouts became infinite ones,
+        // with no keepalive going out either, and the router dropped the session on
+        // lease expiry. Nothing above the keepalive cadence is useful anyway.
+        auto const wait =
+            static_cast<std::int32_t>(std::clamp<std::int64_t>(remaining_ms, 0, keepalive_ms_));
+        if (auto p = pump_step(wait); !p) return std::unexpected(p.error());
     }
 }
 
@@ -828,7 +835,7 @@ auto Session::resolve_key(const WireExpr& we) -> std::expected<std::string, ZErr
     return out;
 }
 
-auto Session::dispatch_cursor() -> std::expected<void, ZError> {
+auto Session::dispatch_cursor() -> std::expected<bool, ZError> {
     while (rx_pos_ < rx_end_) {
         std::span<const std::byte> const body{rx_buf_.data() + rx_pos_, rx_end_ - rx_pos_};
         ByteReader r{body};
@@ -862,7 +869,7 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
                 Sample sample{*key, std::move(payload), kind};
                 if (sub_->strand.post(*key, std::move(sample)) == PostResult::full) {
                     // Strand full: leave the cursor; the consumer drains, then we retry.
-                    return {};
+                    return false;
                 }
             }
             rx_pos_ = rx_end_ - r.remaining(); // committed: advance past this message
@@ -906,7 +913,7 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
                                 .params = std::string(req->payload.query.parameters),
                                 .payload = std::move(payload)};
                 if (qbl_->strand.post(*key, std::move(pq)) == PostResult::full) {
-                    return {}; // pause; retry next pump
+                    return false; // pause; retry next pump
                 }
             } else {
                 // No queryable declared on this session: nobody will ever construct an
@@ -944,7 +951,7 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
                     gr.err_payload_.assign(err->payload.begin(), err->payload.end());
                     post_result = it->second->strand.post(std::string_view{}, std::move(gr));
                 }
-                if (post_result == PostResult::full) return {}; // pause; retry next pump
+                if (post_result == PostResult::full) return false; // pause; retry next pump
             }
             // else: unknown/already-cleaned-up rid (e.g. client-side timeout already
             // fired) — silently ignore, matching resolve_key's "tolerate the unknown"
@@ -989,12 +996,85 @@ auto Session::dispatch_cursor() -> std::expected<void, ZError> {
         }
     }
     rx_pos_ = rx_end_ = 0; // batch fully consumed
-    return {};
+    return true;
+}
+
+auto Session::recv_batch_step() -> std::expected<std::optional<std::size_t>, ZError> {
+    // The 2-byte little-endian length prefix, possibly across several reads.
+    while (rx_hdr_fill_ < rx_hdr_.size()) {
+        auto n = link_.read_some(std::span(rx_hdr_).subspan(rx_hdr_fill_));
+        if (!n) {
+            if (n.error() == IoError::would_block) return std::nullopt;
+            return std::unexpected(io_to_zerr(n.error()));
+        }
+        rx_hdr_fill_ += *n;
+    }
+    if (rx_need_ == 0 && rx_fill_ == 0) {
+        rx_need_ = load_le<std::uint16_t>(rx_hdr_.data());
+        if (rx_buf_.size() < rx_need_) rx_buf_.resize(rx_need_);
+    }
+
+    while (rx_fill_ < rx_need_) {
+        auto n = link_.read_some(std::span(rx_buf_).subspan(rx_fill_, rx_need_ - rx_fill_));
+        if (!n) {
+            if (n.error() == IoError::would_block) return std::nullopt;
+            return std::unexpected(io_to_zerr(n.error()));
+        }
+        rx_fill_ += *n;
+    }
+
+    auto const len = rx_need_;
+    rx_hdr_fill_ = 0; // ready for the next batch
+    rx_need_ = 0;
+    rx_fill_ = 0;
+    return len;
+}
+
+// Deliver to callback-style registrations. Cheap and always safe to call: a handler
+// may undeclare its own registration, so re-test the owner each iteration and invoke
+// through a copy (see run_once).
+auto Session::drain_handlers() -> void {
+    while (sub_ && sub_->handler) {
+        auto s = sub_->strand.pop();
+        if (!s) break;
+        auto handler = sub_->handler;
+        handler(*s);
+    }
+    while (qbl_ && qbl_->handler) {
+        auto pq = qbl_->strand.pop();
+        if (!pq) break;
+        auto handler = qbl_->handler;
+        handler(IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
+                              std::move(pq->payload)));
+    }
+    for (auto& [rid, reg] : pending_gets_) {
+        if (!reg->handler) continue;
+        while (auto r = reg->strand.pop()) reg->handler(*r);
+    }
 }
 
 auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expected<void, ZError> {
-    if (fault_) return std::unexpected(*fault_);     // sticky terminal fault — never resync
-    if (rx_pos_ < rx_end_) return dispatch_cursor(); // resume an in-progress frame
+    if (fault_) return std::unexpected(*fault_); // sticky terminal fault — never resync
+    if (rx_pos_ < rx_end_) {                     // resume an in-progress batch
+        auto progressed = dispatch_cursor();
+        if (!progressed) return std::unexpected(progressed.error());
+        if (*progressed) return {};
+        // Stalled on a full strand. Anything with a callback can be drained right
+        // here, whoever is pumping -- otherwise a callback subscriber that nobody is
+        // calling run_once() for head-of-line blocks the shared cursor, and a get()
+        // pumping for its reply spins re-decoding the same undeliverable sample.
+        drain_handlers();
+        auto retried = dispatch_cursor();
+        if (!retried) return std::unexpected(retried.error());
+        if (*retried) return {};
+        // Still stalled: the blocked strand is pull-style and its owner is not the
+        // caller pumping here (e.g. get_recv() while an undrained subscriber queue is
+        // full). Nothing this call can do, but returning immediately would spin, so
+        // pace it against the socket instead of burning the CPU. The application
+        // draining that Subscriber is what actually unblocks the cursor.
+        (void)link_.poll_readable(std::min<std::int32_t>(max_wait_ms.value_or(1), 1));
+        return {};
+    }
 
     // A caller-supplied max_wait_ms only ever shortens this call's poll (e.g.
     // get_recv bounding it to a get()'s own deadline so a short GetOptions::timeout
@@ -1018,12 +1098,16 @@ auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expecte
         return {};
     }
 
-    auto len = recv_batch(link_, rx_buf_);
+    auto len = recv_batch_step();
     if (!len) {
         fault_ = len.error();
         return std::unexpected(*fault_);
     }
-    if (*len == 0) return {};
+    // Still arriving: the progress is held on the session, so returning here is safe
+    // and lets the caller re-check its own deadline (and us send a keepalive on the
+    // next idle wait) instead of blocking inside a half-read batch.
+    if (!*len) return {};
+    if (**len == 0) return {};
 
     // A batch is a *sequence* of transport messages, not one message: the reference
     // packs a KeepAlive (or a Close, or a second Frame) into whatever batch is
@@ -1032,8 +1116,11 @@ auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expecte
     // `[Frame][Push][KeepAlive]` from looking like a desync and `[KeepAlive][Frame]`
     // from silently discarding the frame behind it.
     rx_pos_ = 0;
-    rx_end_ = *len;
-    return dispatch_cursor();
+    rx_end_ = **len;
+    if (auto progressed = dispatch_cursor(); !progressed) {
+        return std::unexpected(progressed.error());
+    }
+    return {};
 }
 
 auto Session::sub_recv() -> std::expected<Sample, ZError> {
@@ -1063,25 +1150,16 @@ auto Session::qbl_recv() -> std::expected<IncomingQuery, ZError> {
 }
 
 auto Session::run_once() -> std::expected<void, ZError> {
-    if (auto r = pump_step(); !r) return std::unexpected(r.error());
+    // The pump's error is reported *after* delivering, not instead of it: a pump that
+    // ends in EOF (or any other terminal fault) may have posted messages from the same
+    // batch first, and dropping them on the floor loses data the peer did send. The
+    // fault is sticky, so it is still there on the next call.
+    auto pumped = pump_step();
     // A handler may undeclare (or destroy) its own Subscriber/Queryable -- "stop after
-    // N samples" is the obvious case -- which runs sub_drop()/qbl_drop() and frees the
-    // registration the loop is standing on. So re-test the owner every iteration, and
-    // call through a *copy* of the std::function: invoking `sub_->handler(...)` would
-    // otherwise be a call through storage the call itself deletes.
-    while (sub_ && sub_->handler) {
-        auto s = sub_->strand.pop();
-        if (!s) break;
-        auto handler = sub_->handler;
-        handler(*s);
-    }
-    while (qbl_ && qbl_->handler) {
-        auto pq = qbl_->strand.pop();
-        if (!pq) break;
-        auto handler = qbl_->handler;
-        handler(IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
-                              std::move(pq->payload)));
-    }
+    // N samples" is the obvious case -- which frees the registration the loop is
+    // standing on; `drain_handlers` re-tests the owner each iteration and invokes
+    // through a copy of the std::function for exactly that reason.
+    drain_handlers();
     // Drain callback-style get()s. Pull-style (handler-empty) entries are owned
     // entirely by their Getter (recv()'s own pump loop and ~Getter()'s cleanup), so
     // they're deliberately left untouched here to avoid two owners racing to erase
@@ -1098,6 +1176,7 @@ auto Session::run_once() -> std::expected<void, ZError> {
         else
             ++it;
     }
+    if (!pumped) return std::unexpected(pumped.error());
     return {};
 }
 
