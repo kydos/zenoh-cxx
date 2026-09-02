@@ -164,6 +164,37 @@ CI runs both via `scripts/lint.sh` inside the Docker image, reusing the
 handful of checks that fight this codebase's deliberate idioms (documented inline in
 the file) — e.g. the `ZTRY` macro's `expected::value()` call never actually throws.
 
+The `.clang-tidy` check list is anchored with a leading `-*` on purpose: without it
+the enabled set is version-dependent (clang-tidy ≤19 appends a config file's
+`Checks` to its built-in `clang-analyzer-*` default, newer ones don't), which is how
+the static analyzer once ran on CI and nowhere else. Add checks to the list, never
+rely on a tool default.
+
+## CI
+
+`.github/workflows/ci.yml` is one Linux job, all of it inside the Docker toolchain
+image: build + `ctest` (`scripts/docker-ci.sh`), then lint (`scripts/lint.sh`), then
+coverage (`scripts/docker-coverage.sh`) and a Codecov upload. Every step runs the
+same script a developer runs locally, so a CI failure is reproducible with one
+command — reproduce it that way before theorising.
+
+**After every push, verify the run went green before calling the work done.** A
+commit whose CI has not been checked is unfinished work, not a finished change:
+
+```sh
+gh run list --limit 1                  # the run for the commit just pushed
+gh run watch <run-id> --exit-status    # block until it finishes
+gh run view <run-id> --log-failed      # on failure: only the failing step's log
+```
+
+Two failure modes look alike and must not be confused. A *defect* is in the change
+(or in the CI config) and has to be fixed. A *flake* is external — most often
+`apt.llvm.org` being briefly unreachable while the toolchain image builds, which
+fails the run in well under a minute at llvm.sh's GPG-key preflight;
+`scripts/docker-image.sh` retries the image build for exactly this reason, and a run
+that still dies there is an upstream outage, so re-run it (`gh run rerun <run-id>`)
+rather than changing the repo.
+
 ## Conventions
 
 - **Public API must be well documented.** Every exported type/function/enum (not

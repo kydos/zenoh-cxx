@@ -9,7 +9,8 @@ cd "$(dirname "$0")/.."
 
 IMAGE=zenoh-linux-ci
 
-docker build -t "$IMAGE" -f docker/Dockerfile .
+# Retried on failure — apt.llvm.org outages otherwise fail the run (see the script).
+scripts/docker-image.sh "$IMAGE"
 
 # Mount the repo and run as the host user so generated files aren't root-owned.
 docker run --rm \
