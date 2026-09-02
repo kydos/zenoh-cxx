@@ -188,3 +188,55 @@ TEST("encode rejects an empty zid (would underflow the length nibble)") {
         CHECK(id.encode(w).has_value());
     }
 }
+
+// `Timestamp::id_len` indexes a fixed 16-byte array but is a plain public member, so
+// `encode` has to bound it like every other nibble-encoded zid length in the codec
+// (EntityGlobalId, DestinationId, InitIdentifier). It used to trust it: encoding a
+// Timestamp with id_len > 16 read past the array -- an ASan stack-buffer-overflow,
+// and `encoded_len()` reported a size large enough for the whole overread to fit.
+TEST("Timestamp::encode rejects an id_len past the end of the id array") {
+    std::array<std::byte, 512> buf{};
+
+    Timestamp over{};
+    over.time = 1;
+    over.id_len = 200; // way past the 16-byte array
+    ByteWriter w1{buf};
+    CHECK(!over.encode(w1).has_value());
+    CHECK(w1.written() == 0);
+
+    Timestamp just_over{};
+    just_over.time = 1;
+    just_over.id_len = 17;
+    ByteWriter w2{buf};
+    CHECK(!just_over.encode(w2).has_value());
+
+    // An empty id is not encodable either: uhlc source ids are 1..16 bytes.
+    Timestamp empty{};
+    empty.time = 1;
+    empty.id_len = 0;
+    ByteWriter w3{buf};
+    CHECK(!empty.encode(w3).has_value());
+
+    // The boundary value still works, and round-trips.
+    Timestamp ok{};
+    ok.time = 42;
+    ok.id_len = 16;
+    ok.id.fill(std::byte{0xab});
+    ByteWriter w4{buf};
+    CHECK(ok.encode(w4).has_value());
+    ByteReader r{std::span(buf).first(w4.written())};
+    auto back = Timestamp::decode(r);
+    CHECK(back.has_value());
+    if (back) CHECK(*back == ok);
+}
+
+// The reference rejects an empty timestamp id too (`uhlc::ID::try_from` holds a
+// NonZeroU128), so accepting one here would round-trip a value no reference peer
+// considers valid.
+TEST("Timestamp::decode rejects an empty id") {
+    std::array<std::byte, 2> const empty_id{std::byte{0x2a}, std::byte{0x00}};
+    CHECK(rejects<Timestamp>(empty_id));
+
+    std::array<std::byte, 3> const too_long{std::byte{0x2a}, std::byte{0x11}, std::byte{0x00}};
+    CHECK(rejects<Timestamp>(too_long)); // 17 > 16
+}

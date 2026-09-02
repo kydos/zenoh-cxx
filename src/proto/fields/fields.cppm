@@ -131,12 +131,17 @@ struct Timestamp {
     auto operator==(const Timestamp&) const -> bool = default;
 
     /// Encoded length: VLE(time) + VLE(id_len) + id bytes.
+    ///
+    /// Meaningful only for an `id_len` in 1..16 — i.e. one `encode` would accept.
     [[nodiscard]] auto encoded_len() const noexcept -> std::size_t {
         return len_uint(time) + len_uint(id_len) + id_len;
     }
     /// Encode: VLE(time) ++ VLE(id_len) ++ id bytes.
+    ///
+    /// `malformed` if `id_len` is not in 1..16 — it indexes the fixed 16-byte `id`,
+    /// so an out-of-range value would otherwise read past the array.
     [[nodiscard]] auto encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError>;
-    /// Decode the above; rejects `id_len > 16` as malformed.
+    /// Decode the above; rejects an `id_len` outside 1..16 as malformed.
     [[nodiscard]] static auto decode(ByteReader& r) noexcept
         -> std::expected<Timestamp, CodecError>;
 };

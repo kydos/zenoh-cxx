@@ -57,6 +57,20 @@ struct BrokerConfig {
     /// endpoint still takes part -- it dials out and routes normally -- it simply
     /// cannot be dialled back, so it must be able to reach its peers itself.
     std::optional<std::string> advertise{};
+    /// Whether an *inbound* connection may become a clique link by saying so.
+    ///
+    /// A face's `FaceKind` is taken from the peer's own `InitSyn` (`whatami`), which
+    /// nothing authenticates — so with this on, any client that announces
+    /// `whatami = router` is handed clique-peer treatment: gossip ingestion, a replay
+    /// of this broker's declaration state, split-horizon routing, and the far larger
+    /// router congestion budgets. Off by default: an inbound peer that claims `router`
+    /// is logged and demoted to a client face.
+    ///
+    /// Turn it on for the brokers in a clique that *receive* peer links (a mutual dial
+    /// collapses to one connection, so one end of every pair is inbound). Outbound
+    /// links this broker dialled itself are unaffected — those it chose, by config or
+    /// by gossip, and they are clique links either way.
+    bool accept_router_faces = false;
 };
 
 class Broker {
@@ -81,6 +95,11 @@ class Broker {
         -> std::expected<std::unique_ptr<Broker>, BindError>;
 
     /// The bound local port (resolves an ephemeral `port=0` bind).
+    ///
+    /// Captured during `bind`, so this is a plain read of an immutable value and is
+    /// safe to call from any thread at any time — including while the broker is
+    /// running or stopping. It deliberately does not ask the acceptor, which asio
+    /// documents as unsafe to share across threads.
     [[nodiscard]] auto port() const noexcept -> std::uint16_t;
 
     /// Spawn `num_threads` (clamped to >= 1) worker threads running the io_context

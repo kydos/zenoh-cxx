@@ -37,6 +37,27 @@ Two consequences worth being explicit about:
   from a peer is recorded locally and never re-announced, so each broker learns a key
   from the broker that actually owns the subscriber and from nowhere else.
 
+### `whatami` is a claim, not a credential
+
+The `whatami` a peer announces is unauthenticated, so being a clique peer is **opt-in
+per broker**: an inbound face that announces `router` becomes a router face only when
+the broker was started with `BrokerConfig::accept_router_faces`
+(`zenohb --accept-router-faces`). Otherwise it is logged and treated as a client.
+Outbound links are unaffected — this broker dialled those itself, from `--peer` or
+from gossip.
+
+That matters because a router face is not a label: it gets gossip ingestion, a replay
+of this broker's declaration state, split-horizon treatment, and the much larger
+router congestion budgets (16 MiB watermark, 256 MiB ceiling, against 1 MiB and 64 MiB
+for a client). Any client that could claim it would get all of that.
+
+**A mutual dial collapses to one connection, so exactly one end of every peer pair
+sees the link as inbound.** A federation therefore needs `--accept-router-faces` on
+the brokers that receive links — usually simplest to pass it to every broker in the
+clique. Without it the symptom is quiet: the peer connects and is routed to as an
+ordinary client, so the clique appears up but does not federate. The demotion is
+logged to stderr for exactly that reason.
+
 ### Why this is equivalent to the reference, not an approximation of it
 
 The Rust reference (`zenoh/src/net/routing/hat/router/`) routes between routers using
@@ -67,7 +88,8 @@ the design's job is to say so loudly instead of papering over it.
 A broker is given some number of seed peers and dials them:
 
 ```sh
-zenohb -l tcp/0.0.0.0:7447 --advertise tcp/10.0.0.1:7447 --peer tcp/10.0.0.2:7447
+zenohb -l tcp/0.0.0.0:7447 --advertise tcp/10.0.0.1:7447 --peer tcp/10.0.0.2:7447 \
+    --accept-router-faces
 ```
 
 Everything else is learned. On a link coming up, each side sends its full member view
@@ -318,7 +340,8 @@ between them is one gossip produced, not one that was configured:
 
 ```sh
 B=./build/clang-release
-$B/zenohb -l tcp/127.0.0.1:7447 --threads 2 &
+# --accept-router-faces on :7447 because both peer links arrive there inbound.
+$B/zenohb -l tcp/127.0.0.1:7447 --threads 2 --accept-router-faces &
 $B/zenohb -l tcp/127.0.0.1:7448 --peer tcp/127.0.0.1:7447 --threads 2 &
 $B/zenohb -l tcp/127.0.0.1:7449 --peer tcp/127.0.0.1:7447 --threads 2 &
 

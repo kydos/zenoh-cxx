@@ -200,14 +200,19 @@ struct MsgSlice {
 ///
 ///   a message received on a router face is never sent to a router face.
 ///
-/// Deliberately a property of the face rather than a marker carried on the wire (the
+/// Deliberately a property of the face rather than a marker carried per message (the
 /// reference implementation's `NodeId` per-link psid, resolved through a link-state
 /// exchange, is the equivalent there): in a clique every broker is exactly one hop
-/// away, so "did this arrive from a broker" is all the information routing needs, and
-/// deriving it locally means a peer cannot spoof it. It also bounds every message to
-/// at most one inter-broker hop *structurally*, so routing still terminates if the
-/// mesh is ever miswired into a cycle -- a stronger guarantee than assuming the
-/// clique is correctly configured.
+/// away, so "did this arrive from a broker" is all the information routing needs.
+/// That bounds every message to at most one inter-broker hop *structurally*, so
+/// routing still terminates if the mesh is ever miswired into a cycle -- a stronger
+/// guarantee than assuming the clique is correctly configured.
+///
+/// It is not, however, self-authenticating, and an earlier version of this comment
+/// wrongly claimed a peer could not spoof it. The kind of an *inbound* face comes
+/// from that peer's own `InitSyn` (`whatami`), which nothing verifies -- so honouring
+/// it is opt-in per broker (`BrokerConfig::accept_router_faces`), and off by default.
+/// An *outbound* link is a router face unconditionally: this broker chose to dial it.
 enum class FaceKind : std::uint8_t { client, router };
 
 /// How far behind a face's outbound queue has fallen. Three levels rather than the

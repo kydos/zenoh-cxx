@@ -38,6 +38,11 @@ import zenoh;
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 using namespace zenoh::broker;
 using namespace zenoh;
 
@@ -62,8 +67,15 @@ struct TestBroker {
 
     static auto start(std::vector<std::string> peers = {}, unsigned threads = 1) -> TestBroker {
         TestBroker tb;
-        auto b = Broker::bind(
-            BrokerConfig{.listen_host = "127.0.0.1", .listen_port = 0, .peers = std::move(peers)});
+        // Clique links are inbound at one end of every pair (a mutual dial collapses
+        // to a single connection), so every broker in a federation test has to be
+        // willing to accept them -- see BrokerConfig::accept_router_faces, which is
+        // off by default precisely because `whatami` is the peer's own unverified
+        // claim.
+        auto b = Broker::bind(BrokerConfig{.listen_host = "127.0.0.1",
+                                           .listen_port = 0,
+                                           .peers = std::move(peers),
+                                           .accept_router_faces = true});
         CHECK(b.has_value());
         if (!b) return tb;
         tb.broker = std::move(*b);
@@ -241,7 +253,8 @@ TEST("A peer that is not up yet is retried, not an error, and links once it appe
     CHECK(routers(a) == 0); // nothing to connect to yet
 
     // Now bring the peer up on that exact port and let the connector's backoff find it.
-    auto b = Broker::bind(BrokerConfig{.listen_host = "127.0.0.1", .listen_port = port});
+    auto b = Broker::bind(
+        BrokerConfig{.listen_host = "127.0.0.1", .listen_port = port, .accept_router_faces = true});
     CHECK(b.has_value());
     if (!b) return;
     std::thread runner([raw = b->get()] { raw->run(1); });
@@ -270,7 +283,8 @@ TEST("A dropped peer link is re-established by the connector") {
     // Bring a fresh broker up on the same port; the connector reconnects on its own.
     auto b2 = Broker::bind(BrokerConfig{.listen_host = "127.0.0.1",
                                         .listen_port = static_cast<std::uint16_t>(
-                                            std::stoi(endpoint.substr(endpoint.rfind(':') + 1)))});
+                                            std::stoi(endpoint.substr(endpoint.rfind(':') + 1))),
+                                        .accept_router_faces = true});
     CHECK(b2.has_value());
     if (!b2) return;
     std::thread runner([raw = b2->get()] { raw->run(1); });
@@ -1036,7 +1050,8 @@ TEST("A broker whose peer restarts re-links and re-learns its declarations") {
     // A fresh broker on the same endpoint -- a restart, with a new zid. The
     // connector reconnects, and the replay on link-up means the new broker's
     // declarations reach `a` with no operator action.
-    auto b2 = Broker::bind(BrokerConfig{.listen_host = "127.0.0.1", .listen_port = port});
+    auto b2 = Broker::bind(
+        BrokerConfig{.listen_host = "127.0.0.1", .listen_port = port, .accept_router_faces = true});
     CHECK(b2.has_value());
     if (!b2) return;
     std::thread runner([raw = b2->get()] { raw->run(1); });
@@ -1347,7 +1362,8 @@ TEST("An unreachable peer stops being reported once the link comes back") {
     b.shutdown();
     CHECK(wait_until([&] { return unlinked_peers(a) == 1; }));
 
-    auto b2 = Broker::bind(BrokerConfig{.listen_host = "127.0.0.1", .listen_port = port});
+    auto b2 = Broker::bind(
+        BrokerConfig{.listen_host = "127.0.0.1", .listen_port = port, .accept_router_faces = true});
     CHECK(b2.has_value());
     if (!b2) return;
     std::thread runner([raw = b2->get()] { raw->run(1); });
@@ -1455,4 +1471,212 @@ TEST("A clique routes correctly under a multi-threaded broker pool") {
     for (int i = 0; i < subscriber_count; ++i) {
         CHECK(received[static_cast<std::size_t>(i)] == message_count);
     }
+}
+
+// --- who is allowed to be a peer ---
+//
+// A face's FaceKind comes from the peer's own InitSyn (`whatami`), and nothing
+// authenticates it. Accepting that claim from anyone hands a plain client every
+// clique privilege: gossip ingestion, a replay of this broker's declaration state,
+// split-horizon treatment, and the far larger router congestion budgets (16 MiB
+// watermark / 256 MiB ceiling instead of 1 MiB / 64 MiB). It is now opt-in per
+// broker via BrokerConfig::accept_router_faces (`--accept-router-faces`).
+
+// Minimal hand-rolled client handshake that announces an arbitrary `whatami`.
+// Returns the connected fd (caller closes) or -1.
+[[nodiscard]] auto connect_announcing(std::uint16_t port, WhatAmI whatami) -> int {
+    int const fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+
+    auto send_batch = [fd](std::span<const std::byte> body) {
+        std::array<std::byte, 2> len{};
+        store_le<std::uint16_t>(len.data(), static_cast<std::uint16_t>(body.size()));
+        return ::send(fd, len.data(), len.size(), 0) == 2 &&
+               ::send(fd, body.data(), body.size(), 0) == static_cast<ssize_t>(body.size());
+    };
+    auto recv_batch = [fd]() -> std::vector<std::byte> {
+        std::array<std::byte, 2> len{};
+        if (::recv(fd, len.data(), len.size(), MSG_WAITALL) != 2) return {};
+        std::uint16_t const l = load_le<std::uint16_t>(len.data());
+        std::vector<std::byte> body(l);
+        if (l != 0 && ::recv(fd, body.data(), l, MSG_WAITALL) != static_cast<ssize_t>(l)) return {};
+        return body;
+    };
+    auto encode_one = [](const auto& msg) {
+        std::vector<std::byte> buf(4096);
+        ByteWriter w{buf};
+        if (!msg.encode(w)) return std::vector<std::byte>{};
+        return std::vector<std::byte>{buf.data(), buf.data() + w.written()};
+    };
+
+    InitSyn isyn{};
+    isyn.version = 9;
+    isyn.identifier.whatami = whatami;
+    isyn.identifier.zid.len = 16;
+    isyn.identifier.zid.bytes.fill(std::byte{0x77});
+    if (!send_batch(encode_one(isyn))) {
+        ::close(fd);
+        return -1;
+    }
+    auto iack_bytes = recv_batch();
+    ByteReader ir{iack_bytes};
+    auto iack = InitAck::decode(ir);
+    if (!iack) {
+        ::close(fd);
+        return -1;
+    }
+
+    OpenSyn osyn{};
+    osyn.lease = Duration::from_millis(10000);
+    osyn.sn = 0;
+    osyn.cookie = std::span<const std::byte>{iack->cookie};
+    if (!send_batch(encode_one(osyn))) {
+        ::close(fd);
+        return -1;
+    }
+    auto oack_bytes = recv_batch();
+    ByteReader ar{oack_bytes};
+    if (!OpenAck::decode(ar)) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+TEST("a client announcing whatami=router is not accepted as a clique peer by default") {
+    // TestBroker::start opts in (every federation test needs it), so this case binds
+    // a broker directly, keeping the shipped default.
+    auto strict = Broker::bind(BrokerConfig{.listen_host = "127.0.0.1", .listen_port = 0});
+    CHECK(strict.has_value());
+    if (!strict) return;
+    std::thread runner([raw = strict->get()] { raw->run(1); });
+
+    int const fd = connect_announcing((*strict)->port(), WhatAmI::router);
+    CHECK(fd >= 0);
+
+    auto& tables = (*strict)->tables;
+    // The face is registered ...
+    CHECK(wait_until([&] { return on_strand(tables, [&] { return tables.face_count(); }) == 1; }));
+    // ... as a client, not as a clique peer.
+    CHECK(on_strand(tables, [&] { return tables.router_face_count(); }) == 0);
+
+    if (fd >= 0) ::close(fd);
+    (*strict)->stop();
+    runner.join();
+}
+
+TEST("a broker configured with accept_router_faces does honour whatami=router") {
+    auto b = Broker::bind(
+        BrokerConfig{.listen_host = "127.0.0.1", .listen_port = 0, .accept_router_faces = true});
+    CHECK(b.has_value());
+    if (!b) return;
+    std::thread runner([raw = b->get()] { raw->run(1); });
+
+    int const fd = connect_announcing((*b)->port(), WhatAmI::router);
+    CHECK(fd >= 0);
+
+    auto& tables = (*b)->tables;
+    CHECK(wait_until(
+        [&] { return on_strand(tables, [&] { return tables.router_face_count(); }) == 1; }));
+
+    if (fd >= 0) ::close(fd);
+    (*b)->stop();
+    runner.join();
+}
+
+// A router face that is torn down while congested must give its share of
+// `congested_router_faces_` back. That counter read-throttles *every client face* in
+// the broker (see Face::throttle_if_backlogged), so leaking a single count wedges the
+// whole broker for its remaining lifetime: it keeps accepting connections and stops
+// processing client traffic. The leak was possible because a delivery posted from the
+// routing strand before it processed `remove_face` can still run on the face's strand
+// after the read loop has already released the count -- `deliver` captures
+// `shared_from_this()` precisely so the face outlives its own loop -- and re-raised
+// the level with no coroutine left alive to lower it again.
+TEST("a router face torn down while congested leaves the congested count at zero") {
+    auto b = Broker::bind(
+        BrokerConfig{.listen_host = "127.0.0.1", .listen_port = 0, .accept_router_faces = true});
+    CHECK(b.has_value());
+    if (!b) return;
+    std::thread runner([raw = b->get()] { raw->run(1); });
+    auto& tables = (*b)->tables;
+
+    // A "peer broker" that declares interest and then never reads a byte.
+    int const peer_fd = connect_announcing((*b)->port(), WhatAmI::router);
+    CHECK(peer_fd >= 0);
+    if (peer_fd < 0) {
+        (*b)->stop();
+        runner.join();
+        return;
+    }
+    {
+        FrameHeader fh{};
+        fh.reliability = Reliability::reliable;
+        fh.sn = 0;
+        Declare dec{};
+        DeclareSubscriber ds{};
+        ds.id = 1;
+        ds.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = "wedge/**"};
+        dec.body = DeclareBody{.body = ds};
+        std::vector<std::byte> buf(512);
+        ByteWriter w{buf};
+        CHECK(fh.encode(w).has_value());
+        CHECK(dec.encode(w).has_value());
+        std::array<std::byte, 2> len{};
+        store_le<std::uint16_t>(len.data(), static_cast<std::uint16_t>(w.written()));
+        CHECK(::send(peer_fd, len.data(), len.size(), 0) == 2);
+        CHECK(::send(peer_fd, buf.data(), w.written(), 0) == static_cast<ssize_t>(w.written()));
+    }
+    CHECK(wait_until(
+        [&] { return on_strand(tables, [&] { return tables.router_face_count(); }) == 1; }));
+
+    // Fill that face's queue past the 16 MiB router watermark. The peer never reads,
+    // so everything past the socket buffer piles up in the broker.
+    auto pub = zenoh::Session::open("tcp/127.0.0.1:" + std::to_string((*b)->port()));
+    CHECK(pub.has_value());
+    if (!pub) {
+        ::close(peer_fd);
+        (*b)->stop();
+        runner.join();
+        return;
+    }
+    std::vector<std::byte> const payload(60000, std::byte{0xab});
+    auto& counter = tables.congested_router_faces();
+    for (int i = 0; i < 400 && counter.load(std::memory_order_relaxed) == 0; ++i) {
+        if (!pub->put("wedge/x", payload)) break;
+    }
+    CHECK(wait_until([&] { return counter.load(std::memory_order_relaxed) == 1; }));
+
+    // Tear the wedged face down mid-flight and let the deliveries already posted to
+    // its strand land afterwards.
+    ::close(peer_fd);
+    CHECK(wait_until([&] { return counter.load(std::memory_order_relaxed) == 0; }));
+
+    // And the broker is still usable: no client face is left throttled.
+    auto sub_sess = zenoh::Session::open("tcp/127.0.0.1:" + std::to_string((*b)->port()));
+    CHECK(sub_sess.has_value());
+    if (sub_sess) {
+        auto sub = sub_sess->declare_subscriber("after/**");
+        CHECK(sub.has_value());
+        if (sub) {
+            CHECK(wait_until([&] {
+                return on_strand(tables, [&] { return tables.resource_face_count("after/**"); }) ==
+                       1;
+            }));
+            CHECK(pub->put("after/x", bytes("done")).has_value());
+            auto s = sub->recv();
+            CHECK(s.has_value());
+        }
+    }
+
+    (*b)->stop();
+    runner.join();
 }

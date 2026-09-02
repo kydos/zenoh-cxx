@@ -250,7 +250,8 @@ broker/src/
   broker.{cppm,cpp}     zenoh.broker            Broker (bind/run/stop, BrokerConfig); Face, accept loop and
                                                 peer connector live inside broker.cpp only (a toolchain
                                                 constraint — see docs/BROKER.md)
-  main.cpp              (zenohb executable)     CLI: -l/--listen, --peer, --advertise, --threads N
+  main.cpp              (zenohb executable)     CLI: -l/--listen, --peer, --advertise, --threads N,
+                                                --accept-router-faces
 ```
 
 `zenoh-proto` (util → buffer → codec → codec.ext → proto/*) is a pure leaf: no I/O,
@@ -384,7 +385,9 @@ see `PutOptions`/`GetOptions::congestion`.
 
 `zenohb` (`broker/src/main.cpp`, always built) is the broker executable —
 `zenohb -l tcp/host:port [--peer tcp/host:port]... [--advertise tcp/host:port]
-[--threads N]`. It's the manual interop test path in the *other* direction: real
+[--threads N] [--accept-router-faces]` (the last one is required on whichever end of
+a peer pair *receives* the link — `whatami` is the peer's own unverified claim, so
+inbound clique links are opt-in; see `docs/CLIQUE.md`). It's the manual interop test path in the *other* direction: real
 `zenoh-rust` example binaries connecting to this project's own broker — see
 `docs/BROKER.md`'s "Manual interop test", and `docs/CLIQUE.md`'s for a federated one.
 

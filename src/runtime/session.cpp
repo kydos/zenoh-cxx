@@ -1064,13 +1064,23 @@ auto Session::qbl_recv() -> std::expected<IncomingQuery, ZError> {
 
 auto Session::run_once() -> std::expected<void, ZError> {
     if (auto r = pump_step(); !r) return std::unexpected(r.error());
-    if (sub_ && sub_->handler) {
-        while (auto s = sub_->strand.pop()) sub_->handler(*s); // deliver to the callback
+    // A handler may undeclare (or destroy) its own Subscriber/Queryable -- "stop after
+    // N samples" is the obvious case -- which runs sub_drop()/qbl_drop() and frees the
+    // registration the loop is standing on. So re-test the owner every iteration, and
+    // call through a *copy* of the std::function: invoking `sub_->handler(...)` would
+    // otherwise be a call through storage the call itself deletes.
+    while (sub_ && sub_->handler) {
+        auto s = sub_->strand.pop();
+        if (!s) break;
+        auto handler = sub_->handler;
+        handler(*s);
     }
-    if (qbl_ && qbl_->handler) {
-        while (auto pq = qbl_->strand.pop())
-            qbl_->handler(IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
-                                        std::move(pq->payload)));
+    while (qbl_ && qbl_->handler) {
+        auto pq = qbl_->strand.pop();
+        if (!pq) break;
+        auto handler = qbl_->handler;
+        handler(IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
+                              std::move(pq->payload)));
     }
     // Drain callback-style get()s. Pull-style (handler-empty) entries are owned
     // entirely by their Getter (recv()'s own pump loop and ~Getter()'s cleanup), so

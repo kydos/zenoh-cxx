@@ -28,7 +28,7 @@ under federation — a peer-broker link is just another face, distinguished by
 | `zenoh.broker.membership` | `broker/src/membership.cppm`/`.cpp` | `MemberInfo`, `Membership` — clique membership, the gossip payload codec, endpoint validation, and the mutual-dial tie-break. Pure logic, no ASIO. See `docs/CLIQUE.md`. |
 | `zenoh.broker.tables` | `broker/src/tables.cppm`/`.cpp` | `Tables` — the broker's global routing state: face registry, `ResourceTable`, and query fan-out/fan-in bookkeeping, all serialized on one `asio::strand`. `FaceHandle`/`RoutedPush`/`RoutedRequest`/`RoutedResponse` are the owned, strand-crossing-safe shapes routing operates on. |
 | `zenoh.broker` | `broker/src/broker.cppm`/`.cpp` | `Broker` (bind/run/stop, the `io_context` + configurable thread pool) **and**, entirely inside `broker.cpp`'s anonymous namespace, the per-connection `Face` class and the accept loop — see "Why `Face` isn't its own module" below. |
-| `zenohb` | `broker/src/main.cpp` | CLI (`-l`/`--listen tcp/host:port`, `--threads N`) + `Broker::bind`/`run`. |
+| `zenohb` | `broker/src/main.cpp` | CLI (`-l`/`--listen tcp/host:port`, `--threads N`, `--accept-router-faces`) + `Broker::bind`/`run`. |
 
 `zenoh-broker` (the static library backing `zenohb` and the test suite) links
 `zenoh-proto` — **not** `zenoh`, the client runtime. `Session`/`TcpLink`'s blocking,

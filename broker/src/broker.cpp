@@ -149,9 +149,10 @@ enum class FaceRole : std::uint8_t { listener, dialer };
 class Face : public std::enable_shared_from_this<Face> {
   public:
     Face(asio::ip::tcp::socket sock, asio::strand<asio::any_io_executor> strand, FaceId id,
-         Tables* tables, FaceRole role, std::shared_ptr<std::atomic<bool>> dial_suppress = nullptr)
+         Tables* tables, FaceRole role, bool accept_router_faces = false,
+         std::shared_ptr<std::atomic<bool>> dial_suppress = nullptr)
         : sock_(std::move(sock)), strand_(std::move(strand)), id_(id), tables_(tables), role_(role),
-          dial_suppress_(std::move(dial_suppress)) {
+          accept_router_faces_(accept_router_faces), dial_suppress_(std::move(dial_suppress)) {
         // A dialled link is a peer broker by construction; an accepted one is a
         // client until its InitSyn says otherwise (see handshake_listener).
         if (role_ == FaceRole::dialer) kind_ = FaceKind::router;
@@ -184,7 +185,8 @@ class Face : public std::enable_shared_from_this<Face> {
 
         // Drop out of the congested-links count before disappearing: leaving it
         // incremented would read-throttle every client face for the rest of the
-        // broker's life.
+        // broker's life. `torn_down_` makes that release final -- see `set_pressure`.
+        torn_down_ = true;
         set_pressure(FacePressure::ok);
         post_to_tables([id = id_](Tables& tables) { tables.remove_face(id); });
     }
@@ -196,6 +198,7 @@ class Face : public std::enable_shared_from_this<Face> {
     /// one frame and one `write` syscall (see `append_msg`/`pump_tx`).
     auto enqueue_and_pump(const SharedBuf& block, const std::vector<MsgSlice>& slices) -> void {
         assert(strand_.running_in_this_thread());
+        if (torn_down_) return; // a delivery that lost the race with teardown
         auto const bytes = block.bytes();
         for (auto const& slice : slices) {
             if (slice.offset + slice.length <= bytes.size()) {
@@ -228,6 +231,13 @@ class Face : public std::enable_shared_from_this<Face> {
     /// routing strand, and every client face's read loop).
     auto set_pressure(FacePressure p) -> void {
         assert(strand_.running_in_this_thread());
+        // Once the face is finished, only the release to `ok` is honoured. A delivery
+        // posted from the routing strand *before* it processed `remove_face` can still
+        // run on this strand after `run()` has returned (that is exactly why `deliver`
+        // captures `shared_from_this()`), and re-raising the level there would leave
+        // `congested_router_faces_` incremented with no coroutine left alive to ever
+        // decrement it -- read-throttling every client face for the broker's lifetime.
+        if (torn_down_ && p != FacePressure::ok) return;
         auto const previous = pressure_->exchange(p, std::memory_order_relaxed);
         if (previous == p || kind_ != FaceKind::router) return;
         bool const was_behind = previous != FacePressure::ok;
@@ -436,7 +446,21 @@ class Face : public std::enable_shared_from_this<Face> {
         // scouting/link-state machinery this broker does not implement (see
         // docs/BROKER.md's interop note), so it must never be handed router-face
         // semantics.
-        kind_ = isyn->identifier.whatami == WhatAmI::router ? FaceKind::router : FaceKind::client;
+        // `whatami` is the peer's own unauthenticated claim, so an inbound face is a
+        // clique link only where the operator has said inbound peers are expected
+        // (BrokerConfig::accept_router_faces). Without that, a client could announce
+        // `router` and be handed gossip ingestion, a replay of this broker's
+        // declarations, split-horizon treatment and the router congestion budgets.
+        // Outbound links are unaffected: this broker chose to dial those.
+        if (isyn->identifier.whatami == WhatAmI::router && !accept_router_faces_) {
+            // Loud, because the failure mode otherwise is a clique that silently does
+            // not federate: the peer looks connected but is routed to as a client.
+            std::fprintf(stderr, "zenohb: inbound peer announced whatami=router; treating it as a "
+                                 "client (pass --accept-router-faces to allow clique links in)\n");
+        }
+        kind_ = (isyn->identifier.whatami == WhatAmI::router && accept_router_faces_)
+                    ? FaceKind::router
+                    : FaceKind::client;
 
         std::random_device rd;
         std::array<std::byte, 8> cookie{};
@@ -1037,6 +1061,16 @@ class Face : public std::enable_shared_from_this<Face> {
                                                   const asio::error_code& ec, std::size_t) {
                                                   writing_ = false;
                                                   if (ec) {
+                                                      // Nothing will ever drain these
+                                                      // bytes now. Left as-is they keep
+                                                      // `queued_bytes()` permanently
+                                                      // above the watermark, pinning the
+                                                      // face (and, for a router face,
+                                                      // the global congested count) at
+                                                      // congested forever.
+                                                      tx_inflight_len_ = 0;
+                                                      tx_len_ = 0;
+                                                      this->set_pressure(FacePressure::ok);
                                                       close_now();
                                                       return;
                                                   }
@@ -1104,6 +1138,15 @@ class Face : public std::enable_shared_from_this<Face> {
     static constexpr std::size_t no_open_batch = static_cast<std::size_t>(-1);
     std::size_t open_batch_ = no_open_batch;
     bool writing_ = false;
+    /// Set once the read loop has unwound and this face has released its share of
+    /// `congested_router_faces_`. Deliveries and pressure raises are ignored from then
+    /// on: handlers posted before `remove_face` ran can still land on this strand
+    /// afterwards, and honouring them would leak the count (see `set_pressure`).
+    /// Face-strand state, like everything else here.
+    bool torn_down_ = false;
+    /// Whether an inbound `whatami = router` is honoured (BrokerConfig). Immutable
+    /// after construction; always true for a dialled link, which this broker chose.
+    bool accept_router_faces_ = false;
     /// Shared with `Tables` via `FaceHandle::congested` (see its doc comment).
     /// Always non-null: allocated once at construction, never reassigned.
     std::shared_ptr<std::atomic<FacePressure>> pressure_ =
@@ -1134,10 +1177,10 @@ class Face : public std::enable_shared_from_this<Face> {
 // (the accept loop) and passed in, not created here, precisely so the co_spawn
 // call below is the one that binds it.
 [[nodiscard]] auto accept_face(asio::ip::tcp::socket sock,
-                               asio::strand<asio::any_io_executor> strand, Tables& tables)
-    -> asio::awaitable<void> {
+                               asio::strand<asio::any_io_executor> strand, Tables& tables,
+                               bool accept_router_faces) -> asio::awaitable<void> {
     auto face = std::make_shared<Face>(std::move(sock), strand, next_face_id(), &tables,
-                                       FaceRole::listener);
+                                       FaceRole::listener, accept_router_faces);
     co_await face->run();
 }
 
@@ -1148,8 +1191,9 @@ class Face : public std::enable_shared_from_this<Face> {
                                 asio::strand<asio::any_io_executor> strand, Tables& tables,
                                 std::shared_ptr<std::atomic<bool>> dial_suppress)
     -> asio::awaitable<void> {
-    auto face = std::make_shared<Face>(std::move(sock), strand, next_face_id(), &tables,
-                                       FaceRole::dialer, std::move(dial_suppress));
+    auto face =
+        std::make_shared<Face>(std::move(sock), strand, next_face_id(), &tables, FaceRole::dialer,
+                               /*accept_router_faces=*/true, std::move(dial_suppress));
     co_await face->run();
 }
 
@@ -1287,10 +1331,21 @@ struct Broker::Impl {
     // accept loop (Broker::run()) and Broker::stop() must reach the acceptor only via
     // this strand.
     asio::strand<asio::any_io_executor> accept_strand{ioc.get_executor()};
+    /// The bound port, captured by `do_bind` while the io_context is still idle.
+    /// `Broker::port()` returns this instead of asking the acceptor: asio documents
+    /// `basic_socket_acceptor` as "Shared objects: Unsafe", and `port()` is called
+    /// from arbitrary threads (tests do it while the accept loop is inside
+    /// `async_accept`, and it can land concurrently with `stop()`'s `close()`) --
+    /// the same race the strand above exists to prevent.
+    std::uint16_t bound_port = 0;
     /// Seed peer endpoints from BrokerConfig. Written once by `bind` before any
     /// thread runs the io_context, then only read (by `run`'s connector spawn), so
     /// it needs no strand of its own.
     std::vector<std::string> peers;
+    /// Whether an inbound face may become a clique link by announcing
+    /// `whatami = router` (BrokerConfig::accept_router_faces). Written once by `bind`
+    /// before any thread runs the io_context, then only read.
+    bool accept_router_faces = false;
     /// Endpoints that already have a connector coroutine. Guarded by `accept_strand`
     /// (every insertion is posted there), which is also what serializes the seed
     /// peers against gossip-driven dials.
@@ -1321,7 +1376,14 @@ auto Broker::do_bind(std::string_view host, std::uint16_t port) -> bool {
     acceptor.bind(endpoint, ec);
     if (ec) return false;
     acceptor.listen(asio::socket_base::max_listen_connections, ec);
-    return !ec;
+    if (ec) return false;
+
+    // Resolve port 0 to the port the OS actually picked, once, here -- no thread is
+    // running the io_context yet, so this is the one safe moment to ask.
+    asio::error_code local_ec;
+    auto const bound = acceptor.local_endpoint(local_ec);
+    if (!local_ec) impl_->bound_port = bound.port();
+    return true;
 }
 
 auto Broker::bind(std::string_view host, std::uint16_t port)
@@ -1346,6 +1408,7 @@ auto Broker::bind(BrokerConfig cfg) -> std::expected<std::unique_ptr<Broker>, Bi
     // Only recorded here: a connector needs the io_context to be running, so the
     // dialling itself starts in `run()`.
     broker->impl_->peers = std::move(cfg.peers);
+    broker->impl_->accept_router_faces = cfg.accept_router_faces;
 
     // Resolved after `do_bind`, not from the config, so that an ephemeral
     // (`port == 0`) listen still advertises the port it actually got.
@@ -1359,11 +1422,7 @@ auto Broker::bind(BrokerConfig cfg) -> std::expected<std::unique_ptr<Broker>, Bi
     return broker;
 }
 
-auto Broker::port() const noexcept -> std::uint16_t {
-    asio::error_code ec;
-    auto const ep = impl_->acceptor.local_endpoint(ec);
-    return ec ? 0 : ep.port();
-}
+auto Broker::port() const noexcept -> std::uint16_t { return impl_->bound_port; }
 
 auto Broker::run(unsigned num_threads) -> void {
     if (num_threads == 0) num_threads = 1;
@@ -1394,8 +1453,10 @@ auto Broker::run(unsigned num_threads) -> void {
                 // posted-to-strand write path) actually runs serialized on it. See
                 // accept_face's own comment for why this can't be built inside it.
                 asio::strand<asio::any_io_executor> strand{sock.get_executor()};
-                asio::co_spawn(strand, accept_face(std::move(sock), strand, tables),
-                               asio::detached);
+                asio::co_spawn(
+                    strand,
+                    accept_face(std::move(sock), strand, tables, impl_->accept_router_faces),
+                    asio::detached);
             }
         },
         asio::detached);

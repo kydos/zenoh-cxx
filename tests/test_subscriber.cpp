@@ -615,3 +615,46 @@ TEST("a Close packed after a frame is honoured, and the frame still delivers") {
     sess->close();
     router.join();
 }
+
+// A callback handler is allowed to undeclare its own Subscriber -- "stop after N
+// samples" is the obvious shape. run_once() used to re-dereference `sub_` on every
+// iteration of its drain loop and call the handler *through* it, so undeclaring from
+// inside the handler freed the registration the loop was standing on: the next
+// iteration null-dereferenced it (ASan: SEGV on address 0x20), and the std::function
+// being executed had been freed under its own feet. Needs >1 message queued to hit.
+TEST("a callback that undeclares its own subscriber mid-drain does not crash") {
+    SubRouter router([](int fd) {
+        send_batch(fd, build_frame(1, [](ByteWriter& w) {
+                       put_msg(w, "demo/a", "one");
+                       put_msg(w, "demo/b", "two");
+                       put_msg(w, "demo/c", "three");
+                   }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+
+    int delivered = 0;
+    Subscriber* self = nullptr;
+    auto sub = sess->declare_subscriber("demo/**", [&](const Sample&) {
+        ++delivered;
+        if (self) self->undeclare(); // frees the registration run_once is draining
+    });
+    CHECK(sub.has_value());
+    if (!sub) {
+        sess->close();
+        router.join();
+        return;
+    }
+    self = &*sub;
+
+    CHECK(sess->run_once().has_value()); // used to crash here
+    CHECK(delivered == 1);               // and no further samples after the undeclare
+
+    sess->close();
+    router.join();
+}

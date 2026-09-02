@@ -21,6 +21,12 @@ import zenoh.codec;
 namespace zenoh {
 
 auto Timestamp::encode(ByteWriter& w) const noexcept -> std::expected<void, CodecError> {
+    // `id_len` indexes a fixed 16-byte array, but it is a plain public member: an
+    // out-of-range value would make the span below read past `id` (and `encoded_len`
+    // would obligingly size a buffer large enough for the whole overread to land).
+    // Every sibling that nibble-encodes a zid length checks the same bounds --
+    // EntityGlobalId::encode_body, DestinationId::encode_body, InitIdentifier::encode.
+    if (id_len == 0 || id_len > 16) return std::unexpected(CodecError::malformed);
     ZTRY(put_uint(w, time));
     ZTRY(put_uint(w, id_len));
     return put_raw(w, std::span<const std::byte>{id.data(), id_len});
@@ -30,7 +36,10 @@ auto Timestamp::decode(ByteReader& r) noexcept -> std::expected<Timestamp, Codec
     Timestamp t{};
     t.time = ZTRY(get_uint(r));
     auto const n = ZTRY(get_uint(r));
-    if (n > 16) return std::unexpected(CodecError::malformed);
+    // 1..16, not 0..16: a uhlc source id is never empty, and the reference rejects an
+    // empty one in `uhlc::ID::try_from` (its inner value is a NonZeroU128). Accepting
+    // it here would round-trip a timestamp no reference peer considers valid.
+    if (n == 0 || n > 16) return std::unexpected(CodecError::malformed);
     t.id_len = static_cast<std::uint8_t>(n);
     auto const s = ZTRY(r.read_slice(t.id_len));
     std::ranges::copy(s, t.id.begin());
