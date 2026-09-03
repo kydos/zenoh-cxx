@@ -8,15 +8,16 @@ session owns the socket, the protocol state, and the encode buffers, and drives
 
 A client communicates **only through a router** (`zenohd`); there is no scouting or
 peer-to-peer layer here. Verified interoperable against the Rust reference router and
-subscriber (`../zenoh-rust`).
+subscriber (checked out as a sibling of this repo's root — `../../zenoh-rust` from a
+worktree such as `zenoh-cxx/main`).
 
 ## Module map
 
 | Module | Unit | Contents |
 | --- | --- | --- |
-| `zenoh.runtime.tcp` | `src/runtime/tcp.{cppm,cpp}` | `TcpLink` (RAII POSIX socket), `IoError`. Blocking `write_all`/`read_exact`, non-blocking `write_some`, `poll_readable` (keepalive timer). POSIX headers stay in the `.cpp`. |
+| `zenoh.runtime.tcp` | `src/runtime/tcp.{cppm,cpp}` | `TcpLink` (RAII POSIX socket), `IoError`. Blocking `write_all`/`writev_all`/`read_exact` (handshake only), non-blocking `write_some`/`read_some`, `poll_readable` (keepalive timer). POSIX headers stay in the `.cpp`. |
 | `zenoh.runtime.strand` | `src/runtime/strand.cppm` | `Strand<T>` — the per-subscriber bounded queue (`ordered` / `last_value` conflation), `StrandMode`. Header-only template. |
-| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`, `Sample`, `Subscriber`. Endpoint parsing, the 4-way handshake, `put`/`try_put`/`close`, and the subscriber receive pump (`declare_subscriber`, `run`/`run_once`, `Subscriber::recv`). |
+| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`, `Sample`, `Subscriber`, `Queryable`/`IncomingQuery`, `Getter`/`GetReply`, `Batch`, `PeerId`, and the option structs (`PutOptions`, `GetOptions`, `SubscriberOptions`, `QueryableOptions`). Endpoint parsing, the 4-way handshake, `put`/`try_put`/`batch`/`get`/`close`, and the receive pump (`declare_subscriber`/`declare_queryable`, `run`/`run_once`, `Subscriber::recv`). |
 | `zenoh` | `src/zenoh.cppm` | Public umbrella; re-exports `zenoh.session`. **Import this for the client API.** |
 
 ## Connecting (the handshake)

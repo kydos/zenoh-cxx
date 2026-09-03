@@ -28,7 +28,7 @@ under federation — a peer-broker link is just another face, distinguished by
 | `zenoh.broker.membership` | `broker/src/membership.cppm`/`.cpp` | `MemberInfo`, `Membership` — clique membership, the gossip payload codec, endpoint validation, and the mutual-dial tie-break. Pure logic, no ASIO. See `docs/CLIQUE.md`. |
 | `zenoh.broker.tables` | `broker/src/tables.cppm`/`.cpp` | `Tables` — the broker's global routing state: face registry, `ResourceTable`, and query fan-out/fan-in bookkeeping, all serialized on one `asio::strand`. `FaceHandle`/`RoutedPush`/`RoutedRequest`/`RoutedResponse` are the owned, strand-crossing-safe shapes routing operates on. |
 | `zenoh.broker` | `broker/src/broker.cppm`/`.cpp` | `Broker` (bind/run/stop, the `io_context` + configurable thread pool) **and**, entirely inside `broker.cpp`'s anonymous namespace, the per-connection `Face` class and the accept loop — see "Why `Face` isn't its own module" below. |
-| `zenohb` | `broker/src/main.cpp` | CLI (`-l`/`--listen tcp/host:port`, `--threads N`, `--accept-router-faces`) + `Broker::bind`/`run`. |
+| `zenohb` | `broker/src/main.cpp` | CLI (`-l`/`--listen`, `-p`/`--peer` (repeatable), `--advertise`, `--threads N`, `--accept-router-faces`, `-h`/`--help`; an unrecognised argument is an error) + `Broker::bind`/`run`. See the README's multi-broker section for topologies. |
 
 `zenoh-broker` (the static library backing `zenohb` and the test suite) links
 `zenoh-proto` — **not** `zenoh`, the client runtime. `Session`/`TcpLink`'s blocking,
@@ -534,3 +534,18 @@ cleanup (verified via strand-marshaled `Tables` introspection accessors — read
 them directly from the test thread would race the routing strand exactly like
 production code would), and multi-threaded concurrency-stress cases (both pub/sub and
 query/reply) run under the `linux-tsan` preset as the actual thread-safety gate.
+
+`RawClient` (in the same file) plays the client side of the handshake by hand, so a
+test can put bytes on the wire a real `Session` never produces. That is what the
+protocol-level regressions use: a batch carrying `[Frame][Declare][KeepAlive]`,
+`[KeepAlive][Frame][Declare]` and `[Frame][Frame]` (a batch is a *sequence* of
+transport messages — see "Batch framing" above; each of these used to drop the
+connection or silently lose the frame), 300 declares rebinding one declaration id to
+different keys (which must leave exactly one resource, not 300), and a requester that
+never stops asking (which must stay inside `Tables::max_pending_fanouts_per_face`, and
+give the budget back when it disconnects).
+
+`tests/test_broker_stress.cpp` carries the scale cases plus the `ResourceTable`
+property tests — including that a face matching through several declarations folds to
+a single entry carrying the union of what they declare, asserted through the
+exact-hash path so it cannot pass by iteration-order luck.

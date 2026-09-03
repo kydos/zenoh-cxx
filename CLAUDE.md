@@ -109,7 +109,7 @@ case per `TEST`** (`tests/CMakeLists.txt`), each labeled with its suite — so
 `ctest --preset <preset>` reports the suite test-by-test, `-R '<regex>'` narrows to
 one case, `-L '^test_broker$'` to one source file (labels are regex-matched, so a bare
 `-L test_broker` also picks up `test_broker_stress`), and `-j` runs cases in parallel
-(184 cases on the `clang` preset: ~30 s serial, ~6-10 s at `-j8`, vs ~13 s for the
+(261 cases on the `clang` preset: ~56 s serial, ~9 s at `-j8`, vs ~27 s for the
 whole binary in one process — process-per-test trades startup cost for granularity
 and parallelism). Set `-DZENOH_CTEST_PER_TEST=OFF` to go back to a single ctest case
 that runs the binary once.

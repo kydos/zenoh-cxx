@@ -15,6 +15,7 @@ struct Args {
     std::uint16_t port = 7447;
     unsigned threads = 0; // 0 = std::thread::hardware_concurrency()
     bool ok = true;       // cleared by a malformed argument
+    bool help = false;    // -h/--help: print usage to stdout and exit 0
     /// Peer brokers to dial, from repeated `--peer`. See docs/CLIQUE.md.
     std::vector<std::string> peers;
     /// What to tell the rest of the clique to dial this broker on. Required when
@@ -76,6 +77,15 @@ struct Args {
             args.threads = static_cast<unsigned>(*n);
         } else if (a == "--accept-router-faces") {
             args.accept_router_faces = true;
+        } else if (a == "-h" || a == "--help") {
+            args.help = true;
+        } else {
+            // Rejected, not ignored: silently swallowing an unrecognised argument is
+            // how `--accept-router-face` (one character short) starts a broker that
+            // looks fine and quietly refuses to federate, and how a `--threads` with
+            // no value leaves the pool at its default with nothing said.
+            std::fprintf(stderr, "zenohb: unrecognised or incomplete argument '%s'\n", argv[i]);
+            args.ok = false;
         }
     }
     return args;
@@ -85,10 +95,23 @@ struct Args {
 
 auto main(int argc, char** argv) -> int {
     auto const args = parse_args(argc, argv);
-    if (!args.ok) {
-        std::fprintf(stderr, "usage: zenohb [-l tcp/host:port] [--peer tcp/host:port]... "
-                             "[--advertise tcp/host:port] [--threads N] [--accept-router-faces]\n");
-        return EXIT_FAILURE;
+    if (!args.ok || args.help) {
+        std::fprintf(
+            args.help ? stdout : stderr,
+            "usage: zenohb [-l tcp/host:port] [--peer tcp/host:port]...\n"
+            "              [--advertise tcp/host:port] [--threads N] [--accept-router-faces]\n"
+            "\n"
+            "  -l, --listen tcp/host:port  listen endpoint (default tcp/0.0.0.0:7447)\n"
+            "  -p, --peer tcp/host:port    peer broker to dial; repeatable (docs/CLIQUE.md)\n"
+            "      --advertise tcp/h:p     endpoint peers should dial this broker on;\n"
+            "                              required when --listen is a wildcard address\n"
+            "      --threads N             ASIO thread pool size (default: hardware threads)\n"
+            "      --accept-router-faces   let an inbound connection announcing\n"
+            "                              whatami=router become a clique link. Off by\n"
+            "                              default: that claim is unauthenticated. Needed on\n"
+            "                              whichever end of a peer pair receives the link\n"
+            "  -h, --help                  this message\n");
+        return args.help ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     auto broker = zenoh::broker::Broker::bind(

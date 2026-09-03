@@ -318,7 +318,12 @@ requirement, not a preference.
   query/reply across the mesh and every `QueryTarget`; zid-targeting at the terminal
   hop; gossip convergence from a single seed, including a four-broker clique; the
   reserved-key injection defence; congestion classes; keepalive on an idle link;
-  partition visibility; and a multi-threaded pool case.
+  partition visibility; and a multi-threaded pool case. It also covers the two
+  policy/lifetime rules that federation depends on: a client announcing
+  `whatami = router` is **not** accepted as a peer unless the broker was configured
+  for it (and is, when it was), and a router face torn down while congested gives its
+  share of `congested_router_faces_` back — leaking one throttles every client face in
+  the broker for the rest of its life.
 
 The strand-discipline asserts (`assert(strand_.running_in_this_thread())`) are compiled
 in on the `clang`/`linux-clang` presets, so the multi-threaded cases turn an off-strand
