@@ -342,3 +342,172 @@ TEST("a moved-from Session leaves the moved-to one usable") {
     CHECK(router.samples().size() == 1);
     if (!router.samples().empty()) CHECK(router.samples()[0].key == "demo/m");
 }
+
+// Every handle (Batch, Subscriber, Queryable, Getter) is move-only and holds a
+// non-owning `Session*` that is nulled when it is moved from or explicitly released.
+// Each of its methods guards on that pointer, and each move-assignment guards against
+// self-assignment. Those two guards are pure boilerplate — which is exactly why they
+// are worth pinning down: nothing else in the suite ever takes either branch, so a
+// regression there (use-after-move, or a self-move that frees what it is adopting)
+// would be invisible.
+TEST("moved-from handles report connection_closed instead of dereferencing nothing") {
+    FakeRouter router;
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+
+    {
+        auto b = sess->batch();
+        CHECK(b.put("demo/live", bytes("x")).has_value());
+        auto moved = std::move(b);
+        // NOLINTNEXTLINE(bugprone-use-after-move) -- the point of the test
+        CHECK(!b.put("demo/dead", bytes("x")).has_value());
+        CHECK(!b.flush().has_value());
+        CHECK(b.size() == 0);
+        CHECK(moved.flush().has_value());
+    }
+
+    {
+        auto sub = sess->declare_subscriber("demo/**");
+        CHECK(sub.has_value());
+        if (sub) {
+            auto moved = std::move(*sub);
+            // NOLINTNEXTLINE(bugprone-use-after-move)
+            CHECK(!sub->recv().has_value());
+            // NOLINTNEXTLINE(bugprone-use-after-move)
+            CHECK(sub->key_expr().empty());
+            sub->undeclare(); // idempotent on a moved-from handle
+            CHECK(moved.key_expr() == "demo/**");
+        }
+    }
+
+    {
+        auto qbl = sess->declare_queryable("demo/q/**");
+        CHECK(qbl.has_value());
+        if (qbl) {
+            auto moved = std::move(*qbl);
+            // NOLINTNEXTLINE(bugprone-use-after-move)
+            CHECK(!qbl->recv().has_value());
+            qbl->undeclare();
+        }
+    }
+
+    sess->close();
+    router.join();
+}
+
+TEST("self-move-assignment leaves a handle usable") {
+    FakeRouter router;
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+
+    {
+        auto b = sess->batch();
+        CHECK(b.put("demo/self", bytes("x")).has_value());
+        auto& alias = b;
+        b = std::move(alias); // must not flush-and-free what it is about to adopt
+        CHECK(b.size() == 1);
+        CHECK(b.flush().has_value());
+    }
+
+    {
+        auto sub = sess->declare_subscriber("demo/self/**");
+        CHECK(sub.has_value());
+        if (sub) {
+            auto& alias = *sub;
+            *sub = std::move(alias);
+            CHECK(sub->key_expr() == "demo/self/**");
+        }
+    }
+
+    {
+        auto qbl = sess->declare_queryable("demo/selfq/**");
+        CHECK(qbl.has_value());
+        if (qbl) {
+            auto& alias = *qbl;
+            *qbl = std::move(alias);
+        }
+    }
+
+    // A Session is movable too, and self-move must leave it connected.
+    auto& sess_alias = *sess;
+    *sess = std::move(sess_alias);
+    CHECK(sess->put("demo/after-self-move", bytes("ok")).has_value());
+
+    sess->close();
+    router.join();
+}
+
+// Each encoder has its own "the message does not fit the negotiated batch" arm, and
+// they are separate code paths: put and try_put encode a whole Put, batch()'s put
+// encodes into an accumulating frame, get encodes a Request, and the declare helpers
+// encode a Declare. A 64-byte batch size makes every one of them reachable.
+TEST("every encoder reports encode_error rather than truncating an oversized message") {
+    FakeRouter router; // batch_size = 64
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+
+    std::vector<std::byte> const big(200, std::byte{0x7});
+    std::string const long_key(200, 'k');
+
+    auto put = sess->put("demo/big", big);
+    CHECK(!put.has_value() && put.error() == ZError::encode_error);
+
+    auto tput = sess->try_put("demo/big", big);
+    CHECK(!tput.has_value() && tput.error() == ZError::encode_error);
+
+    auto put_key = sess->put(long_key, bytes("x"));
+    CHECK(!put_key.has_value() && put_key.error() == ZError::encode_error);
+
+    {
+        auto b = sess->batch();
+        auto r = b.put("demo/big", big);
+        CHECK(!r.has_value() && r.error() == ZError::encode_error);
+    }
+
+    auto get = sess->get(long_key, "");
+    CHECK(!get.has_value() && get.error() == ZError::encode_error);
+
+    auto sub = sess->declare_subscriber(long_key);
+    CHECK(!sub.has_value() && sub.error() == ZError::encode_error);
+
+    auto qbl = sess->declare_queryable(long_key);
+    CHECK(!qbl.has_value() && qbl.error() == ZError::encode_error);
+
+    sess->close();
+    router.join();
+}
+
+// Operations on a closed session must report connection_closed promptly rather than
+// attempting the syscall on a dead descriptor.
+TEST("operations on a closed session report connection_closed") {
+    FakeRouter router;
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    sess->close();
+    sess->close(); // idempotent
+
+    auto put = sess->put("demo/after-close", bytes("x"));
+    CHECK(!put.has_value() && put.error() == ZError::connection_closed);
+    auto tput = sess->try_put("demo/after-close", bytes("x"));
+    CHECK(!tput.has_value() && tput.error() == ZError::connection_closed);
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(!sub.has_value() && sub.error() == ZError::connection_closed);
+
+    router.join();
+}

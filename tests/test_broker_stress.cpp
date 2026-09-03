@@ -703,3 +703,71 @@ TEST("a face matching through several queryable declarations folds to one comple
     }
     CHECK(deep_seen == 1);
 }
+
+// ResourceTable's rejection and no-op paths. Every mutator canonicalizes its key
+// first and refuses one that cannot be canonicalized (a malformed pattern from an
+// untrusted peer), and every undeclare tolerates a key or face it has never seen --
+// this codebase's "tolerate the unknown, fault only on real desync" rule. None of
+// that is reachable through the integration tests, which only ever send well-formed
+// declarations for faces that exist.
+TEST("ResourceTable rejects malformed key expressions and tolerates unknown undeclares") {
+    ResourceTable table;
+    constexpr FaceId face = 1;
+
+    // `***` is not a valid chunk: canonize fails, so nothing is recorded.
+    CHECK(!table.declare_subscriber("bad/***/key", face));
+    CHECK(!table.declare_queryable("bad/***/key", face, zenoh::QueryableInfo{}));
+    CHECK(table.resource_count() == 0);
+
+    // The same malformed key on the undeclare side is a silent no-op, as is an
+    // undeclare for a key that was never declared, and one for the wrong face.
+    table.undeclare_subscriber("bad/***/key", face);
+    table.undeclare_queryable("bad/***/key", face);
+    table.undeclare_subscriber("never/declared", face);
+    table.undeclare_queryable("never/declared", face);
+    CHECK(table.resource_count() == 0);
+
+    CHECK(table.declare_subscriber("probe/known", face));
+    table.undeclare_subscriber("probe/known", face + 1); // right key, wrong face
+    CHECK(table.resource_count() == 1);
+    table.undeclare_queryable("probe/known", face); // right key, not a queryable
+    CHECK(table.resource_count() == 1);
+
+    // Re-declaring the same (key, face) updates in place rather than duplicating.
+    CHECK(table.declare_subscriber("probe/known", face));
+    CHECK(table.resource_count() == 1);
+    CHECK(table.face_count_for("probe/known") == 1);
+
+    // A face can hold both roles on one key; dropping one leaves the other.
+    CHECK(table.declare_queryable("probe/known", face,
+                                  zenoh::QueryableInfo{.complete = true, .distance = 1}));
+    CHECK(table.resource_count() == 1);
+    table.undeclare_subscriber("probe/known", face);
+    CHECK(table.resource_count() == 1); // still a queryable there
+    table.undeclare_queryable("probe/known", face);
+    CHECK(table.resource_count() == 0); // now empty, so the resource is dropped
+
+    // remove_face on a face with nothing declared is a no-op.
+    table.remove_face(face + 99);
+    CHECK(table.resource_count() == 0);
+}
+
+// A non-canonical but *canonicalizable* key is stored in canonical form, so lookups
+// by either spelling agree.
+TEST("ResourceTable canonicalizes declared key expressions") {
+    ResourceTable table;
+    constexpr FaceId face = 2;
+
+    // `a/**/**` canonicalizes to `a/**`.
+    CHECK(table.declare_subscriber("a/**/**", face));
+    CHECK(table.resource_count() == 1);
+    CHECK(table.face_count_for("a/**") == 1);
+
+    // Declaring the canonical spelling for the same face is the same declaration.
+    CHECK(table.declare_subscriber("a/**", face));
+    CHECK(table.resource_count() == 1);
+
+    // And the non-canonical spelling undeclares it.
+    table.undeclare_subscriber("a/**/**", face);
+    CHECK(table.resource_count() == 0);
+}

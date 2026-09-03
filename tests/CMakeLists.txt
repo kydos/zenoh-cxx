@@ -14,6 +14,7 @@ add_executable(zenoh-tests
     test_query_api.cpp
     test_declare.cpp
     test_negative.cpp
+    test_sweep.cpp
     test_umbrella.cpp
     test_diff.cpp
     test_coverage.cpp

@@ -389,6 +389,10 @@ auto Session::flush_pending() -> std::expected<void, ZError> {
 
 auto Session::put(std::string_view key_expr, std::span<const std::byte> payload, PutOptions opts)
     -> std::expected<void, ZError> {
+    // A closed session says so, rather than letting the write fail on a dead
+    // descriptor and surfacing as a generic io_error -- which is what
+    // declare_subscriber/declare_queryable/get already do.
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
     // Drain any bytes a prior try_put left buffered (blocking).
     if (pending_off_ < tx_pending_.size()) {
         if (auto r = link_.write_all(std::span(tx_pending_).subspan(pending_off_)); !r)
@@ -410,6 +414,7 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload,
 
 auto Session::try_put(std::string_view key_expr, std::span<const std::byte> payload,
                       PutOptions opts) -> std::expected<void, ZError> {
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed); // see put()
     // Don't interleave a new frame ahead of buffered bytes: flush first.
     if (pending_off_ < tx_pending_.size()) {
         if (auto f = flush_pending(); !f) return std::unexpected(f.error());
