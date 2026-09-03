@@ -1688,3 +1688,127 @@ TEST("the broker bounds in-flight query fan-out from one face") {
     CHECK(
         wait_until([&] { return on_strand(tables, [&] { return tables.fanout_count(); }) == 0; }));
 }
+
+// Broker-side handshake rejection. A listener has to survive whatever a peer opens
+// with, and each failure arm ends the face without disturbing the broker: a closed
+// connection, a wrong protocol version, a message that is not an InitSyn, and a
+// second connection that never gets past Init. None of these is reachable through
+// `Session`, which always speaks the handshake correctly.
+TEST("the broker rejects malformed handshakes without disturbing other faces") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    auto raw_connect = [&]() -> int {
+        int const fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(tb.broker->port());
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            ::close(fd);
+            return -1;
+        }
+        return fd;
+    };
+    auto send_raw = [](int fd, std::span<const std::byte> body) {
+        std::array<std::byte, 2> len{};
+        store_le<std::uint16_t>(len.data(), static_cast<std::uint16_t>(body.size()));
+        return ::send(fd, len.data(), len.size(), 0) == 2 &&
+               ::send(fd, body.data(), body.size(), 0) == static_cast<ssize_t>(body.size());
+    };
+
+    // (1) Connect and hang up before sending anything.
+    int fd = raw_connect();
+    CHECK(fd >= 0);
+    if (fd >= 0) ::close(fd);
+
+    // (2) A well-formed message that is not an InitSyn.
+    fd = raw_connect();
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(send_raw(fd, RawClient::encode_body(KeepAlive{})));
+        ::close(fd);
+    }
+
+    // (3) An InitSyn announcing an unsupported protocol version.
+    fd = raw_connect();
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        InitSyn isyn{};
+        isyn.version = 3; // not 9
+        isyn.identifier.whatami = WhatAmI::client;
+        isyn.identifier.zid.len = 4;
+        isyn.identifier.zid.bytes.fill(std::byte{0x55});
+        CHECK(send_raw(fd, RawClient::encode_body(isyn)));
+        ::close(fd);
+    }
+
+    // (4) Bytes that are not a decodable message at all.
+    fd = raw_connect();
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        std::array<std::byte, 4> junk{};
+        junk.fill(std::byte{0xfe});
+        CHECK(send_raw(fd, junk));
+        ::close(fd);
+    }
+
+    // None of them registered a face, and a real client still connects afterwards.
+    auto c = RawClient::connect(tb.broker->port());
+    CHECK(c.has_value());
+    CHECK(wait_until([&] { return on_strand(tables, [&] { return tables.face_count(); }) == 1; }));
+}
+
+// A published key must be literal: a `*`/`**` in a Push key is malformed input from a
+// buggy or hostile peer, not a wildcard, and routing it as one would deliver it to far
+// more subscribers than intended. Such a message is dropped on the routing strand --
+// the face is *not* faulted, since the byte stream is still perfectly in sync -- so
+// the test is that the wildcard publish reaches nobody while the face keeps working.
+TEST("a wildcard in a published key is dropped, and the face keeps working") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+    auto& tables = tb.broker->tables;
+
+    using namespace zenoh;
+    auto sub_sess = Session::open(tb.endpoint());
+    CHECK(sub_sess.has_value());
+    if (!sub_sess) return;
+    auto sub = sub_sess->declare_subscriber("demo/wild/**");
+    CHECK(sub.has_value());
+    if (!sub) return;
+    CHECK(wait_until([&] {
+        return on_strand(tables, [&] { return tables.resource_face_count("demo/wild/**"); }) == 1;
+    }));
+
+    auto c = RawClient::connect(tb.broker->port());
+    CHECK(c.has_value());
+    if (!c) return;
+
+    auto send_push = [&](std::string_view key, std::string_view payload, std::uint32_t sn) {
+        FrameHeader fh{};
+        fh.sn = sn;
+        Push push{};
+        push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key};
+        Put put{};
+        put.payload = bytes(payload);
+        push.payload = PushBody{.body = std::move(put)};
+        std::vector<std::byte> buf(256);
+        ByteWriter w{buf};
+        return fh.encode(w).has_value() && push.encode(w).has_value() &&
+               c->send_batch(std::span(buf).first(w.written()));
+    };
+
+    CHECK(send_push("demo/wild/*/bad", "dropped", 0)); // wildcard: must not be routed
+    CHECK(send_push("demo/wild/ok", "delivered", 1));  // literal: must arrive
+
+    // The literal one arrives, and it is the *first* thing the subscriber sees -- so
+    // the wildcard publish was dropped rather than merely delivered later.
+    auto s = sub->recv();
+    CHECK(s.has_value());
+    if (s) CHECK(s->key_expr() == "demo/wild/ok" && str(s->payload()) == "delivered");
+
+    // And the publishing face survived: the stream was never desynchronized.
+    CHECK(on_strand(tables, [&] { return tables.face_count(); }) >= 2);
+}

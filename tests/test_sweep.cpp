@@ -175,6 +175,34 @@ TEST("sweep: transport messages, every extension present") {
     oack.compression = HasCompression{};
     sweep(oack);
 
+    // Extension id 0x1 on Init is overloaded by KIND: Unit means "QoS enabled", U64
+    // carries a QoSLink value. The fully-populated messages above set both, so only
+    // one encoding is emitted and only one decode arm runs -- these pick one each.
+    // Same story for id 0x4 on Open (ZStruct MultiLinkSyn vs Unit MultiLinkAck).
+    InitSyn unit_qos{};
+    unit_qos.version = 9;
+    unit_qos.identifier.zid = make_zid(0x71, 4);
+    unit_qos.qos = HasQoS{};
+    sweep(unit_qos);
+
+    InitAck unit_qos_ack{};
+    unit_qos_ack.version = 9;
+    unit_qos_ack.identifier.zid = make_zid(0x72, 4);
+    unit_qos_ack.qos = HasQoS{};
+    sweep(unit_qos_ack);
+
+    OpenSyn unit_mlink{};
+    unit_mlink.lease = Duration::from_millis(1000);
+    unit_mlink.sn = 1;
+    unit_mlink.mlink_ack = HasMultiLinkAck{};
+    sweep(unit_mlink);
+
+    OpenAck unit_mlink_ack{};
+    unit_mlink_ack.lease = Duration::from_millis(1000);
+    unit_mlink_ack.sn = 1;
+    unit_mlink_ack.mlink_ack = HasMultiLinkAck{};
+    sweep(unit_mlink_ack);
+
     sweep(Close{.reason = 3, .behaviour = CloseBehaviour::session});
     sweep(Close{.reason = 0, .behaviour = CloseBehaviour::link});
     sweep(KeepAlive{});
@@ -749,4 +777,142 @@ TEST("a Reply tolerates an extension it does not define") {
     auto const mandatory = splice(0x1d); // same id with M set: refused
     ByteReader mr{mandatory};
     CHECK(!Reply::decode(mr).has_value());
+}
+
+// Every message with an extension chain must skip an extension it does not know
+// (when the peer marks it optional) and refuse it when the peer marks it mandatory.
+// That pair of arms is how forward compatibility is actually implemented, and the
+// per-message tests never reach it: they only ever send extensions the decoder knows.
+//
+// For these messages the chain is the last thing on the wire, so appending is enough;
+// `Reply` (whose chain precedes its payload) is covered separately above.
+namespace {
+
+// Append `ext_byte` as an extension to `base`, with the Z flag set on the header.
+auto with_trailing_ext(std::span<const std::byte> base, int ext_byte) -> std::vector<std::byte> {
+    std::vector<std::byte> out(base.begin(), base.end());
+    out[0] = static_cast<std::byte>(std::to_integer<std::uint8_t>(out[0]) | 0x80);
+    out.push_back(static_cast<std::byte>(ext_byte));
+    return out;
+}
+
+template <class T> auto tolerates_unknown_ext(const T& value) -> void {
+    auto const base = encoded(value);
+    CHECK(!base.empty());
+
+    auto const optional_ext = with_trailing_ext(base, 0x0d); // id 13, Unit, M=0
+    ByteReader r{optional_ext};
+    auto decoded = T::decode(r);
+    CHECK(decoded.has_value());
+    CHECK(r.remaining() == 0);
+
+    auto const mandatory_ext = with_trailing_ext(base, 0x1d); // same id, M=1
+    ByteReader mr{mandatory_ext};
+    CHECK(!T::decode(mr).has_value());
+}
+
+} // namespace
+
+TEST("every extensible message skips an unknown optional extension and refuses a mandatory one") {
+    auto const we = make_wire_expr("k", 1);
+
+    tolerates_unknown_ext(Del{});
+    tolerates_unknown_ext(Query{});
+    tolerates_unknown_ext(ResponseFinal{.rid = 1});
+    tolerates_unknown_ext(InterestFinal{.id = 1});
+
+    InitSyn isyn{};
+    isyn.version = 9;
+    isyn.identifier.zid = make_zid(0x81, 4);
+    tolerates_unknown_ext(isyn);
+
+    OpenSyn osyn{};
+    osyn.lease = Duration::from_millis(1000);
+    osyn.sn = 1;
+    tolerates_unknown_ext(osyn);
+
+    OpenAck oack{};
+    oack.lease = Duration::from_millis(1000);
+    oack.sn = 1;
+    tolerates_unknown_ext(oack);
+
+    FrameHeader fh{};
+    fh.sn = 1;
+    tolerates_unknown_ext(fh);
+
+    // Declare bodies: the wire_expr of an Undeclare* rides in extension 0x0f, so the
+    // chain is where an unknown id lands too.
+    tolerates_unknown_ext(UndeclareSubscriber{.id = 1, .wire_expr = std::nullopt});
+    tolerates_unknown_ext(UndeclareQueryable{.id = 1, .wire_expr = std::nullopt});
+    tolerates_unknown_ext(UndeclareToken{.id = 1, .wire_expr = std::nullopt});
+    tolerates_unknown_ext(DeclareQueryable{.id = 1, .wire_expr = we, .qinfo = QueryableInfo{}});
+    tolerates_unknown_ext(DeclareKeyExpr{.id = 1, .wire_expr = we});
+    tolerates_unknown_ext(DeclareSubscriber{.id = 1, .wire_expr = we});
+    tolerates_unknown_ext(DeclareToken{.id = 1, .wire_expr = we});
+    tolerates_unknown_ext(UndeclareKeyExpr{.id = 1});
+    tolerates_unknown_ext(DeclareFinal{});
+}
+
+// Put, Err and Push carry their body *after* the extension chain (a Put's payload is
+// "the rest of the slice"), so an unknown extension has to be spliced in ahead of it
+// rather than appended. Same two arms.
+TEST("messages whose body follows the extensions also tolerate an unknown one") {
+    auto splice_before_body = [](std::span<const std::byte> head, int ext_byte,
+                                 std::span<const std::byte> body) {
+        std::vector<std::byte> out(head.begin(), head.end());
+        out[0] = static_cast<std::byte>(std::to_integer<std::uint8_t>(out[0]) | 0x80);
+        out.push_back(static_cast<std::byte>(ext_byte));
+        out.insert(out.end(), body.begin(), body.end());
+        return out;
+    };
+
+    // A Put's payload is length-prefixed, so the split point is the prefix, not the
+    // bytes: with a payload under 128 bytes the prefix is one VLE byte.
+    auto const payload = bytes_of("payload");
+    auto const tail_len = 1 + payload.size();
+
+    Put put{};
+    put.payload = payload;
+    auto const put_full = encoded(put);
+    CHECK(put_full.size() > tail_len);
+    std::span<const std::byte> const put_head{put_full.data(), put_full.size() - tail_len};
+    std::span<const std::byte> const put_tail{put_full.data() + put_full.size() - tail_len,
+                                              tail_len};
+    auto const put_ok = splice_before_body(put_head, 0x0d, put_tail);
+    ByteReader pr{put_ok};
+    auto put_decoded = Put::decode(pr);
+    CHECK(put_decoded.has_value());
+    if (put_decoded) CHECK(put_decoded->payload.size() == payload.size());
+    auto const put_bad = splice_before_body(put_head, 0x1d, put_tail);
+    ByteReader pbr{put_bad};
+    CHECK(!Put::decode(pbr).has_value());
+
+    Err err{};
+    err.payload = payload;
+    auto const err_full = encoded(err);
+    CHECK(err_full.size() > tail_len);
+    std::span<const std::byte> const err_head{err_full.data(), err_full.size() - tail_len};
+    std::span<const std::byte> const err_tail{err_full.data() + err_full.size() - tail_len,
+                                              tail_len};
+    auto const err_ok = splice_before_body(err_head, 0x0d, err_tail);
+    ByteReader er{err_ok};
+    CHECK(Err::decode(er).has_value());
+    auto const err_bad = splice_before_body(err_head, 0x1d, err_tail);
+    ByteReader ebr{err_bad};
+    CHECK(!Err::decode(ebr).has_value());
+
+    // Push: its PushBody follows the chain.
+    Push push{};
+    push.wire_expr = make_wire_expr("k", 0);
+    push.payload = PushBody{.body = Del{}};
+    auto const full = encoded(push);
+    auto const body = encoded(Del{});
+    CHECK(full.size() > body.size());
+    std::span<const std::byte> const head{full.data(), full.size() - body.size()};
+    auto const push_ok = splice_before_body(head, 0x0d, body);
+    ByteReader hr{push_ok};
+    CHECK(Push::decode(hr).has_value());
+    auto const push_bad = splice_before_body(head, 0x1d, body);
+    ByteReader hbr{push_bad};
+    CHECK(!Push::decode(hbr).has_value());
 }

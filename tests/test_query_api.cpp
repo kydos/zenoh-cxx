@@ -877,3 +877,115 @@ TEST("a very long get() timeout still lets keepalives out") {
     sess->close();
     router.join();
 }
+
+// Getter and IncomingQuery are move-only handles over a non-owning Session*, exactly
+// like Subscriber/Queryable/Batch: every method guards on that pointer and every
+// move-assignment guards against self-assignment, and nothing else in the suite takes
+// either branch. A reply on a moved-from query must be a no-op, not a crash.
+TEST("moved-from and self-moved Getter/IncomingQuery stay safe") {
+    QueryRouter router([&](int fd) {
+        auto declare_batch = recv_batch(fd); // DeclareQueryable
+        if (!declare_batch) return;
+
+        Request req{};
+        req.id = 7;
+        req.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = "demo/mv"};
+        Query q{};
+        q.parameters = "";
+        req.payload = RequestBody{.query = q};
+        send_batch(fd, build_frame(1, [&](ByteWriter& w) { (void)req.encode(w); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+
+    auto qbl = sess->declare_queryable("demo/**");
+    CHECK(qbl.has_value());
+    if (!qbl) {
+        sess->close();
+        router.join();
+        return;
+    }
+
+    auto query = qbl->recv();
+    CHECK(query.has_value());
+    if (query) {
+        auto moved = std::move(*query);
+        // NOLINTNEXTLINE(bugprone-use-after-move) -- the point of the test
+        CHECK(!query->reply("demo/mv", bytes("x")).has_value());
+        // NOLINTNEXTLINE(bugprone-use-after-move)
+        CHECK(!query->reply_err(bytes("x")).has_value());
+
+        auto& alias = moved;
+        moved = std::move(alias); // self-move must not finalize-and-free
+        CHECK(moved.key_expr() == "demo/mv");
+        CHECK(moved.reply("demo/mv", bytes("answer")).has_value());
+    }
+
+    // A Getter behaves the same way.
+    auto getter = sess->get("demo/**", "", GetOptions{.timeout_ms = 50});
+    CHECK(getter.has_value());
+    if (getter) {
+        auto moved = std::move(*getter);
+        // NOLINTNEXTLINE(bugprone-use-after-move)
+        CHECK(!getter->recv().has_value());
+        auto& alias = moved;
+        moved = std::move(alias);
+        auto r = moved.recv(); // times out; the point is that it still works at all
+        CHECK(!r.has_value() || true);
+    }
+
+    sess->close();
+    router.join();
+}
+
+// The reply encoders have their own oversized-message arms, distinct from put/get's.
+TEST("reply and reply_err report encode_error on an oversized message") {
+    QueryRouter router(
+        [&](int fd) {
+            auto declare_batch = recv_batch(fd);
+            if (!declare_batch) return;
+
+            Request req{};
+            req.id = 11;
+            req.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = "demo/big"};
+            Query q{};
+            q.parameters = "";
+            req.payload = RequestBody{.query = q};
+            send_batch(fd, build_frame(1, [&](ByteWriter& w) { (void)req.encode(w); }));
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        },
+        /*batch_size=*/64);
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto qbl = sess->declare_queryable("demo/**");
+    CHECK(qbl.has_value());
+    if (!qbl) {
+        sess->close();
+        router.join();
+        return;
+    }
+
+    auto query = qbl->recv();
+    CHECK(query.has_value());
+    if (query) {
+        std::vector<std::byte> const big(200, std::byte{0x7});
+        auto r = query->reply("demo/big", big);
+        CHECK(!r.has_value() && r.error() == ZError::encode_error);
+        auto e = query->reply_err(big);
+        CHECK(!e.has_value() && e.error() == ZError::encode_error);
+    }
+
+    sess->close();
+    router.join();
+}

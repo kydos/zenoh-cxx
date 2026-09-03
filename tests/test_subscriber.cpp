@@ -677,3 +677,125 @@ TEST("a callback that undeclares its own subscriber mid-drain does not crash") {
     sess->close();
     router.join();
 }
+
+// Receive-path failure branches. Each of these is a distinct `if` in the dispatch
+// loop or in resolve_key, and none is reachable from a well-behaved router — which is
+// exactly why they are worth pinning: they are what stands between a hostile or buggy
+// peer and a misparse.
+TEST("a Push naming an unknown keyexpr id faults the session") {
+    SubRouter router([](int fd) {
+        // scope 4242 was never declared to this client, so the resmap cannot resolve it.
+        send_batch(
+            fd, build_frame(1, [](ByteWriter& w) { put_msg(w, "/suffix", "v", /*scope=*/4242); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+    auto r = sub->recv();
+    CHECK(!r.has_value() && r.error() == ZError::protocol_error);
+    sess->close();
+    router.join();
+}
+
+TEST("an oversized declared keyexpr is refused rather than cached") {
+    SubRouter router([](int fd) {
+        // DeclareKeyExpr with a suffix past max_key_len: the resmap must not grow.
+        std::string const huge(70000, 'k');
+        Declare dec{};
+        DeclareKeyExpr dk{};
+        dk.id = 1;
+        dk.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = huge};
+        dec.body = DeclareBody{.body = dk};
+        std::vector<std::byte> buf(huge.size() + 256);
+        ByteWriter w{buf};
+        FrameHeader fh{};
+        fh.sn = 1;
+        if (fh.encode(w) && dec.encode(w)) {
+            // Too large for one 64 KiB batch, so send what fits: the client must not
+            // wedge on it either way.
+            auto const n = std::min<std::size_t>(w.written(), 65000);
+            send_batch(fd, std::span(buf).first(n));
+        }
+        // Then a normal sample, to prove the session is still usable if it survived.
+        send_batch(fd, build_frame(2, [](ByteWriter& ww) { put_msg(ww, "demo/ok", "v"); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto sub = sess->declare_subscriber("demo/**");
+    CHECK(sub.has_value());
+    auto r = sub->recv();
+    // Either the truncated declare faulted the stream, or it was ignored and the
+    // following sample arrived. Both are defensible; a hang or a crash is not.
+    CHECK(!r.has_value() || r->key_expr() == "demo/ok");
+    sess->close();
+    router.join();
+}
+
+TEST("a router that closes mid-handshake is reported, not hung on") {
+    // Accept the connection and close it without answering InitSyn.
+    int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listen_fd >= 0);
+    int one = 1;
+    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    ::listen(listen_fd, 1);
+    socklen_t len = sizeof(addr);
+    ::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
+    auto const port = ntohs(addr.sin_port);
+
+    std::thread server([listen_fd] {
+        int const fd = ::accept(listen_fd, nullptr, nullptr);
+        if (fd >= 0) ::close(fd); // hang up before InitAck
+    });
+
+    auto sess = Session::open(endpoint(port));
+    CHECK(!sess.has_value()); // connection_closed / protocol_error, but never a hang
+    server.join();
+    ::close(listen_fd);
+}
+
+TEST("a router answering the handshake with garbage is reported") {
+    int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listen_fd >= 0);
+    int one = 1;
+    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    ::listen(listen_fd, 1);
+    socklen_t len = sizeof(addr);
+    ::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
+    auto const port = ntohs(addr.sin_port);
+
+    std::thread server([listen_fd] {
+        int const fd = ::accept(listen_fd, nullptr, nullptr);
+        if (fd < 0) return;
+        std::array<std::byte, 8> junk{};
+        junk.fill(std::byte{0xff});
+        (void)write_all(fd, junk); // not a length-prefixed InitAck
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ::close(fd);
+    });
+
+    auto sess = Session::open(endpoint(port));
+    CHECK(!sess.has_value());
+    server.join();
+    ::close(listen_fd);
+}
