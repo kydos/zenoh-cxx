@@ -17,7 +17,7 @@ worktree such as `zenoh-cxx/main`).
 | --- | --- | --- |
 | `zenoh.runtime.tcp` | `src/runtime/tcp.{cppm,cpp}` | `TcpLink` (RAII POSIX socket), `IoError`. Blocking `write_all`/`writev_all`/`read_exact` (handshake only), non-blocking `write_some`/`read_some`, `poll_readable` (keepalive timer). POSIX headers stay in the `.cpp`. |
 | `zenoh.runtime.strand` | `src/runtime/strand.cppm` | `Strand<T>` — the per-subscriber bounded queue (`ordered` / `last_value` conflation), `StrandMode`. Header-only template. |
-| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`, `Sample`, `Subscriber`, `Queryable`/`IncomingQuery`, `Getter`/`GetReply`, `Batch`, `PeerId`, and the option structs (`PutOptions`, `GetOptions`, `SubscriberOptions`, `QueryableOptions`). Endpoint parsing, the 4-way handshake, `put`/`try_put`/`batch`/`get`/`close`, and the receive pump (`declare_subscriber`/`declare_queryable`, `run`/`run_once`, `Subscriber::recv`). |
+| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`, `Sample`, `Publisher`, `Subscriber`, `Queryable`/`IncomingQuery`, `Getter`/`GetReply`, `Batch`, `PeerId`, and the option structs (`PutOptions`, `PublisherOptions`, `GetOptions`, `SubscriberOptions`, `QueryableOptions`). Endpoint parsing, the 4-way handshake, `put`/`try_put`/`batch`/`get`/`close`, `declare_publisher`, and the receive pump (`declare_subscriber`/`declare_queryable`, `run`/`run_once`, `Subscriber::recv`). |
 | `zenoh` | `src/zenoh.cppm` | Public umbrella; re-exports `zenoh.session`. **Import this for the client API.** |
 
 ## Connecting (the handshake)
@@ -150,9 +150,10 @@ session->get("sensors/**", "", {.target = GetTarget::all,
   works across a broker clique: the filter is applied by whichever broker owns that
   peer.
 
-Priority (QoS bits 2:0) and express (bit 4) are **not** exposed: honouring them needs
-per-priority frame SNs and queues, and this runtime has a single `frame_sn_` that
-always writes `Reliability::reliable`.
+Priority (QoS bits 2:0) and express (bit 4) are **not** exposed — by `PutOptions`,
+`GetOptions` or `PublisherOptions`: honouring them needs per-priority frame SNs and
+queues, and this runtime has a single `frame_sn_` that always writes
+`Reliability::reliable`.
 
 ## Batching
 
@@ -179,6 +180,74 @@ b.flush();              // or let the Batch go out of scope
 - `put`/`flush` block like `Session::put`. The batch routes through the session's SN
   counter and pending-buffer, so interleaving `session->put()` and batch puts stays
   wire-consistent. The session must outlive any batch created from it.
+
+## Publishers (declared key expressions)
+
+`Session::declare_publisher("demo/example/some/long/key")` returns a `Publisher`
+bound to one key expression and one fixed set of publication settings. Its `put` is
+the same `Frame(Push(Put))` a bare `Session::put` sends, with the one difference that
+is the whole point of declaring a publisher: the `Push` carries the key expression's
+**numeric id** rather than its text.
+
+```cpp
+auto pub = session->declare_publisher("demo/example/some/long/key");
+pub->put(payload);        // blocking, like Session::put
+pub->try_put(payload);    // non-blocking, like Session::try_put
+pub->del();               // Push(Del) — subscribers see SampleKind::del
+pub->undeclare();         // or let the Publisher go out of scope
+```
+
+Declaring one sends two messages, matching what a `zenoh-rust` publisher sends:
+
+1. `Frame(Declare{DeclareKeyExpr{id, key_expr}})` — binds a session-local numeric id
+   to the key expression, spelled out in full since this is what defines the id.
+2. `Frame(Interest{CurrentFuture, KEYEXPRS|SUBSCRIBERS, id})` — the reference's
+   writer-side matching-status query. This runtime has no `matching_status()` to feed
+   (see below), but the message is what a real publisher puts on the wire, so it is
+   sent for fidelity. `zenohb` decodes and deliberately does not answer it
+   (`docs/BROKER.md`); `zenohd` *does* answer, which has one consequence worth
+   knowing.
+
+   **A publisher-only session accumulates unread inbound bytes against `zenohd`.**
+   Having asked to be told about matching subscribers, the session is sent a
+   declaration every time one appears or disappears — and an application that only
+   publishes never pumps, so those bytes sit in the socket receive queue (measured:
+   258 bytes after six subscriber connect/disconnect cycles, ~43 bytes per event).
+   Publishing is unaffected, and the queue only grows with *subscriber churn*, not
+   with traffic; but a very long-lived publisher facing thousands of churn events
+   will eventually fill the receive buffer and push back on the router. Call
+   `run_once()` occasionally from such a loop, or drop the publisher and use
+   `Session::put` if the key expression is published rarely enough not to need an id.
+
+Afterwards every publication is a `Push` with `wire_expr = {scope: id, suffix: ""}`,
+so a thirty-character key expression costs one or two bytes per message. The router
+resolves it through the per-face id→key map it built from the declaration — the same
+mechanism this session's own receive path uses for router-declared ids.
+
+- **Ids are refcounted per key expression.** Two publishers on the same key share one
+  `DeclareKeyExpr`, and the `UndeclareKeyExpr` goes out only when the last one is
+  undeclared (mirroring the reference's `local_resources`).
+- **Undeclaring** sends `InterestFinal{id}` and then, if it was the last holder,
+  `Frame(Declare{UndeclareKeyExpr{id}})`. `undeclare()` is idempotent and the
+  destructor runs it; publishing through an undeclared handle returns
+  `connection_closed`. As with `Subscriber`/`Queryable`, undeclare *before*
+  `Session::close()` if the wire message needs to actually reach the peer.
+- **There is no per-session limit** on publishers (unlike the one-subscriber and
+  one-queryable cuts): a publisher holds no receive-side state.
+- **A publisher that cannot get an id still works.** The session declines to bind more
+  than 4096 ids — the cap both `zenohb` and this session's own receive path put on
+  their id→key maps, past which a router silently forgets the declaration and would
+  leave every later `Push` unresolvable. Past it, `keyexpr_id()` is 0 and the
+  publisher sends the key expression in full, exactly as `Session::put` does.
+- **QoS is fixed at declaration** (`PublisherOptions{target_zid, congestion}`) rather
+  than passed per publication, as in the reference. The two knobs mean exactly what
+  they mean for `PutOptions`.
+
+Not modeled from the reference's `Publisher`, consistent with the rest of this
+runtime's scope: per-publication encoding, attachments and timestamps; priority and
+express QoS; and `matching_status()`/`matching_listener()`, which would need the
+router to answer the publisher's `Interest` with the declarations it matches — v1
+routers here decode that query and deliberately do not reply (`docs/BROKER.md`).
 
 ## Subscribing
 
@@ -229,10 +298,12 @@ permanently** (a byte stream can't resync): every later `recv`/`run` returns
 
 ### `ZError`
 
-`would_block` (try_put backpressure), `connection_closed` (EOF / router Close),
-`io_error`, `protocol_error` (malformed handshake or data stream), `encode_error`
-(message exceeds a batch), `bad_endpoint` (unparseable/unresolvable locator),
-`already_subscribed` (second subscriber on a session).
+`would_block` (try_put backpressure), `connection_closed` (EOF / router Close, and
+publishing through an undeclared `Publisher`), `io_error`, `protocol_error` (malformed
+handshake or data stream), `encode_error` (message exceeds a batch — including a key
+expression too long for one), `bad_endpoint` (unparseable/unresolvable locator),
+`already_subscribed` (second subscriber on a session). `declare_publisher` adds no
+error of its own.
 
 ## Example & manual interop test
 
@@ -271,7 +342,9 @@ extensions of this port. With `--batch` the puts are coalesced into API-level ba
 (one Frame per batch).
 
 `examples/z_pub.cpp` (`z_pub`) — the C++ equivalent of zenoh-rust's `z_pub`:
-publishes `"[<idx>] <payload>"` to a key once a second, forever.
+declares a `Publisher` on the key expression (as the reference does) and publishes
+`"[<idx>] <payload>"` through it once a second, forever — so every message on the wire
+carries the declared key-expression id rather than the text.
 `z_pub [OPTIONS]` with `-k/--key` and `-p/--payload`. The reference also sets a
 TEXT_PLAIN encoding; `put` carries no such metadata, and its `-a/--attach` and
 `--add-matching-listener` parse but have no effect.

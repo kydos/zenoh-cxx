@@ -185,6 +185,20 @@ struct PutOptions {
     CongestionControl congestion = CongestionControl::drop;
 };
 
+/// The publication settings a `Publisher` fixes once, at declaration time, and then
+/// applies to every `put`/`del` made through it — the same two knobs `PutOptions`
+/// carries per message, hoisted to the declaration (as in `zenoh-rust`, whose
+/// `Publisher` likewise owns its QoS rather than taking it per publication).
+///
+/// Priority and express are deliberately absent, for the same reason they are absent
+/// from `PutOptions` — see `docs/RUNTIME.md`.
+struct PublisherOptions {
+    /// See `PutOptions::target_zid`. Applies to every publication from this publisher.
+    std::optional<PeerId> target_zid{};
+    /// See `PutOptions::congestion`. Applies to every publication from this publisher.
+    CongestionControl congestion = CongestionControl::drop;
+};
+
 /// Options for `Session::get`. `target_zid`, when set, is a broker-enforced filter
 /// (see `docs/BROKER.md`) narrowing which queryable(s) may answer — like `put`'s
 /// `target_zid`, it only ever narrows normal key-expression-declaration matching,
@@ -235,6 +249,7 @@ class GetReply {
 using GetReplyHandler = std::function<void(const GetReply&)>;
 
 class Batch;
+class Publisher;
 class Subscriber;
 struct SubReg; // defined in session.cpp (holds the non-movable Strand + handler)
 class Queryable;
@@ -308,6 +323,21 @@ class Session {
     /// any batch created from it.
     [[nodiscard]] auto batch() -> Batch;
 
+    /// Declare a publisher on `key_expr`: bind the key expression to a numeric id on
+    /// this session's link (`Frame(Declare{DeclareKeyExpr})`) and announce the
+    /// publication (`Frame(Interest)`), then return a handle whose `put`/`del` send
+    /// the *id* instead of the text — so a long key expression costs one or two bytes
+    /// per message rather than its own length. This is what makes a publisher worth
+    /// declaring over calling `Session::put` in a loop; everything else about the
+    /// data path is identical.
+    ///
+    /// `opts` fixes the QoS for every publication made through the handle. Unlike
+    /// subscribers and queryables there is no per-session limit: publishers hold no
+    /// receive-side state, and two on the same key expression share one declared id.
+    /// The session must outlive the returned publisher.
+    [[nodiscard]] auto declare_publisher(std::string_view key_expr, PublisherOptions opts = {})
+        -> std::expected<Publisher, ZError>;
+
     /// Issue a query on `key_expr` (`parameters` is an opaque, caller-defined query
     /// string) and pull replies with `Getter::recv()` until it returns `nullopt`
     /// (the query completed normally) or an error (incl. `query_timeout`).
@@ -369,6 +399,7 @@ class Session {
 
   private:
     friend class Batch;
+    friend class Publisher;
     friend class Subscriber;
     friend class Queryable;
     friend class IncomingQuery;
@@ -381,12 +412,59 @@ class Session {
     [[nodiscard]] auto write_frame(std::span<const std::byte> msg_bytes)
         -> std::expected<void, ZError>;
 
-    [[nodiscard]] auto encode_put(std::string_view key_expr, std::span<const std::byte> payload,
-                                  const PutOptions& opts) -> std::expected<void, ZError>;
-    [[nodiscard]] auto encode_put_head(std::string_view key_expr,
+    /// The two encoders and the two publish paths all take a key expression already
+    /// split into its wire form — a numeric `scope` (0 = none) plus the textual
+    /// `suffix` that follows it. `Session::put` passes `(0, key)`; a `Publisher`
+    /// passes `(its declared id, "")`, which is the whole point of declaring one.
+    [[nodiscard]] auto encode_put(std::uint16_t scope, std::string_view suffix,
+                                  std::span<const std::byte> payload, const PutOptions& opts)
+        -> std::expected<void, ZError>;
+    [[nodiscard]] auto encode_put_head(std::uint16_t scope, std::string_view suffix,
                                        std::span<const std::byte> payload, const PutOptions& opts)
         -> std::expected<std::size_t, ZError>;
+    /// Blocking publish of one `Push(Put)` (the body of `put`, and of `Publisher::put`).
+    [[nodiscard]] auto put_wire(std::uint16_t scope, std::string_view suffix,
+                                std::span<const std::byte> payload, const PutOptions& opts)
+        -> std::expected<void, ZError>;
+    /// Non-blocking publish of one `Push(Put)` (the body of `try_put`, and of
+    /// `Publisher::try_put`).
+    [[nodiscard]] auto try_put_wire(std::uint16_t scope, std::string_view suffix,
+                                    std::span<const std::byte> payload, const PutOptions& opts)
+        -> std::expected<void, ZError>;
     [[nodiscard]] auto flush_pending() -> std::expected<void, ZError>;
+
+    // --- publisher declaration / teardown ---
+    /// Bind a numeric id to `key` on this link, sending `Frame(Declare{DeclareKeyExpr})`
+    /// the first time it is asked for. Ids are refcounted per key expression, so N
+    /// publishers on one key share one declaration (mirroring `zenoh-rust`'s
+    /// `local_resources`).
+    ///
+    /// Returns 0 — a valid outcome, not an error — when no id is available (the
+    /// per-session cap is reached, or the declaration could not be written). Scope 0
+    /// means "no id" on the wire, so a publisher that gets one simply publishes the
+    /// key expression in full, exactly as `Session::put` does.
+    [[nodiscard]] auto declare_ke(std::string_view key) -> std::uint16_t;
+    /// Drop one reference to `ke_id`, sending `Frame(Declare{UndeclareKeyExpr})` when
+    /// the last one goes (best-effort). A no-op for id 0.
+    auto undeclare_ke(std::uint16_t ke_id) -> void;
+    /// Encode + send a `Frame(Declare{DeclareKeyExpr{id, key}})` (blocking).
+    [[nodiscard]] auto write_declare_keyexpr(std::uint16_t id, std::string_view key)
+        -> std::expected<void, ZError>;
+    /// Encode + send a `Frame(Declare{UndeclareKeyExpr{id}})` (best-effort).
+    auto write_undeclare_keyexpr(std::uint16_t id) -> void;
+    /// Encode + send the publisher's `Frame(Interest{CurrentFuture, KEYEXPRS|SUBSCRIBERS})`
+    /// (blocking) — what a `zenoh-rust` publisher announces on declaration.
+    [[nodiscard]] auto write_interest(std::uint32_t id, std::uint16_t scope,
+                                      std::string_view suffix) -> std::expected<void, ZError>;
+    /// Encode + send a `Frame(InterestFinal{id})`, closing the publisher's interest
+    /// (best-effort).
+    auto write_interest_final(std::uint32_t id) -> void;
+    /// Publish one `Push(Del)` (blocking). For `Publisher::del`.
+    [[nodiscard]] auto del_wire(std::uint16_t scope, std::string_view suffix,
+                                const PutOptions& opts) -> std::expected<void, ZError>;
+    /// Undeclare a publisher: close its interest, then release its key-expression id.
+    /// For `Publisher`.
+    auto pub_drop(std::uint32_t id, std::uint16_t ke_id) -> void;
 
     // --- receive path (subscriber) ---
     /// Encode + send a `Frame(Declare{DeclareSubscriber{id, key}})` (blocking).
@@ -501,6 +579,18 @@ class Session {
     std::size_t rx_need_ = 0;           ///< body length once the prefix is complete
     std::size_t rx_fill_ = 0;           ///< bytes of the body already in `rx_buf_`
     std::unordered_map<std::uint16_t, std::string> resmap_; ///< router keyexpr id -> key
+
+    /// One key expression this session has declared an id for (see `declare_ke`).
+    /// Refcounted, because two publishers on the same key expression share one
+    /// declaration and the id may only be released when the second one goes.
+    struct KeReg {
+        std::uint16_t id = 0;
+        std::size_t refs = 0;
+    };
+    std::unordered_map<std::string, KeReg> ke_by_key_{}; ///< our declared keyexpr ids, by key
+    std::unordered_map<std::uint16_t, std::string> ke_by_id_{}; ///< ... and the reverse index
+    std::uint16_t next_ke_id_ = 1; ///< id allocation cursor (0 = "no id" on the wire)
+
     std::optional<ZError> fault_{};     ///< sticky terminal fault (stream desynced)
     std::uint32_t next_entity_id_ = 0;  ///< monotonic subscriber/queryable entity id
     std::int32_t keepalive_ms_ = 2500;  ///< idle keepalive cadence (negotiated lease / 4)
@@ -550,6 +640,88 @@ class Batch {
     std::vector<std::byte> buf_{}; ///< accumulated `Push` bytes
     std::size_t body_len_ = 0;     ///< valid prefix of buf_
     std::size_t count_ = 0;        ///< buffered Put operations
+};
+
+/// A handle to a declared publication: one key expression, one fixed set of
+/// publication settings, and the numeric id the router bound to that key expression
+/// when it was declared.
+///
+/// `put`/`del` through a publisher are the same wire messages `Session::put` sends,
+/// with one difference that is the reason publishers exist: the `Push` carries the
+/// declared *id* in place of the key expression text, so publishing on
+/// `demo/example/some/long/key` costs a couple of bytes per message instead of thirty.
+/// Both are `Push(Put)`/`Push(Del)` on the session's frame SN, so a publisher and a
+/// bare `put` may be interleaved freely.
+///
+/// Created via `Session::declare_publisher`; the originating session must outlive the
+/// publisher (like `Batch`/`Subscriber`). Move-only. The destructor undeclares
+/// best-effort.
+///
+/// Not modeled, following this runtime's existing `PutOptions` scope: per-publication
+/// encoding, attachments and timestamps, priority/express QoS, and the reference's
+/// `matching_status()`/`matching_listener()` (which need the router to answer the
+/// publisher's `Interest` with the declarations it matches — v1 routers here decode
+/// that query and deliberately do not reply; see `docs/BROKER.md`).
+class Publisher {
+  public:
+    Publisher(const Publisher&) = delete;
+    auto operator=(const Publisher&) -> Publisher& = delete;
+    Publisher(Publisher&& other) noexcept;
+    auto operator=(Publisher&& other) noexcept -> Publisher&;
+    ~Publisher();
+
+    /// Publish `payload` on this publisher's key expression, blocking until the whole
+    /// message has been handed to the transport. Identical in every respect to
+    /// `Session::put(key_expr(), payload, {...})` with this publisher's settings,
+    /// except that the key expression travels as its declared id.
+    [[nodiscard]] auto put(std::span<const std::byte> payload) -> std::expected<void, ZError>;
+
+    /// Like `put`, but never blocks — same `would_block` / partial-write commit
+    /// semantics as `Session::try_put`.
+    [[nodiscard]] auto try_put(std::span<const std::byte> payload) -> std::expected<void, ZError>;
+
+    /// Publish a deletion (`Push(Del)`) on this publisher's key expression, blocking.
+    /// Subscribers receive a `Sample` with `SampleKind::del` and an empty payload.
+    [[nodiscard]] auto del() -> std::expected<void, ZError>;
+
+    /// Undeclare the publisher: close its interest and release its key-expression id
+    /// (the latter only once no other publisher on the same key expression holds it).
+    /// Idempotent; also run by the destructor. Further `put`s return
+    /// `connection_closed`.
+    auto undeclare() -> void;
+
+    /// The key expression this publisher was declared on.
+    [[nodiscard]] auto key_expr() const noexcept -> std::string_view { return key_; }
+    /// The congestion-control setting applied to every publication from this handle.
+    [[nodiscard]] auto congestion_control() const noexcept -> CongestionControl {
+        return opts_.congestion;
+    }
+    /// The zid filter applied to every publication from this handle, if any.
+    [[nodiscard]] auto target_zid() const noexcept -> const std::optional<PeerId>& {
+        return opts_.target_zid;
+    }
+    /// The numeric id the key expression was declared under, or 0 when it is published
+    /// in full (no id could be allocated — see `Session::declare_ke`). Exposed for
+    /// tests and diagnostics; it changes nothing an application can observe.
+    [[nodiscard]] auto keyexpr_id() const noexcept -> std::uint16_t { return ke_id_; }
+
+  private:
+    friend class Session;
+    Publisher(Session* session, std::uint32_t id, std::uint16_t ke_id, std::string key,
+              PutOptions opts) noexcept
+        : session_(session), id_(id), ke_id_(ke_id), key_(std::move(key)), opts_(std::move(opts)) {}
+
+    /// The text half of this publisher's wire key expression: empty once an id is
+    /// bound (the id *is* the key expression), the whole key expression otherwise.
+    [[nodiscard]] auto wire_suffix() const noexcept -> std::string_view {
+        return ke_id_ == 0 ? std::string_view{key_} : std::string_view{};
+    }
+
+    Session* session_ = nullptr; ///< owning session (not owned); null when moved-from/undeclared
+    std::uint32_t id_ = 0;       ///< entity id, and the id of this publisher's Interest
+    std::uint16_t ke_id_ = 0;    ///< declared key-expression id (0 = publish the text)
+    std::string key_;            ///< the key expression, owned (the handle outlives the caller's)
+    PutOptions opts_{};          ///< the settings every publication from this handle carries
 };
 
 /// A handle to a declared subscription. Holds a non-owning pointer to its `Session`

@@ -5,6 +5,10 @@
 //   -k, --key <KEY>          key expression [default: demo/example/zenoh-cpp-pub]
 //   -p, --payload <PAYLOAD>  payload string [default: "Pub from C++!"]
 //
+// Like the reference it declares a Publisher on the key expression up front and
+// publishes through it, so the key expression is bound to a numeric id once and every
+// message carries the id instead of the text.
+//
 // Each iteration publishes "[<idx>] <payload>" — matching the reference. The
 // reference also sets a TEXT_PLAIN encoding, takes an optional attachment
 // (-a/--attach) and can add a matching listener (--add-matching-listener); `put`
@@ -98,6 +102,13 @@ auto main(int argc, char** argv) -> int {
     }
 
     std::printf("Declaring Publisher on '%s'...\n", key.c_str());
+    auto publisher = session->declare_publisher(key);
+    if (!publisher) {
+        std::fprintf(stderr, "declare_publisher('%s') failed: %s\n", key.c_str(),
+                     zexample::error_name(publisher.error()));
+        return 1;
+    }
+
     std::printf("Press CTRL-C to quit...\n");
     for (std::uint32_t idx = 0;; ++idx) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -106,7 +117,7 @@ auto main(int argc, char** argv) -> int {
         std::snprintf(idx_buf.data(), idx_buf.size(), "[%4u] ", idx);
         std::string const buf = std::string(idx_buf.data()) + payload;
         std::printf("Putting Data ('%s': '%s')...\n", key.c_str(), buf.c_str());
-        if (auto r = session->put(key, zexample::as_bytes(buf)); !r) {
+        if (auto r = publisher->put(zexample::as_bytes(buf)); !r) {
             std::fprintf(stderr, "put('%s') failed: %s\n", key.c_str(),
                          zexample::error_name(r.error()));
             return 1;

@@ -124,9 +124,10 @@ Test files are organized by layer, not 1:1 with modules: `test_varint.cpp`,
 `test_transport.cpp`, `test_declare.cpp`, `test_query.cpp`, `test_push.cpp`,
 `test_put.cpp`, `test_negative.cpp` (malformed input / error paths), `test_diff.cpp`
 (differential vectors, see below), `test_session.cpp`/`test_tcp.cpp`/
-`test_strand.cpp`/`test_subscriber.cpp`/`test_query_api.cpp` (client runtime, against
-a real `socketpair`/loopback), `test_broker.cpp` (the broker — a real `Broker` on
-loopback port 0, driven by real `Session` clients; see `docs/BROKER.md`'s "Testing"),
+`test_strand.cpp`/`test_subscriber.cpp`/`test_publisher.cpp`/`test_query_api.cpp`
+(client runtime, against a real `socketpair`/loopback), `test_broker.cpp` (the broker —
+a real `Broker` on loopback port 0, driven by real `Session` clients; see
+`docs/BROKER.md`'s "Testing"),
 `test_broker_stress.cpp` (broker scale/stress — `Tables`/`ResourceTable` at
 thousands of declarations, sustained no-loss throughput, congestion drop/recover,
 connect/disconnect churn), `test_membership.cpp` (the pure clique member table and its
@@ -233,8 +234,9 @@ proto/
 runtime/
   tcp.{cppm,cpp}      zenoh.runtime.tcp     TcpLink (RAII POSIX socket), IoError; POSIX headers stay in the .cpp
   strand.cppm         zenoh.runtime.strand  Strand<T> per-subscriber bounded queue (ordered / last_value conflation)
-  session.{cppm,cpp}  zenoh.session         Session, ZError, Sample, Subscriber, Queryable, Getter — handshake,
-                                            put/try_put/batch (with target_zid), get/declare_queryable, recv pump
+  session.{cppm,cpp}  zenoh.session         Session, ZError, Sample, Publisher, Subscriber, Queryable, Getter —
+                                            handshake, put/try_put/batch (with target_zid), declare_publisher
+                                            (declared keyexpr ids), get/declare_queryable, recv pump
 zenoh.cppm  zenoh   public umbrella; re-exports zenoh.session only (codec types are NOT re-exported)
 ```
 
@@ -336,7 +338,10 @@ or `last_value` conflation by key); decode errors permanently fault the subscrib
 (no resync mid byte-stream). `get`/`declare_queryable` follow the same shape
 (`Getter`/`Queryable`, `pending_gets_` keyed by request id); `put`/`try_put`/`get`
 accept an optional `target_zid` (zid-targeting — see `docs/BROKER.md`, since the
-broker is what actually enforces it as a filter).
+broker is what actually enforces it as a filter). `declare_publisher` binds a numeric
+id to a key expression (`DeclareKeyExpr` + the reference's `Interest`, refcounted per
+key expression) so a `Publisher`'s `put`/`try_put`/`del` send the id instead of the
+text; unlike subscribers/queryables there is no per-session limit.
 
 ### Broker (`zenohb`) — see `docs/BROKER.md` for full detail
 
@@ -379,11 +384,13 @@ manual interop test path against a real `zenohd` router — see `docs/RUNTIME.md
 the exact invocation sequences (router + reference binaries + this repo's).
 
 Not modeled, for lack of a runtime API rather than by choice: `z_delete` (there is no
-`Session::del` — `SampleKind::del` exists on the receive path only), a query payload
-(`z_get -p`, `z_querier -p`), `declare_querier`/matching listeners
-(`--add-matching-listener`), attachments (`z_pub -a`), and express/priority QoS
-(`--express`, `--no-express`, `z_pub_thr -p`). Congestion control *is* modeled —
-see `PutOptions`/`GetOptions::congestion`.
+`Session::del` — deletion is published through `Publisher::del`, and `SampleKind::del`
+otherwise exists on the receive path only), a query payload (`z_get -p`,
+`z_querier -p`), `declare_querier`/matching listeners (`--add-matching-listener` —
+`Publisher` has no `matching_status()`; see `docs/RUNTIME.md`), attachments
+(`z_pub -a`), and express/priority QoS (`--express`, `--no-express`, `z_pub_thr -p`).
+Congestion control *is* modeled — see `PutOptions`/`PublisherOptions`/
+`GetOptions::congestion`, and `z_pub` declares a real `Publisher`.
 
 `zenohb` (`broker/src/main.cpp`, always built) is the broker executable —
 `zenohb -l tcp/host:port [--peer tcp/host:port]... [--advertise tcp/host:port]

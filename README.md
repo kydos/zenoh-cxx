@@ -25,10 +25,10 @@ Three static libraries, built from one CMake project:
 
 | Capability | Client (`zenoh`) | Broker (`zenohb`) |
 | --- | --- | --- |
-| Pub/sub | `put`, `try_put` (non-blocking), `batch()`, `declare_subscriber` (pull or callback, bounded queue with FIFO or last-value conflation) | fan-out to every matching face, wildcard `*`/`**` matching |
+| Pub/sub | `put`, `try_put` (non-blocking), `batch()`, `declare_publisher` (declared key-expression id, fixed QoS), `declare_subscriber` (pull or callback, bounded queue with FIFO or last-value conflation) | fan-out to every matching face, wildcard `*`/`**` matching |
 | Query/reply | `get` (pull or callback, `GetTarget`, consolidation, timeout), `declare_queryable` | fan-out to matching queryables, fan-in with a synthesized `ResponseFinal` |
-| Delivery | `del` on the receive path | `Put` and `Del` relayed; a message that needs no rewrite is forwarded byte-for-byte |
-| QoS | `CongestionControl::{drop,block}` per operation | per-message: `block` traffic is queued past the watermark, `drop` traffic is shed |
+| Delivery | `Publisher::del` on the send path, `del` on the receive path | `Put` and `Del` relayed; a message that needs no rewrite is forwarded byte-for-byte |
+| QoS | `CongestionControl::{drop,block}` per operation, or fixed per `Publisher` | per-message: `block` traffic is queued past the watermark, `drop` traffic is shed |
 | Addressing | zid-targeting via `target_zid` on `put`/`try_put`/`get` | enforced as a **filter**, never a bypass — including across the clique |
 | Federation | — | full-mesh clique: gossip membership, split-horizon routing, aggregated declarations, partition reporting |
 | Transport | TCP, 4-way handshake, keepalives, batching | same, plus per-connection and global `asio::strand` tiers (no mutexes) |
@@ -72,6 +72,10 @@ int main() {
     }
 }
 ```
+
+Publishing repeatedly on one key expression is worth a `Publisher`:
+`session->declare_publisher(key)` binds the key expression to a numeric id once, so
+each `pub->put(payload)` (and `pub->del()`) sends the id rather than the text.
 
 Query/reply is the same shape: `session->get(key, params, opts)` returns a `Getter`
 whose `recv()` yields each reply and then an empty result when the query completes,
@@ -352,7 +356,7 @@ reference option is rejected.
 | Document | Covers |
 | --- | --- |
 | [`docs/PROTO.md`](docs/PROTO.md) | Wire format and codec internals: message layout, extensions, the strict-decoding rules, adding a message. |
-| [`docs/RUNTIME.md`](docs/RUNTIME.md) | The client `Session`: handshake, TCP framing and batch handling, `put` vs `try_put` commit semantics, subscriber strands, interop runs against `zenohd`. |
+| [`docs/RUNTIME.md`](docs/RUNTIME.md) | The client `Session`: handshake, TCP framing and batch handling, `put` vs `try_put` commit semantics, declared publishers, subscriber strands, interop runs against `zenohd`. |
 | [`docs/BROKER.md`](docs/BROKER.md) | `zenohb`: routing semantics, the two-tier strand concurrency model, the `DestinationId` wire extension, congestion control, performance notes, documented v1 gaps. |
 | [`docs/CLIQUE.md`](docs/CLIQUE.md) | Broker-to-broker federation: the split-horizon invariant, gossip membership, aggregated declarations, partition detection, peer trust. |
 | [`docs/STYLE.md`](docs/STYLE.md) | The short form of the coding conventions. |

@@ -22,6 +22,7 @@ add_executable(zenoh-tests
     test_tcp.cpp
     test_strand.cpp
     test_subscriber.cpp
+    test_publisher.cpp
     test_broker.cpp
     test_broker_stress.cpp
     test_clique.cpp

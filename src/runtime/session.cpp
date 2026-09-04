@@ -314,10 +314,11 @@ namespace {
 
 } // namespace
 
-auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> payload,
-                         const PutOptions& opts) -> std::expected<void, ZError> {
+auto Session::encode_put(std::uint16_t scope, std::string_view suffix,
+                         std::span<const std::byte> payload, const PutOptions& opts)
+    -> std::expected<void, ZError> {
     Push push{};
-    push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    push.wire_expr = WireExpr{.scope = scope, .mapping = Mapping::sender, .suffix = suffix};
     push.qos = to_qos(opts.congestion);
     if (opts.target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
     Put put{};
@@ -328,7 +329,7 @@ auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> p
     fh.reliability = Reliability::reliable;
     fh.sn = frame_sn_;
 
-    std::size_t const cap = 2 + key_expr.size() + payload.size() + 64;
+    std::size_t const cap = 2 + suffix.size() + payload.size() + 64;
     if (tx_scratch_.size() < cap) tx_scratch_.resize(cap);
 
     ByteWriter w{std::span(tx_scratch_).subspan(2)};
@@ -341,10 +342,11 @@ auto Session::encode_put(std::string_view key_expr, std::span<const std::byte> p
     return {};
 }
 
-auto Session::encode_put_head(std::string_view key_expr, std::span<const std::byte> payload,
-                              const PutOptions& opts) -> std::expected<std::size_t, ZError> {
+auto Session::encode_put_head(std::uint16_t scope, std::string_view suffix,
+                              std::span<const std::byte> payload, const PutOptions& opts)
+    -> std::expected<std::size_t, ZError> {
     Push push{};
-    push.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    push.wire_expr = WireExpr{.scope = scope, .mapping = Mapping::sender, .suffix = suffix};
     push.qos = to_qos(opts.congestion);
     if (opts.target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
     Put put{};
@@ -356,7 +358,7 @@ auto Session::encode_put_head(std::string_view key_expr, std::span<const std::by
     fh.sn = frame_sn_;
 
     // Header only — no room reserved for the payload, which is sent via writev.
-    std::size_t const cap = 2 + key_expr.size() + 64;
+    std::size_t const cap = 2 + suffix.size() + 64;
     if (tx_scratch_.size() < cap) tx_scratch_.resize(cap);
 
     ByteWriter w{std::span(tx_scratch_).subspan(2)};
@@ -389,6 +391,17 @@ auto Session::flush_pending() -> std::expected<void, ZError> {
 
 auto Session::put(std::string_view key_expr, std::span<const std::byte> payload, PutOptions opts)
     -> std::expected<void, ZError> {
+    return put_wire(0, key_expr, payload, opts); // no declared id: the key travels in full
+}
+
+auto Session::try_put(std::string_view key_expr, std::span<const std::byte> payload,
+                      PutOptions opts) -> std::expected<void, ZError> {
+    return try_put_wire(0, key_expr, payload, opts);
+}
+
+auto Session::put_wire(std::uint16_t scope, std::string_view suffix,
+                       std::span<const std::byte> payload, const PutOptions& opts)
+    -> std::expected<void, ZError> {
     // A closed session says so, rather than letting the write fail on a dead
     // descriptor and surfacing as a generic io_error -- which is what
     // declare_subscriber/declare_queryable/get already do.
@@ -403,7 +416,7 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload,
 
     // Scatter-gather: encode just the header into tx_scratch_ and write it together
     // with the borrowed payload, so the payload is never copied into a staging buffer.
-    auto const head = encode_put_head(key_expr, payload, opts);
+    auto const head = encode_put_head(scope, suffix, payload, opts);
     if (!head) return std::unexpected(head.error());
 
     if (auto r = link_.writev_all(std::span(tx_scratch_).first(*head), payload); !r)
@@ -412,15 +425,16 @@ auto Session::put(std::string_view key_expr, std::span<const std::byte> payload,
     return {};
 }
 
-auto Session::try_put(std::string_view key_expr, std::span<const std::byte> payload,
-                      PutOptions opts) -> std::expected<void, ZError> {
+auto Session::try_put_wire(std::uint16_t scope, std::string_view suffix,
+                           std::span<const std::byte> payload, const PutOptions& opts)
+    -> std::expected<void, ZError> {
     if (!link_.valid()) return std::unexpected(ZError::connection_closed); // see put()
     // Don't interleave a new frame ahead of buffered bytes: flush first.
     if (pending_off_ < tx_pending_.size()) {
         if (auto f = flush_pending(); !f) return std::unexpected(f.error());
     }
 
-    if (auto e = encode_put(key_expr, payload, opts); !e) return std::unexpected(e.error());
+    if (auto e = encode_put(scope, suffix, payload, opts); !e) return std::unexpected(e.error());
     std::size_t const framed =
         static_cast<std::size_t>(load_le<std::uint16_t>(tx_scratch_.data())) + 2;
     auto const batch = std::span(tx_scratch_).first(framed);
@@ -576,6 +590,184 @@ auto Batch::flush() -> std::expected<void, ZError> {
     body_len_ = 0;
     count_ = 0;
     return r;
+}
+
+// --- Publisher declaration / teardown ---
+
+auto Session::write_declare_keyexpr(std::uint16_t id, std::string_view key)
+    -> std::expected<void, ZError> {
+    Declare d{};
+    DeclareKeyExpr dk{};
+    dk.id = id;
+    // The declaration itself always spells the key expression out: it is what binds
+    // the id, so it cannot be expressed in terms of one.
+    dk.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key};
+    d.body = DeclareBody{.body = dk};
+
+    std::vector<std::byte> tmp(key.size() + 64);
+    ByteWriter w{tmp};
+    if (!d.encode(w)) return std::unexpected(ZError::encode_error);
+    return write_frame(std::span(tmp).first(w.written()));
+}
+
+auto Session::write_undeclare_keyexpr(std::uint16_t id) -> void {
+    if (!link_.valid()) return;
+    Declare d{};
+    d.body = DeclareBody{.body = UndeclareKeyExpr{.id = id}};
+
+    std::vector<std::byte> tmp(64);
+    ByteWriter w{tmp};
+    if (!d.encode(w)) return;
+    (void)write_frame(std::span(tmp).first(w.written())); // best-effort
+}
+
+auto Session::write_interest(std::uint32_t id, std::uint16_t scope, std::string_view suffix)
+    -> std::expected<void, ZError> {
+    Interest in{};
+    in.id = id;
+    // What a `zenoh-rust` publisher announces on declaration: "tell me, now and as it
+    // changes, about the key expressions and subscribers matching this" -- the query
+    // behind its matching_status()/matching_listener(). Bit 0 is KEYEXPRS, bit 1 is
+    // SUBSCRIBERS (`InterestInner`'s K and S).
+    in.mode = InterestMode::current_future;
+    in.inner.options = 0x01 | 0x02;
+    in.inner.wire_expr = WireExpr{.scope = scope, .mapping = Mapping::sender, .suffix = suffix};
+
+    std::vector<std::byte> tmp(suffix.size() + 64);
+    ByteWriter w{tmp};
+    if (!in.encode(w)) return std::unexpected(ZError::encode_error);
+    return write_frame(std::span(tmp).first(w.written()));
+}
+
+auto Session::write_interest_final(std::uint32_t id) -> void {
+    if (!link_.valid()) return;
+    InterestFinal fin{};
+    fin.id = id;
+
+    std::vector<std::byte> tmp(64);
+    ByteWriter w{tmp};
+    if (!fin.encode(w)) return;
+    (void)write_frame(std::span(tmp).first(w.written())); // best-effort
+}
+
+auto Session::declare_ke(std::string_view key) -> std::uint16_t {
+    if (auto it = ke_by_key_.find(std::string(key)); it != ke_by_key_.end()) {
+        ++it->second.refs; // already declared on this link: share the id
+        return it->second.id;
+    }
+    // Stay under what a router will actually remember: both this project's broker and
+    // a `Session`'s own receive path cap their id->key maps at `max_resmap_entries`
+    // and silently ignore declarations past it. An id the peer dropped would make
+    // every later Push unresolvable, so declining to allocate (and publishing the key
+    // in full) is the safe answer rather than the lossy one.
+    if (ke_by_id_.size() >= max_resmap_entries) return 0;
+
+    // Ids are u16 and are released on undeclare, so a long-lived session that churns
+    // publishers wraps: walk from the cursor to the first free id, skipping 0 (which
+    // means "no id" on the wire). The map size check above guarantees one exists.
+    std::uint16_t id = next_ke_id_;
+    while (id == 0 || ke_by_id_.contains(id)) ++id;
+    next_ke_id_ = static_cast<std::uint16_t>(id + 1);
+
+    if (!write_declare_keyexpr(id, key)) return 0; // publish the key in full instead
+    ke_by_key_.emplace(std::string(key), KeReg{.id = id, .refs = 1});
+    ke_by_id_.emplace(id, std::string(key));
+    return id;
+}
+
+auto Session::undeclare_ke(std::uint16_t ke_id) -> void {
+    if (ke_id == 0) return;
+    auto by_id = ke_by_id_.find(ke_id);
+    if (by_id == ke_by_id_.end()) return;
+    auto by_key = ke_by_key_.find(by_id->second);
+    if (by_key == ke_by_key_.end()) return;
+    if (--by_key->second.refs > 0) return; // another publisher still holds it
+    write_undeclare_keyexpr(ke_id);
+    ke_by_key_.erase(by_key);
+    ke_by_id_.erase(by_id);
+}
+
+auto Session::declare_publisher(std::string_view key_expr, PublisherOptions opts)
+    -> std::expected<Publisher, ZError> {
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
+    std::uint32_t const id = next_entity_id_++;
+    std::uint16_t const ke_id = declare_ke(key_expr);
+    // With an id bound, the publisher's key expression is that id and nothing else;
+    // without one it is the text, exactly as a bare `put` sends it.
+    std::string_view const suffix = ke_id == 0 ? key_expr : std::string_view{};
+    if (auto r = write_interest(id, ke_id, suffix); !r) {
+        undeclare_ke(ke_id);
+        return std::unexpected(r.error());
+    }
+    return Publisher{this, id, ke_id, std::string(key_expr),
+                     PutOptions{.target_zid = opts.target_zid, .congestion = opts.congestion}};
+}
+
+auto Session::del_wire(std::uint16_t scope, std::string_view suffix, const PutOptions& opts)
+    -> std::expected<void, ZError> {
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
+    Push push{};
+    push.wire_expr = WireExpr{.scope = scope, .mapping = Mapping::sender, .suffix = suffix};
+    push.qos = to_qos(opts.congestion);
+    if (opts.target_zid) push.dest = DestinationId{.zid = to_zenoh_id(*opts.target_zid)};
+    push.payload = PushBody{.body = Del{}};
+
+    std::vector<std::byte> tmp(suffix.size() + 64);
+    ByteWriter w{tmp};
+    if (!push.encode(w)) return std::unexpected(ZError::encode_error);
+    return write_frame(std::span(tmp).first(w.written()));
+}
+
+auto Session::pub_drop(std::uint32_t id, std::uint16_t ke_id) -> void {
+    write_interest_final(id); // mirrors the reference's Interest{Final} on undeclare
+    undeclare_ke(ke_id);
+}
+
+// --- Publisher ---
+
+Publisher::Publisher(Publisher&& other) noexcept
+    : session_(other.session_), id_(other.id_), ke_id_(other.ke_id_), key_(std::move(other.key_)),
+      opts_(std::move(other.opts_)) {
+    other.session_ = nullptr;
+}
+
+auto Publisher::operator=(Publisher&& other) noexcept -> Publisher& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->pub_drop(id_, ke_id_); // undeclare our own first
+        session_ = other.session_;
+        id_ = other.id_;
+        ke_id_ = other.ke_id_;
+        key_ = std::move(other.key_);
+        opts_ = std::move(other.opts_);
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+Publisher::~Publisher() {
+    if (session_ != nullptr) session_->pub_drop(id_, ke_id_); // best-effort undeclare
+}
+
+auto Publisher::undeclare() -> void {
+    if (session_ != nullptr) {
+        session_->pub_drop(id_, ke_id_);
+        session_ = nullptr; // idempotent: the destructor must not undeclare twice
+    }
+}
+
+auto Publisher::put(std::span<const std::byte> payload) -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->put_wire(ke_id_, wire_suffix(), payload, opts_);
+}
+
+auto Publisher::try_put(std::span<const std::byte> payload) -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->try_put_wire(ke_id_, wire_suffix(), payload, opts_);
+}
+
+auto Publisher::del() -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->del_wire(ke_id_, wire_suffix(), opts_);
 }
 
 // --- Subscriber declaration / teardown ---
