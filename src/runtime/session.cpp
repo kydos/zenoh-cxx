@@ -21,6 +21,7 @@ module;
 
 module zenoh.session;
 
+import zenoh.ke;
 import zenoh.proto;
 import zenoh.runtime.tcp;
 import zenoh.runtime.strand;
@@ -47,6 +48,84 @@ constexpr std::size_t frame_overhead = 8;
 constexpr std::size_t max_key_len = 0xffff;
 /// Cap on distinct router-declared keyexpr ids we cache (bounds resmap memory).
 constexpr std::size_t max_resmap_entries = 4096;
+
+/// The reserved namespace every Computation lives in on the wire, and the whole of
+/// the Query/Eval isolation mechanism (session.cppm's Evaluation section): the
+/// logical computation key `robot/r1/reset` is declared, queried and matched as
+/// `@eval/robot/r1/reset`.
+///
+/// Prefixing preserves key-expression matching exactly (`a/*/b` matches `a/x/b` iff
+/// `@eval/a/*/b` matches `@eval/a/x/b`), so nothing about the user's key expressions
+/// changes; what it buys is that an ordinary `get`'s key expression can never reach
+/// a Computation and an eval's can never reach a `Queryable`. `@eval` is a *verbatim*
+/// chunk (`zenoh.ke`), so that holds even for `get("**")`, and it sits in Zenoh's
+/// reserved non-alphabetic-leading key space next to the reference's own `@adv` —
+/// deliberately not inside the `@/...` admin space, which the broker refuses to route
+/// at all (`zenoh.broker.membership`'s `is_internal_key`).
+constexpr std::string_view eval_prefix = "@eval/";
+/// The namespace's own chunk, derived from the prefix so the name is spelled exactly
+/// once ("centralized in one internal helper/constant"). `constexpr`, so this costs
+/// nothing and runs no static initializer.
+constexpr std::string_view eval_ns = eval_prefix.substr(0, eval_prefix.size() - 1);
+
+/// Selector parameter asking the router to accept replies whose key expression does
+/// not intersect the query's own (the reference's `ReplyKeyExpr::Any`, which it
+/// likewise carries as a parameter rather than a wire field). An eval needs it
+/// because its replies are keyed by the *logical* computation key while the request
+/// travels under `eval_prefix`.
+constexpr std::string_view eval_parameters = "_anyke";
+
+/// Whether `key` names the reserved Evaluation namespace, i.e. its first chunk is
+/// literally `@eval`. A literal is the only thing that can name it: `@eval` is a
+/// verbatim chunk, so no wildcard on either side matches it (`zenoh.ke`, and the
+/// reference's `MayHaveVerbatim` rule this mirrors).
+///
+/// This is what makes the namespace *reserved* rather than merely obscure. The
+/// key-expression matching keeps evals and ordinary queries apart for every key
+/// expression an application would naturally write, but a caller who types the prefix
+/// verbatim would otherwise match a Computation's own wire declaration exactly — so
+/// the ordinary query API (`get`, `declare_queryable`) refuses the namespace outright,
+/// and the Evaluation API refuses to nest it inside itself. Only the query surface
+/// needs this: `put`/`declare_subscriber` route to subscribers, and no Computation is
+/// ever one, so there is nothing there to reach.
+[[nodiscard]] auto names_eval_namespace(std::string_view key) noexcept -> bool {
+    return key.substr(0, key.find('/')) == eval_ns;
+}
+
+/// `robot/r1/reset` -> `@eval/robot/r1/reset`. Private, by design: no key this
+/// returns is ever handed back to an application.
+[[nodiscard]] auto to_eval_wire_key(std::string_view key) -> std::string {
+    std::string out;
+    out.reserve(eval_prefix.size() + key.size());
+    out.append(eval_prefix);
+    out.append(key);
+    return out;
+}
+
+/// The inverse, for the receive path: `@eval/robot/r1/reset` -> `robot/r1/reset`,
+/// or `nullopt` when `key` is an ordinary (non-evaluation) key expression.
+[[nodiscard]] auto from_eval_wire_key(std::string_view key) noexcept
+    -> std::optional<std::string_view> {
+    if (!key.starts_with(eval_prefix)) return std::nullopt;
+    return key.substr(eval_prefix.size());
+}
+
+/// Whether `key` is a concrete, canonical key expression — what a Computation must
+/// be declared on. Canonicity is `zenoh.ke`'s business; concreteness is then a plain
+/// scan, because in a canonical key expression the only legal use of '*' is a whole
+/// `*`/`**` chunk (v1 has no `$*` sub-chunk globbing — see ke.cppm).
+[[nodiscard]] auto is_concrete_key(std::string_view key) noexcept -> bool {
+    return ke::is_canon(key) && key.find('*') == std::string_view::npos;
+}
+
+/// Whether `key_expr` is usable as the key expression of an eval: any canonical key
+/// expression that does not name the reserved namespace. Canonicity is required here
+/// though `get` does not require it, because prefixing has to preserve the caller's
+/// key expression — `""` or `a//b` would otherwise be spliced into a malformed wire
+/// key rather than rejected.
+[[nodiscard]] auto is_eval_key_expr(std::string_view key_expr) noexcept -> bool {
+    return ke::is_canon(key_expr) && !names_eval_namespace(key_expr);
+}
 
 [[nodiscard]] auto io_to_zerr(IoError e) noexcept -> ZError {
     switch (e) {
@@ -198,6 +277,26 @@ struct QblReg {
         : id(i), key(std::move(k)), strand(cap, m), handler(std::move(h)) {}
 };
 
+// Plain data popped from a computation's strand; wrapped into an `Eval` (which needs
+// a live `Session*`) only at delivery time, exactly as `PendingQuery` is.
+struct PendingEval {
+    std::uint32_t rid = 0;
+    std::string key;             ///< the evaluator's key expression (logical)
+    std::string computation_key; ///< the concrete key of the computation it reached
+    std::vector<std::byte> argument;
+};
+
+// One declared computation. Mirrors `QblReg`, minus the delivery mode: a computation
+// strand is always `ordered` (see `ComputationOptions`).
+struct CompReg {
+    std::uint32_t id;
+    std::string key; ///< the logical, concrete key (no `eval_prefix`)
+    Strand<PendingEval> strand;
+    EvalHandler handler; ///< empty for a pull-based (recv) computation
+    CompReg(std::uint32_t i, std::string k, std::size_t cap, EvalHandler h)
+        : id(i), key(std::move(k)), strand(cap, StrandMode::ordered), handler(std::move(h)) {}
+};
+
 // One in-flight get()'s bookkeeping: the reply strand, an optional callback (empty
 // for a pull-based `Getter`), whether the broker's `ResponseFinal` has been seen, and
 // the client-enforced deadline (the broker does not enforce query timeouts in v1).
@@ -212,6 +311,7 @@ struct GetReg {
 };
 
 auto GetRegDeleter::operator()(GetReg* p) const noexcept -> void { delete p; }
+auto CompRegDeleter::operator()(CompReg* p) const noexcept -> void { delete p; }
 
 Session::Session(Session&&) noexcept = default;
 auto Session::operator=(Session&&) noexcept -> Session& = default;
@@ -859,6 +959,10 @@ auto Session::declare_queryable(std::string_view key_expr, QueryableOptions opts
 
 auto Session::declare_queryable(std::string_view key_expr, QueryHandler on_query,
                                 QueryableOptions opts) -> std::expected<Queryable, ZError> {
+    // The other half of the reservation (see `names_eval_namespace`): an ordinary
+    // queryable must not be able to register itself where evals are routed, or an eval
+    // would reach a `Queryable` -- the isolation guarantee inverted.
+    if (names_eval_namespace(key_expr)) return std::unexpected(ZError::invalid_key_expr);
     if (qbl_) return std::unexpected(ZError::already_queryable);
     if (!link_.valid()) return std::unexpected(ZError::connection_closed);
     std::uint32_t const id = next_entity_id_++;
@@ -913,12 +1017,12 @@ auto Session::send_response_final(std::uint32_t rid) -> void {
 
 // --- get() / Getter ---
 
-auto Session::write_request(std::uint32_t rid, std::string_view key_expr,
-                            std::string_view parameters, const GetOptions& opts)
-    -> std::expected<void, ZError> {
+auto Session::write_request(std::uint32_t rid, std::uint16_t scope, std::string_view suffix,
+                            std::string_view parameters, std::span<const std::byte> payload,
+                            const GetOptions& opts) -> std::expected<void, ZError> {
     Request req{};
     req.id = rid;
-    req.wire_expr = WireExpr{.scope = 0, .mapping = Mapping::sender, .suffix = key_expr};
+    req.wire_expr = WireExpr{.scope = scope, .mapping = Mapping::sender, .suffix = suffix};
     req.target = to_query_target(opts.target);
     req.qos = to_qos(opts.congestion);
     req.timeout = Duration::from_millis(effective_timeout_ms(opts));
@@ -927,20 +1031,24 @@ auto Session::write_request(std::uint32_t rid, std::string_view key_expr,
     Query q{};
     q.consolidation = to_consolidation_mode(opts.consolidation);
     q.parameters = parameters;
+    // The request payload (the eval argument) rides the `Query`'s value extension —
+    // the same field the reference's `get().payload(..)` uses. Left unset for a plain
+    // `get`, which has no payload in this runtime's API.
+    if (!payload.empty()) q.body = Value{.encoding = Encoding{}, .payload = payload};
     req.payload = RequestBody{.query = q};
 
-    std::vector<std::byte> tmp(64 + key_expr.size() + parameters.size());
+    std::vector<std::byte> tmp(64 + suffix.size() + parameters.size() + payload.size());
     ByteWriter w{tmp};
     if (!req.encode(w)) return std::unexpected(ZError::encode_error);
     return write_frame(std::span(tmp).first(w.written()));
 }
 
-auto Session::start_get(std::string_view key_expr, std::string_view parameters,
-                        GetReplyHandler handler, const GetOptions& opts)
-    -> std::expected<std::uint32_t, ZError> {
+auto Session::start_get(std::uint16_t scope, std::string_view suffix, std::string_view parameters,
+                        std::span<const std::byte> payload, GetReplyHandler handler,
+                        const GetOptions& opts) -> std::expected<std::uint32_t, ZError> {
     if (!link_.valid()) return std::unexpected(ZError::connection_closed);
     std::uint32_t const rid = next_request_id_++;
-    if (auto r = write_request(rid, key_expr, parameters, opts); !r)
+    if (auto r = write_request(rid, scope, suffix, parameters, payload, opts); !r)
         return std::unexpected(r.error());
     auto const deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms(opts));
@@ -951,14 +1059,16 @@ auto Session::start_get(std::string_view key_expr, std::string_view parameters,
 
 auto Session::get(std::string_view key_expr, std::string_view parameters, GetOptions opts)
     -> std::expected<Getter, ZError> {
-    auto rid = start_get(key_expr, parameters, GetReplyHandler{}, opts);
+    if (names_eval_namespace(key_expr)) return std::unexpected(ZError::invalid_key_expr);
+    auto rid = start_get(0, key_expr, parameters, {}, GetReplyHandler{}, opts);
     if (!rid) return std::unexpected(rid.error());
     return Getter{this, *rid};
 }
 
 auto Session::get(std::string_view key_expr, std::string_view parameters, GetReplyHandler on_reply,
                   GetOptions opts) -> std::expected<void, ZError> {
-    auto rid = start_get(key_expr, parameters, std::move(on_reply), opts);
+    if (names_eval_namespace(key_expr)) return std::unexpected(ZError::invalid_key_expr);
+    auto rid = start_get(0, key_expr, parameters, {}, std::move(on_reply), opts);
     if (!rid) return std::unexpected(rid.error());
     return {};
 }
@@ -997,6 +1107,190 @@ auto Session::get_recv(std::uint32_t rid) -> std::expected<std::optional<GetRepl
 }
 
 auto Session::get_drop(std::uint32_t rid) -> void { pending_gets_.erase(rid); }
+
+// --- Evaluation: Computation declaration / Evaluator / eval() ---
+
+auto Session::declare_computation(std::string_view key, ComputationOptions opts)
+    -> std::expected<Computation, ZError> {
+    return declare_computation(key, EvalHandler{}, opts);
+}
+
+auto Session::declare_computation(std::string_view key, EvalHandler on_eval,
+                                  ComputationOptions opts) -> std::expected<Computation, ZError> {
+    // A Computation is a computation registered at *one* key: a wild (or merely
+    // non-canonical) key expression is rejected rather than quietly registered on
+    // something that can never be one concrete computation.
+    // ... and the reserved namespace is refused so it cannot be nested inside itself
+    // (see `names_eval_namespace`).
+    if (!is_concrete_key(key) || names_eval_namespace(key))
+        return std::unexpected(ZError::invalid_key_expr);
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
+    if (auto r = declare_comp_key(key); !r) return std::unexpected(r.error());
+    std::uint32_t const id = next_entity_id_++;
+    comps_.push_back(std::unique_ptr<CompReg, CompRegDeleter>(
+        new CompReg(id, std::string(key), opts.capacity, std::move(on_eval))));
+    return Computation{this, id};
+}
+
+auto Session::declare_comp_key(std::string_view key) -> std::expected<void, ZError> {
+    // One wire declaration per *key*, refcounted, not one per registration -- the same
+    // shape `declare_ke` uses for publishers, and for a sharper reason here. Two
+    // Computations may share a key (both must run), and an `UndeclareQueryable` names a
+    // key expression, not a registration: a router that keys declarations by key alone
+    // -- `zenohb` does, via `ResourceTable`'s per-(key, face) flag -- would let the
+    // first undeclare silently stop routing to the survivors. Declaring once and
+    // releasing on the last drop makes the guarantee independent of that choice, and
+    // puts N-1 fewer declarations on the wire.
+    auto it = comp_decls_.find(key);
+    if (it != comp_decls_.end()) {
+        ++it->second.refs;
+        return {};
+    }
+    std::uint32_t const decl_id = next_entity_id_++;
+    // Declared to the router as an ordinary queryable on the internally-namespaced
+    // key, which is what keeps ordinary queries and evals from reaching each other.
+    // Always incomplete: `complete` is a data-query notion (see ComputationOptions).
+    QueryableInfo const qinfo{.complete = false, .distance = 0};
+    if (auto r = write_declare_queryable(decl_id, to_eval_wire_key(key), qinfo); !r)
+        return std::unexpected(r.error());
+    comp_decls_.emplace(std::string(key), CompDecl{.id = decl_id, .refs = 1});
+    return {};
+}
+
+auto Session::undeclare_comp_key(std::string_view key) -> void {
+    auto it = comp_decls_.find(key);
+    if (it == comp_decls_.end()) return;
+    if (--it->second.refs != 0) return; // another Computation still holds this key
+    write_undeclare_queryable(it->second.id);
+    comp_decls_.erase(it);
+}
+
+auto Session::find_comp(std::uint32_t id) noexcept -> CompReg* {
+    for (auto const& c : comps_) {
+        if (c->id == id) return c.get();
+    }
+    return nullptr;
+}
+
+auto Session::comp_drop(std::uint32_t id) -> void {
+    auto it =
+        std::find_if(comps_.begin(), comps_.end(), [id](auto const& c) { return c->id == id; });
+    if (it == comps_.end()) return;
+    undeclare_comp_key((*it)->key); // a wire message only when the last one on that key goes
+    // Evals still queued for this computation will never be delivered, so release
+    // their share of their request now -- otherwise the evaluator waits out its whole
+    // timeout for a `ResponseFinal` that nobody is left to trigger.
+    while (auto pe = (*it)->strand.pop()) eval_finish(pe->rid);
+    comps_.erase(it);
+}
+
+auto Session::deliver_eval(std::uint32_t rid, std::string_view key,
+                           std::span<const std::byte> argument) -> bool {
+    // Which computations does this evaluation reach? The router matched our
+    // declarations *as a face* (one Request per session, however many of its
+    // declarations matched), so the per-registration fan-out is ours to do -- and it
+    // is a match, not a lookup: the evaluator's key expression may be wild, and two
+    // computations may share one key, in which case both run.
+    std::size_t matched = 0;
+    for (auto const& c : comps_) {
+        if (!ke::intersects(key, c->key)) continue;
+        // Room is checked for *every* matching computation before anything is posted:
+        // a half-delivered request that the caller replays would run the computations
+        // that had room a second time, and a computation may not be replay-safe.
+        if (c->strand.size() >= c->strand.capacity()) return false;
+        ++matched;
+    }
+    if (matched == 0) {
+        // Nothing matched after all (e.g. the computation was undeclared while this
+        // request was in flight): terminate it rather than leave the evaluator
+        // waiting on a reply stream that will never close.
+        send_response_final(rid);
+        return true;
+    }
+    eval_pending_[rid] += matched;
+    for (auto const& c : comps_) {
+        if (!ke::intersects(key, c->key)) continue;
+        PendingEval pe{.rid = rid,
+                       .key = std::string(key),
+                       .computation_key = c->key,
+                       .argument = {argument.begin(), argument.end()}};
+        // Room was pre-checked above, so this always `posted` -- never `full` (which
+        // would lose an eval already counted in `eval_pending_`) and never `conflated`
+        // (a computation strand is `ordered`, so it does not conflate at all).
+        (void)c->strand.post(c->key, std::move(pe));
+    }
+    return true;
+}
+
+auto Session::eval_finish(std::uint32_t rid) -> void {
+    auto it = eval_pending_.find(rid);
+    if (it == eval_pending_.end()) return;
+    if (--it->second != 0) return; // sibling computations are still working
+    eval_pending_.erase(it);
+    send_response_final(rid);
+}
+
+auto Session::comp_recv(std::uint32_t id) -> std::expected<Eval, ZError> {
+    for (;;) {
+        auto* comp = find_comp(id);
+        if (comp == nullptr) return std::unexpected(ZError::connection_closed);
+        if (auto pe = comp->strand.pop())
+            return Eval(this, pe->rid, std::move(pe->key), std::move(pe->computation_key),
+                        std::move(pe->argument));
+        // As in `qbl_recv`: a pump that ends in an error may still have posted
+        // messages from the same batch first, so deliver those before reporting it.
+        if (auto r = pump_step(); !r) {
+            auto* still = find_comp(id);
+            if (still == nullptr || still->strand.empty()) return std::unexpected(r.error());
+        }
+    }
+}
+
+auto Session::declare_evaluator(std::string_view key_expr, EvalOptions opts)
+    -> std::expected<Evaluator, ZError> {
+    if (!is_eval_key_expr(key_expr)) return std::unexpected(ZError::invalid_key_expr);
+    if (!link_.valid()) return std::unexpected(ZError::connection_closed);
+    std::string wire_key = to_eval_wire_key(key_expr);
+    // Same declared-keyexpr-id mechanism a `Publisher` uses, for the same reason: an
+    // evaluator sends its key expression on every eval, so binding it to an id once
+    // turns a long key expression into a couple of bytes per request. Id 0 (none
+    // available) is a valid outcome -- the text is then sent in full.
+    std::uint16_t const ke_id = declare_ke(wire_key);
+    return Evaluator{this, ke_id, std::string(key_expr), std::move(wire_key), std::move(opts)};
+}
+
+auto Session::start_eval(std::uint16_t scope, std::string_view suffix,
+                         std::span<const std::byte> argument, GetReplyHandler handler,
+                         const EvalOptions& opts) -> std::expected<std::uint32_t, ZError> {
+    // The Evaluation contract, applied where the underlying query is built rather
+    // than exposed as options (session.cppm's `EvalOptions`): every matching
+    // Computation registration runs (`all`), nothing is consolidated (`none`), and
+    // replies keyed by the logical computation key are accepted even though the
+    // request travels under `eval_prefix` (`_anyke`).
+    GetOptions gopts{};
+    gopts.consolidation = GetConsolidation::none;
+    gopts.target = GetTarget::all;
+    gopts.timeout_ms = opts.timeout_ms;
+    gopts.target_zid = opts.target_zid;
+    gopts.congestion = opts.congestion;
+    return start_get(scope, suffix, eval_parameters, argument, std::move(handler), gopts);
+}
+
+auto Session::eval(std::string_view key_expr, std::span<const std::byte> argument, EvalOptions opts)
+    -> std::expected<Getter, ZError> {
+    if (!is_eval_key_expr(key_expr)) return std::unexpected(ZError::invalid_key_expr);
+    auto rid = start_eval(0, to_eval_wire_key(key_expr), argument, GetReplyHandler{}, opts);
+    if (!rid) return std::unexpected(rid.error());
+    return Getter{this, *rid};
+}
+
+auto Session::eval(std::string_view key_expr, std::span<const std::byte> argument,
+                   GetReplyHandler on_reply, EvalOptions opts) -> std::expected<void, ZError> {
+    if (!is_eval_key_expr(key_expr)) return std::unexpected(ZError::invalid_key_expr);
+    auto rid = start_eval(0, to_eval_wire_key(key_expr), argument, std::move(on_reply), opts);
+    if (!rid) return std::unexpected(rid.error());
+    return {};
+}
 
 // --- Receive pump ---
 
@@ -1095,22 +1389,37 @@ auto Session::dispatch_cursor() -> std::expected<bool, ZError> {
             // `req->dest` (zid-targeting) is not re-filtered here: the broker already
             // restricts fan-out to the matching peer before a Request ever reaches
             // us, so by the time it's here it's already known to be for us.
-            if (qbl_) {
+            if (qbl_ || !comps_.empty()) {
                 auto key = resolve_key(req->wire_expr);
                 if (!key) {
                     fault_ = key.error();
                     return std::unexpected(*fault_);
                 }
-                std::vector<std::byte> payload;
-                if (auto const& body = req->payload.query.body) {
-                    payload.assign(body->payload.begin(), body->payload.end());
-                }
-                PendingQuery pq{.rid = req->id,
-                                .key = *key,
-                                .params = std::string(req->payload.query.parameters),
-                                .payload = std::move(payload)};
-                if (qbl_->strand.post(*key, std::move(pq)) == PostResult::full) {
-                    return false; // pause; retry next pump
+                // Bound to a reference before dereferencing rather than read through a
+                // conditional expression: the latter is what `bugprone-unchecked-
+                // optional-access` cannot see through (it reads the `->payload` as
+                // unguarded), and this is the shape the rest of this file already uses.
+                std::span<const std::byte> arg{};
+                if (auto const& body = req->payload.query.body) arg = body->payload;
+                // An evaluation and an ordinary query are told apart by the internal
+                // namespace alone, and each is routed only to its own abstraction:
+                // this is the client half of the Query/Eval isolation the `@eval`
+                // prefix buys (see `eval_prefix`). The router already enforces the
+                // other half by matching key expressions, verbatim chunk included.
+                if (auto logical = from_eval_wire_key(*key)) {
+                    if (!deliver_eval(req->id, *logical, arg)) {
+                        return false; // pause; retry next pump
+                    }
+                } else if (qbl_) {
+                    PendingQuery pq{.rid = req->id,
+                                    .key = *key,
+                                    .params = std::string(req->payload.query.parameters),
+                                    .payload = {arg.begin(), arg.end()}};
+                    if (qbl_->strand.post(*key, std::move(pq)) == PostResult::full) {
+                        return false; // pause; retry next pump
+                    }
+                } else {
+                    send_response_final(req->id); // computations only, and none matched
                 }
             } else {
                 // No queryable declared on this session: nobody will ever construct an
@@ -1244,10 +1553,54 @@ auto Session::drain_handlers() -> void {
         handler(IncomingQuery(this, pq->rid, std::move(pq->key), std::move(pq->params),
                               std::move(pq->payload)));
     }
-    for (auto& [rid, reg] : pending_gets_) {
-        if (!reg->handler) continue;
-        while (auto r = reg->strand.pop()) reg->handler(*r);
+    // Computations are drained in two phases, unlike the single registrations above:
+    // a handler may undeclare *any* computation (its own included), which would
+    // invalidate an iteration over `comps_` mid-flight. Phase one runs no user code
+    // and only moves queued evals out; phase two invokes the handlers, skipping any
+    // computation undeclared in the meantime -- so an undeclare still stops delivery,
+    // exactly as re-testing `qbl_` does above.
+    std::vector<std::pair<std::uint32_t, PendingEval>> due;
+    for (auto const& c : comps_) {
+        if (!c->handler) continue;
+        while (auto pe = c->strand.pop()) due.emplace_back(c->id, std::move(*pe));
     }
+    for (auto& [id, pe] : due) {
+        auto* comp = find_comp(id);
+        if (comp == nullptr) { // undeclared by an earlier handler in this batch
+            eval_finish(pe.rid);
+            continue;
+        }
+        auto handler = comp->handler;
+        handler(Eval(this, pe.rid, std::move(pe.key), std::move(pe.computation_key),
+                     std::move(pe.argument)));
+    }
+    // Callback-style get()s and evals, over a snapshot of the request ids rather than
+    // over the map itself. A reply handler that starts the *next* request -- "on each
+    // reply, eval the next step", which the Evaluation API invites -- inserts into
+    // `pending_gets_` and can rehash it, which would invalidate a live iterator here.
+    // Re-finding by id each time round is what makes that safe; the entry may also be
+    // gone (a handler dropping its own `Getter`), hence the lookup rather than a
+    // cached pointer.
+    for (std::uint32_t const rid : callback_get_rids()) {
+        for (;;) {
+            auto it = pending_gets_.find(rid);
+            if (it == pending_gets_.end()) break;
+            auto r = it->second->strand.pop();
+            if (!r) break;
+            auto handler = it->second->handler; // copy: the handler may erase the entry
+            handler(*r);
+        }
+    }
+}
+
+auto Session::callback_get_rids() -> std::vector<std::uint32_t> {
+    std::vector<std::uint32_t> rids;
+    if (pending_gets_.empty()) return rids; // the common case: no allocation at all
+    rids.reserve(pending_gets_.size());
+    for (auto const& [rid, reg] : pending_gets_) {
+        if (reg->handler) rids.push_back(rid);
+    }
+    return rids;
 }
 
 auto Session::pump_step(std::optional<std::int32_t> max_wait_ms) -> std::expected<void, ZError> {
@@ -1359,21 +1712,18 @@ auto Session::run_once() -> std::expected<void, ZError> {
     // standing on; `drain_handlers` re-tests the owner each iteration and invokes
     // through a copy of the std::function for exactly that reason.
     drain_handlers();
-    // Drain callback-style get()s. Pull-style (handler-empty) entries are owned
-    // entirely by their Getter (recv()'s own pump loop and ~Getter()'s cleanup), so
-    // they're deliberately left untouched here to avoid two owners racing to erase
-    // the same map entry.
-    for (auto it = pending_gets_.begin(); it != pending_gets_.end();) {
+    // Retire finished callback-style get()s and evals. Pull-style (handler-empty)
+    // entries are owned entirely by their Getter (recv()'s own pump loop and
+    // ~Getter()'s cleanup), so they're deliberately left untouched here to avoid two
+    // owners racing to erase the same map entry. `drain_handlers` above already
+    // delivered everything queued; this pass only decides what to erase, over a
+    // snapshot of the ids for the same reentrancy reason it uses.
+    for (std::uint32_t const rid : callback_get_rids()) {
+        auto it = pending_gets_.find(rid);
+        if (it == pending_gets_.end()) continue; // erased by a handler
         auto& reg = *it->second;
-        if (!reg.handler) {
-            ++it;
-            continue;
-        }
-        while (auto r = reg.strand.pop()) reg.handler(*r);
         if ((reg.final && reg.strand.empty()) || std::chrono::steady_clock::now() >= reg.deadline)
-            it = pending_gets_.erase(it);
-        else
-            ++it;
+            pending_gets_.erase(it);
     }
     if (!pumped) return std::unexpected(pumped.error());
     return {};
@@ -1491,6 +1841,132 @@ auto IncomingQuery::reply(std::string_view key_expr, std::span<const std::byte> 
 auto IncomingQuery::reply_err(std::span<const std::byte> payload) -> std::expected<void, ZError> {
     if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
     return session_->send_response(rid_, std::string_view{}, payload, /*is_err=*/true);
+}
+
+// --- Computation handle ---
+
+Computation::Computation(Computation&& other) noexcept : session_(other.session_), id_(other.id_) {
+    other.session_ = nullptr;
+}
+
+auto Computation::operator=(Computation&& other) noexcept -> Computation& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->comp_drop(id_); // undeclare our own first
+        session_ = other.session_;
+        id_ = other.id_;
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+Computation::~Computation() {
+    if (session_ != nullptr) session_->comp_drop(id_); // best-effort undeclare
+}
+
+auto Computation::recv() -> std::expected<Eval, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->comp_recv(id_);
+}
+
+auto Computation::undeclare() -> void {
+    if (session_ != nullptr) {
+        session_->comp_drop(id_);
+        session_ = nullptr;
+    }
+}
+
+auto Computation::key() const noexcept -> std::string_view {
+    if (session_ == nullptr) return {};
+    auto const* comp = session_->find_comp(id_);
+    return comp == nullptr ? std::string_view{} : std::string_view{comp->key};
+}
+
+// --- Eval handle ---
+
+Eval::Eval(Eval&& other) noexcept
+    : session_(other.session_), rid_(other.rid_), key_(std::move(other.key_)),
+      computation_key_(std::move(other.computation_key_)), argument_(std::move(other.argument_)) {
+    other.session_ = nullptr;
+}
+
+auto Eval::operator=(Eval&& other) noexcept -> Eval& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->eval_finish(rid_); // release our own first
+        session_ = other.session_;
+        rid_ = other.rid_;
+        key_ = std::move(other.key_);
+        computation_key_ = std::move(other.computation_key_);
+        argument_ = std::move(other.argument_);
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+Eval::~Eval() {
+    // Not `send_response_final` directly (as `~IncomingQuery` does): one request may
+    // have reached several of this session's computations, and it is finalized only
+    // once the last of them is done -- see `Session::eval_finish`.
+    if (session_ != nullptr) session_->eval_finish(rid_);
+}
+
+auto Eval::reply(std::span<const std::byte> value) -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    // The reply carries the *logical* computation key, never the internal wire one:
+    // that is what identifies which computation produced this result, and it is
+    // why the request asked for `_anyke` (the two do not intersect).
+    return session_->send_response(rid_, computation_key_, value, /*is_err=*/false);
+}
+
+auto Eval::reply_err(std::span<const std::byte> error) -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    return session_->send_response(rid_, std::string_view{}, error, /*is_err=*/true);
+}
+
+// --- Evaluator handle ---
+
+Evaluator::Evaluator(Evaluator&& other) noexcept
+    : session_(other.session_), ke_id_(other.ke_id_), key_(std::move(other.key_)),
+      wire_key_(std::move(other.wire_key_)), opts_(std::move(other.opts_)) {
+    other.session_ = nullptr;
+}
+
+auto Evaluator::operator=(Evaluator&& other) noexcept -> Evaluator& {
+    if (this != &other) {
+        if (session_ != nullptr) session_->undeclare_ke(ke_id_); // release our own first
+        session_ = other.session_;
+        ke_id_ = other.ke_id_;
+        key_ = std::move(other.key_);
+        wire_key_ = std::move(other.wire_key_);
+        opts_ = std::move(other.opts_);
+        other.session_ = nullptr;
+    }
+    return *this;
+}
+
+Evaluator::~Evaluator() {
+    if (session_ != nullptr) session_->undeclare_ke(ke_id_); // best-effort
+}
+
+auto Evaluator::eval(std::span<const std::byte> argument) -> std::expected<Getter, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    auto rid = session_->start_eval(ke_id_, wire_suffix(), argument, GetReplyHandler{}, opts_);
+    if (!rid) return std::unexpected(rid.error());
+    return Getter{session_, *rid};
+}
+
+auto Evaluator::eval(std::span<const std::byte> argument, GetReplyHandler on_reply)
+    -> std::expected<void, ZError> {
+    if (session_ == nullptr) return std::unexpected(ZError::connection_closed);
+    auto rid = session_->start_eval(ke_id_, wire_suffix(), argument, std::move(on_reply), opts_);
+    if (!rid) return std::unexpected(rid.error());
+    return {};
+}
+
+auto Evaluator::undeclare() -> void {
+    if (session_ != nullptr) {
+        session_->undeclare_ke(ke_id_);
+        session_ = nullptr;
+    }
 }
 
 // --- Getter handle ---

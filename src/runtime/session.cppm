@@ -41,6 +41,21 @@ enum class ZError : std::uint8_t {
     already_subscribed, ///< A subscriber already exists on this session (single-sub cut).
     already_queryable,  ///< A queryable already exists on this session (single-qbl cut).
     query_timeout,      ///< `get`: no `ResponseFinal` within the requested timeout.
+    /// The key expression is not usable for the operation asked of it.
+    ///
+    ///  - `declare_computation`: it is not a *concrete*, canonical key. A Computation
+    ///    is a computation registered at one key, so a wild key expression
+    ///    (`robot/*/reset`, `math/**`) has no meaning on that side of the abstraction
+    ///    -- it is what an `Evaluator` supplies. Non-canonical keys (`a//b`,
+    ///    `a/**/**/b`) are rejected here too.
+    ///  - `eval`/`declare_evaluator`: it is not canonical. Required (though `get` does
+    ///    not require it) because the key expression is prefixed internally, and
+    ///    prefixing must preserve it rather than splice it into something malformed.
+    ///  - any of the above, plus `get`/`declare_queryable`: it names the reserved
+    ///    Evaluation namespace (a first chunk of `@eval`). That reservation is what
+    ///    stops an ordinary query reaching a `Computation` by naming its wire key
+    ///    literally, and stops an ordinary `Queryable` registering where evals route.
+    invalid_key_expr,
 };
 
 /// Whether a received `Sample` is a publication (`put`) or a deletion (`del`).
@@ -248,12 +263,138 @@ class GetReply {
 /// A callback invoked by `run()`/`run_once()` for each reply of a callback-style `get`.
 using GetReplyHandler = std::function<void(const GetReply&)>;
 
+// --- Evaluation: Computation / Evaluator / Eval ----------------------------------
+//
+// Evaluation is a second, deliberately different abstraction over the same
+// Query/Reply transport (docs/RUNTIME.md "Evaluation"):
+//
+//     Querier(key expr) --get()---> Queryable(key expr) --> Reply
+//     Evaluator(key expr) --eval(argument)--> Computation(key) --> Reply
+//
+// A `Queryable` answers queries over a *region* of the key space; a `Computation`
+// is one computation registered at one *concrete* key, and `Evaluator::eval`
+// invokes every Computation whose key matches its key expression -- always all of
+// them, never a "best" one, because a computation may have side effects and
+// picking one arbitrarily is not a meaningful thing to do to `robot/*/reset`.
+//
+// The two abstractions are mutually isolated: an eval never reaches an ordinary
+// `Queryable`, and an ordinary `get()` never reaches a `Computation`. That is
+// enforced by mapping every Computation onto the Zenoh-reserved `@eval/...`
+// namespace on the wire -- a verbatim chunk (`zenoh.ke`), so not even `get("**")`
+// intersects it -- and by reserving that namespace at the API boundary, so a caller
+// cannot reach into it by naming it literally either (`get`/`declare_queryable`
+// return `invalid_key_expr` for it). The mapping is entirely internal and never
+// appears in this API: `Eval::key_expr()`, `Eval::computation_key()` and every reply
+// key are the logical, application-level ones.
+
+/// Per-computation delivery tuning. Mirrors `QueryableOptions` minus two knobs:
+///
+///  - `complete` is a data-query notion (does this queryable hold the whole answer
+///    for its region?) with no meaning for a computation, so the Evaluation API
+///    does not expose it (a Computation is always declared incomplete).
+///  - `mode` is fixed to `StrandMode::ordered`. Last-value conflation drops an
+///    already-queued entry when a newer one arrives on the same key, which is
+///    exactly wrong for something that may reset a robot or claim a job: an eval
+///    that reached this session must either run or be finalized, never be
+///    silently superseded.
+struct ComputationOptions {
+    std::size_t capacity = 256;
+};
+
+/// One inbound evaluation delivered to a declared `Computation`'s handler or via
+/// `Computation::recv()` -- the Evaluation-side counterpart of `IncomingQuery`.
+///
+/// Move-only, RAII: the destructor releases this eval's share of the underlying
+/// request, and the request's `ResponseFinal` goes out once *every* Computation
+/// this session delivered it to is done with it. (One `Request` reaches a session
+/// however many of its Computations match, so finalizing per `Eval` would cut the
+/// evaluator's reply stream short while sibling computations were still working.)
+///
+/// Not modeled, following this runtime's existing scope rather than by choice: an
+/// eval's encoding and attachment (this runtime has no public `Encoding` or
+/// attachment concept at all — see `Publisher`'s note), and `reply_del`, which is
+/// deliberate: a deletion is a data-centric notion with no meaning as the result of
+/// evaluating a computation.
+class Eval {
+  public:
+    Eval(const Eval&) = delete;
+    auto operator=(const Eval&) -> Eval& = delete;
+    Eval(Eval&& other) noexcept;
+    auto operator=(Eval&& other) noexcept -> Eval&;
+    ~Eval();
+
+    /// The argument the `Evaluator` supplied (empty if it supplied an empty one).
+    [[nodiscard]] auto argument() const noexcept -> std::span<const std::byte> { return argument_; }
+    /// The key expression the evaluation was issued on -- the logical one
+    /// (`robot/*/reset`), never the internal wire namespace.
+    [[nodiscard]] auto key_expr() const noexcept -> std::string_view { return key_; }
+    /// The concrete key of the Computation currently processing this eval
+    /// (`robot/r1/reset`). Always a match of `key_expr()`.
+    [[nodiscard]] auto computation_key() const noexcept -> std::string_view {
+        return computation_key_;
+    }
+
+    /// Send one successful reply, keyed by `computation_key()` -- so the evaluator
+    /// can tell which computation produced which result. Callable multiple times
+    /// (0..N replies per eval, none of them consolidated).
+    ///
+    /// Unlike `IncomingQuery::reply`, no key is passed: a Computation *has* one
+    /// concrete key, so there is nothing for the caller to choose or to get wrong.
+    [[nodiscard]] auto reply(std::span<const std::byte> value) -> std::expected<void, ZError>;
+    /// Send an error reply (`Response{Err}`). Also callable multiple times.
+    [[nodiscard]] auto reply_err(std::span<const std::byte> error) -> std::expected<void, ZError>;
+
+  private:
+    friend class Session;
+    Eval(Session* session, std::uint32_t rid, std::string key, std::string computation_key,
+         std::vector<std::byte> argument) noexcept
+        : session_(session), rid_(rid), key_(std::move(key)),
+          computation_key_(std::move(computation_key)), argument_(std::move(argument)) {}
+
+    Session* session_ = nullptr; ///< owning session (not owned); null when moved-from
+    std::uint32_t rid_ = 0;
+    std::string key_;             ///< the evaluator's key expression (logical)
+    std::string computation_key_; ///< this computation's concrete key
+    std::vector<std::byte> argument_;
+};
+
+/// A callback invoked by `run()`/`run_once()` for each incoming eval.
+using EvalHandler = std::function<void(Eval)>;
+
+/// Options for `Session::eval` / `Session::declare_evaluator`, and so for every
+/// `Evaluator::eval` made through the declared handle.
+///
+/// Deliberately *without* `target` and `consolidation`: an eval always uses
+/// `QueryTarget::All` (every matching Computation registration runs) and
+/// `ConsolidationMode::None` (every reply reaches the caller). Those two are the
+/// contract of Evaluation, not tuning knobs, so there is nothing to set.
+///
+/// Priority and express are absent for the ordinary reason they are absent from
+/// `PutOptions`/`GetOptions` — this runtime does not model them — as are the
+/// reference's `matching_status()`/`matching_listener()`, which `Publisher` lacks for
+/// the same reason (see `docs/RUNTIME.md`).
+struct EvalOptions {
+    /// Reply-collection deadline in milliseconds; unset uses the same 10 s default
+    /// as `get`. Client-enforced, exactly as `GetOptions::timeout_ms`.
+    std::optional<std::uint32_t> timeout_ms{};
+    /// Broker-enforced filter narrowing which peer's Computations may be reached.
+    /// Narrows normal key matching, never bypasses it (see `GetOptions::target_zid`).
+    std::optional<PeerId> target_zid{};
+    /// Whether the eval request may be dropped under congestion. Note that the
+    /// default (`drop`) is right for a computation whose result supersedes the last
+    /// one, and wrong for one that actuates something -- see `CongestionControl`.
+    CongestionControl congestion = CongestionControl::drop;
+};
+
 class Batch;
 class Publisher;
 class Subscriber;
 struct SubReg; // defined in session.cpp (holds the non-movable Strand + handler)
 class Queryable;
 struct QblReg; // defined in session.cpp
+class Computation;
+struct CompReg; // defined in session.cpp
+class Evaluator;
 class Getter;
 struct GetReg; // defined in session.cpp
 
@@ -274,6 +415,13 @@ struct GetReg; // defined in session.cpp
 /// `GetReg` is complete) sidesteps it entirely.
 struct GetRegDeleter {
     auto operator()(GetReg* p) const noexcept -> void;
+};
+
+/// Out-of-line deleter for `comps_`'s `unique_ptr<CompReg>` entries, for exactly the
+/// reason `GetRegDeleter` exists (a *container* of `unique_ptr<Incomplete>` is what
+/// trips libstdc++'s eager `default_delete` instantiation, not a bare member).
+struct CompRegDeleter {
+    auto operator()(CompReg* p) const noexcept -> void;
 };
 
 /// A client session to a single Zenoh router over TCP.
@@ -340,7 +488,10 @@ class Session {
 
     /// Issue a query on `key_expr` (`parameters` is an opaque, caller-defined query
     /// string) and pull replies with `Getter::recv()` until it returns `nullopt`
-    /// (the query completed normally) or an error (incl. `query_timeout`).
+    /// (the query completed normally) or an error (incl. `query_timeout`). A key
+    /// expression naming the reserved Evaluation namespace is refused
+    /// (`invalid_key_expr`): a query is answered by `Queryable`s, never by a
+    /// `Computation` — use `eval` for those.
     [[nodiscard]] auto get(std::string_view key_expr, std::string_view parameters = {},
                            GetOptions opts = {}) -> std::expected<Getter, ZError>;
 
@@ -365,7 +516,8 @@ class Session {
     /// Declare a queryable on `key_expr` (sends `Frame(Declare{DeclareQueryable})`).
     /// Without a handler the queryable is pull-based — drive it with `Queryable::recv`.
     /// First cut: at most one queryable per session (`already_queryable` otherwise).
-    /// The session must outlive the returned queryable.
+    /// The session must outlive the returned queryable. A key expression naming the
+    /// reserved Evaluation namespace is refused (`invalid_key_expr`) — see `ZError`.
     [[nodiscard]] auto declare_queryable(std::string_view key_expr, QueryableOptions opts = {})
         -> std::expected<Queryable, ZError>;
 
@@ -375,14 +527,67 @@ class Session {
                                          QueryableOptions opts = {})
         -> std::expected<Queryable, ZError>;
 
+    /// Declare a computation registered at the concrete key `key`, reachable only
+    /// through `eval` (never through `get`). Without a handler the computation is
+    /// pull-based — drive it with `Computation::recv`.
+    ///
+    /// `key` must be a concrete, canonical key expression: `robot/r1/reset`, not
+    /// `robot/*/reset` (`ZError::invalid_key_expr`). Unlike subscribers and
+    /// queryables there is no per-session limit, and two Computations may share one
+    /// key — both then run on every matching eval (see `Session::eval`). The session
+    /// must outlive the returned computation.
+    [[nodiscard]] auto declare_computation(std::string_view key, ComputationOptions opts = {})
+        -> std::expected<Computation, ZError>;
+
+    /// Declare a computation whose `on_eval` callback is invoked by
+    /// `run()`/`run_once()` for each incoming eval.
+    [[nodiscard]] auto declare_computation(std::string_view key, EvalHandler on_eval,
+                                           ComputationOptions opts = {})
+        -> std::expected<Computation, ZError>;
+
+    /// Declare an evaluator on `key_expr` (any canonical key expression, wild or not,
+    /// outside the reserved Evaluation namespace — `invalid_key_expr` otherwise):
+    /// binds the key expression to a numeric id on this link, exactly as
+    /// `declare_publisher` does, so each `Evaluator::eval` sends the id rather than
+    /// the text. That, and fixing the options once, is the whole difference from
+    /// calling `Session::eval` in a loop. The session must outlive the evaluator.
+    [[nodiscard]] auto declare_evaluator(std::string_view key_expr, EvalOptions opts = {})
+        -> std::expected<Evaluator, ZError>;
+
+    /// Evaluate `argument` on every Computation whose key matches `key_expr`, and
+    /// pull the replies with `Getter::recv()` until it returns `nullopt` (every
+    /// computation finished) or an error — the undeclared counterpart of
+    /// `declare_evaluator`, as `get` is of `Querier` elsewhere.
+    ///
+    /// Every matching *registration* runs, never a "best" one, and no reply is
+    /// consolidated. Each reply is keyed by the concrete key of the computation that
+    /// produced it. The argument is mandatory (pass an empty span for a computation
+    /// that needs none) because it is the argument of a computation, not data being
+    /// stored.
+    ///
+    /// This is a fan-out over matching registrations and nothing more: it is not
+    /// exactly-once, not at-most-once across failures, not idempotent, not
+    /// transactional, and not one-execution-per-distinct-key. A computation may have
+    /// side effects, so `eval` is never safe to retry blindly.
+    ///
+    /// `key_expr` must be canonical and must not name the reserved Evaluation
+    /// namespace (`invalid_key_expr` otherwise) — see `ZError`.
+    [[nodiscard]] auto eval(std::string_view key_expr, std::span<const std::byte> argument,
+                            EvalOptions opts = {}) -> std::expected<Getter, ZError>;
+
+    /// Evaluate `argument`, delivering replies to `on_reply` from `run()`/`run_once()`.
+    [[nodiscard]] auto eval(std::string_view key_expr, std::span<const std::byte> argument,
+                            GetReplyHandler on_reply, EvalOptions opts = {})
+        -> std::expected<void, ZError>;
+
     /// Pump the receive loop once: deliver one batch's worth of progress (decode +
     /// dispatch to the subscriber/queryable/get handlers), send a keepalive if the
     /// link is idle, or report `connection_closed`/`protocol_error`. Returns when it
     /// has made progress or the idle keepalive timer fired. Single-threaded (first cut).
-    /// NOTE: calling `get()` reentrantly from within a `GetReplyHandler`/`QueryHandler`
-    /// invoked here is not supported — it can invalidate the iterator this call is
-    /// using to drain in-flight callback-style `get()`s. Issue follow-up queries after
-    /// `run_once()`/`run()` returns, not from inside a handler.
+    /// A handler invoked here may start another `get`/`eval` (the "on each reply, ask
+    /// the next question" idiom) and may undeclare its own registration: the delivery
+    /// loops walk a snapshot of request/registration ids and re-find each entry, so
+    /// neither mutation invalidates what this call is iterating.
     [[nodiscard]] auto run_once() -> std::expected<void, ZError>;
 
     /// Pump `run_once()` in a loop until the connection closes or the stream faults.
@@ -403,6 +608,9 @@ class Session {
     friend class Subscriber;
     friend class Queryable;
     friend class IncomingQuery;
+    friend class Computation;
+    friend class Evaluator;
+    friend class Eval;
     friend class Getter;
     Session() = default;
 
@@ -535,20 +743,69 @@ class Session {
     /// Encode + send a `Frame(ResponseFinal{rid})` (best-effort). For `IncomingQuery`.
     auto send_response_final(std::uint32_t rid) -> void;
 
+    // --- receive path (computation) ---
+    /// Post one inbound evaluation to every Computation whose key matches `key`
+    /// (the *logical* key expression, already stripped of the internal prefix).
+    ///
+    /// All-or-nothing: if any matching computation's strand is full, nothing is
+    /// posted and this returns `false` so the caller pauses the receive cursor and
+    /// retries the whole request later — a partial post would run the computations
+    /// that had room twice. Returns `true` (having finalized the request itself)
+    /// when no computation matches after all.
+    [[nodiscard]] auto deliver_eval(std::uint32_t rid, std::string_view key,
+                                    std::span<const std::byte> argument) -> bool;
+    /// Release one Computation's share of request `rid`, sending its `ResponseFinal`
+    /// once the last one goes. For `Eval`, and for a `Computation` undeclared with
+    /// evals still queued.
+    auto eval_finish(std::uint32_t rid) -> void;
+    /// Take a reference on the shared wire declaration for `key`, sending
+    /// `Frame(Declare{DeclareQueryable})` for the internally-namespaced key the first
+    /// time it is asked for. Refcounted per key, exactly as `declare_ke` is: several
+    /// Computations may share one key, and they must share one declaration.
+    [[nodiscard]] auto declare_comp_key(std::string_view key) -> std::expected<void, ZError>;
+    /// Drop one reference to `key`'s declaration, sending
+    /// `Frame(Declare{UndeclareQueryable})` when the last one goes (best-effort).
+    auto undeclare_comp_key(std::string_view key) -> void;
+    /// The registration with entity id `id`, or null once it has been undeclared.
+    [[nodiscard]] auto find_comp(std::uint32_t id) noexcept -> CompReg*;
+    /// Pull the next eval for computation `id` (drives `pump_step`). For `Computation`.
+    [[nodiscard]] auto comp_recv(std::uint32_t id) -> std::expected<Eval, ZError>;
+    /// Drop computation `id` (after best-effort undeclare), finalizing any evals
+    /// still sitting in its strand. For `Computation`.
+    auto comp_drop(std::uint32_t id) -> void;
+
     // --- query path (getter) ---
-    /// Encode + send a `Frame(Request{...})` for request id `rid` (blocking).
-    [[nodiscard]] auto write_request(std::uint32_t rid, std::string_view key_expr,
-                                     std::string_view parameters, const GetOptions& opts)
+    /// Encode + send a `Frame(Request{...})` for request id `rid` (blocking). The key
+    /// expression is split into `scope`/`suffix` exactly as on the publish path (a
+    /// declared `Evaluator` sends its id and an empty suffix; `get`/`eval` send
+    /// `(0, text)`), and `payload`, when non-empty, travels as the `Query`'s value —
+    /// the eval argument.
+    [[nodiscard]] auto write_request(std::uint32_t rid, std::uint16_t scope,
+                                     std::string_view suffix, std::string_view parameters,
+                                     std::span<const std::byte> payload, const GetOptions& opts)
         -> std::expected<void, ZError>;
-    /// Shared body of both `get()` overloads: allocates a request id, sends the
-    /// `Request`, and registers `pending_gets_[rid]`.
-    [[nodiscard]] auto start_get(std::string_view key_expr, std::string_view parameters,
+    /// Shared body of both `get()` overloads (and, through `start_eval`, of both
+    /// `eval()` ones): allocates a request id, sends the `Request`, and registers
+    /// `pending_gets_[rid]`.
+    [[nodiscard]] auto start_get(std::uint16_t scope, std::string_view suffix,
+                                 std::string_view parameters, std::span<const std::byte> payload,
                                  GetReplyHandler handler, const GetOptions& opts)
         -> std::expected<std::uint32_t, ZError>;
+    /// `start_get` with the Evaluation contract applied: the internal key namespace,
+    /// `QueryTarget::all`, `ConsolidationMode::none`, and replies accepted from any
+    /// key expression. For `Session::eval` and `Evaluator::eval`.
+    [[nodiscard]] auto start_eval(std::uint16_t scope, std::string_view suffix,
+                                  std::span<const std::byte> argument, GetReplyHandler handler,
+                                  const EvalOptions& opts) -> std::expected<std::uint32_t, ZError>;
     /// Pull the next reply for `rid` (drives `pump_step`). `nullopt` = query complete.
     /// For `Getter`.
     [[nodiscard]] auto get_recv(std::uint32_t rid)
         -> std::expected<std::optional<GetReply>, ZError>;
+    /// The request ids of every callback-style (handler-backed) in-flight request, as
+    /// a snapshot. Iterating that snapshot rather than `pending_gets_` itself is what
+    /// lets a reply handler start another `get`/`eval` without invalidating the loop
+    /// (see `drain_handlers`). Allocates nothing when nothing is in flight.
+    [[nodiscard]] auto callback_get_rids() -> std::vector<std::uint32_t>;
     /// Drop a `Getter`'s local bookkeeping (no wire message — `get()` has nothing to
     /// undeclare; this just stops us tracking a rid nobody will ever poll again).
     auto get_drop(std::uint32_t rid) -> void;
@@ -599,6 +856,31 @@ class Session {
     std::uint32_t next_request_id_ = 0; ///< monotonic get() request id
     std::unordered_map<std::uint32_t, std::unique_ptr<GetReg, GetRegDeleter>>
         pending_gets_{}; ///< in-flight get()s
+    /// Declared computations. A plain vector: there is no per-session limit and no
+    /// key uniqueness (two Computations may share a key), the lookup on the receive
+    /// path is a key-expression *match* rather than an exact one, and the counts
+    /// involved are small.
+    std::vector<std::unique_ptr<CompReg, CompRegDeleter>> comps_{};
+    /// One wire declaration shared by every Computation on the same key, refcounted
+    /// so the last one to go is what undeclares it (see `declare_comp_key`).
+    struct CompDecl {
+        std::uint32_t id = 0;
+        std::size_t refs = 0;
+    };
+    /// Transparent hash so a `string_view` key looks up without a temporary `string`
+    /// (the same idiom `zenoh.broker.resource` and `Strand` use); `std::equal_to<>` is
+    /// the matching transparent comparator.
+    struct TransparentStringHash {
+        using is_transparent = void;
+        [[nodiscard]] auto operator()(std::string_view sv) const noexcept -> std::size_t {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+    std::unordered_map<std::string, CompDecl, TransparentStringHash, std::equal_to<>> comp_decls_{};
+    /// Inbound eval requests still owed a `ResponseFinal`, and how many `Eval`s of
+    /// theirs are still outstanding (one entry per in-flight request id, not per
+    /// computation).
+    std::unordered_map<std::uint32_t, std::size_t> eval_pending_{};
 };
 
 /// An API-level publish batch: accumulates `put`s into a single Frame (one SN, many
@@ -786,10 +1068,109 @@ class Queryable {
     Session* session_ = nullptr; ///< owning session (not owned); null when moved-from/undeclared
 };
 
+/// A handle to a declared computation. Holds a non-owning pointer to its `Session`
+/// (the session must outlive it, like `Queryable`). Move-only. The destructor
+/// undeclares best-effort. Pull evals with `recv()` (pull-based computations), or
+/// let the session's `run()`/`run_once()` invoke the handler (callback computations).
+///
+/// Undeclaring with evals still queued finalizes them rather than stranding the
+/// evaluator waiting for replies that are no longer coming.
+class Computation {
+  public:
+    Computation(const Computation&) = delete;
+    auto operator=(const Computation&) -> Computation& = delete;
+    Computation(Computation&& other) noexcept;
+    auto operator=(Computation&& other) noexcept -> Computation&;
+    ~Computation();
+
+    /// Block until the next eval arrives, pumping the session as needed. Returns
+    /// `connection_closed` on EOF or `protocol_error` on a malformed stream.
+    /// Intended for pull-based (no-handler) computations.
+    [[nodiscard]] auto recv() -> std::expected<Eval, ZError>;
+
+    /// Undeclare and stop receiving (sends `Frame(Declare{UndeclareQueryable})` for
+    /// the internal registration). Idempotent; also run by the destructor.
+    auto undeclare() -> void;
+
+    /// The concrete key this computation is registered at.
+    [[nodiscard]] auto key() const noexcept -> std::string_view;
+
+  private:
+    friend class Session;
+    Computation(Session* session, std::uint32_t id) noexcept : session_(session), id_(id) {}
+
+    Session* session_ = nullptr; ///< owning session (not owned); null when moved-from/undeclared
+    std::uint32_t id_ = 0;       ///< entity id of the registration in `Session::comps_`
+};
+
+/// A handle to a declared evaluator: one key expression, one fixed set of eval
+/// settings, and the numeric id the router bound to the (internally namespaced) key
+/// expression when it was declared.
+///
+/// `eval` through an evaluator is the same wire exchange `Session::eval` performs,
+/// with the one difference that makes declaring it worthwhile — the `Request` carries
+/// the declared *id* instead of the key expression text, exactly as a `Publisher`'s
+/// `put` does. Created via `Session::declare_evaluator`; the originating session must
+/// outlive it. Move-only; the destructor releases the key-expression id best-effort.
+///
+/// There is deliberately no `target()`/`consolidation()`: see `EvalOptions`.
+class Evaluator {
+  public:
+    Evaluator(const Evaluator&) = delete;
+    auto operator=(const Evaluator&) -> Evaluator& = delete;
+    Evaluator(Evaluator&& other) noexcept;
+    auto operator=(Evaluator&& other) noexcept -> Evaluator&;
+    ~Evaluator();
+
+    /// Evaluate `argument` on every Computation matching this evaluator's key
+    /// expression, and pull the replies with `Getter::recv()`. Identical in every
+    /// respect to `Session::eval(key_expr(), argument, {...})` with this evaluator's
+    /// settings, except that the key expression travels as its declared id.
+    [[nodiscard]] auto eval(std::span<const std::byte> argument) -> std::expected<Getter, ZError>;
+
+    /// Evaluate `argument`, delivering replies to `on_reply` from `run()`/`run_once()`.
+    [[nodiscard]] auto eval(std::span<const std::byte> argument, GetReplyHandler on_reply)
+        -> std::expected<void, ZError>;
+
+    /// Release the declared key-expression id (only once no other declaration on the
+    /// same key expression holds it). Idempotent; also run by the destructor. Further
+    /// `eval`s return `connection_closed`.
+    auto undeclare() -> void;
+
+    /// The key expression this evaluator was declared on — the logical one, never the
+    /// internal wire namespace.
+    [[nodiscard]] auto key_expr() const noexcept -> std::string_view { return key_; }
+    /// The numeric id the (internally namespaced) key expression was declared under,
+    /// or 0 when it is sent in full — see `Publisher::keyexpr_id`, which this mirrors.
+    /// Exposed for tests and diagnostics.
+    [[nodiscard]] auto keyexpr_id() const noexcept -> std::uint16_t { return ke_id_; }
+
+  private:
+    friend class Session;
+    Evaluator(Session* session, std::uint16_t ke_id, std::string key, std::string wire_key,
+              EvalOptions opts) noexcept
+        : session_(session), ke_id_(ke_id), key_(std::move(key)), wire_key_(std::move(wire_key)),
+          opts_(std::move(opts)) {}
+
+    /// The text half of the wire key expression: empty once an id is bound (the id
+    /// *is* the key expression), the whole internal key expression otherwise.
+    [[nodiscard]] auto wire_suffix() const noexcept -> std::string_view {
+        return ke_id_ == 0 ? std::string_view{wire_key_} : std::string_view{};
+    }
+
+    Session* session_ = nullptr; ///< owning session (not owned); null when moved-from/undeclared
+    std::uint16_t ke_id_ = 0;    ///< declared key-expression id (0 = send the text)
+    std::string key_;            ///< the logical key expression, owned
+    std::string wire_key_;       ///< ... and its internally-namespaced form
+    EvalOptions opts_{};         ///< the settings every eval from this handle carries
+};
+
 /// A handle to one in-flight `get()`. Holds a non-owning pointer to its `Session`
 /// (the session must outlive it, like `Subscriber`/`Queryable`). Move-only.
 /// Transient: unlike `Subscriber`/`Queryable` there is no wire "undeclare" for a
 /// `get()`, so dropping a `Getter` just stops local bookkeeping for its request id.
+/// Also the reply handle of `Session::eval`/`Evaluator::eval` — an evaluation
+/// collects ordinary `GetReply`s, each keyed by the Computation that produced it.
 class Getter {
   public:
     Getter(const Getter&) = delete;
@@ -806,6 +1187,7 @@ class Getter {
 
   private:
     friend class Session;
+    friend class Evaluator; // `Evaluator::eval` hands back a Getter of its own
     Getter(Session* session, std::uint32_t rid) noexcept : session_(session), rid_(rid) {}
 
     Session* session_ = nullptr; ///< owning session (not owned); null when moved-from

@@ -17,7 +17,7 @@ worktree such as `zenoh-cxx/main`).
 | --- | --- | --- |
 | `zenoh.runtime.tcp` | `src/runtime/tcp.{cppm,cpp}` | `TcpLink` (RAII POSIX socket), `IoError`. Blocking `write_all`/`writev_all`/`read_exact` (handshake only), non-blocking `write_some`/`read_some`, `poll_readable` (keepalive timer). POSIX headers stay in the `.cpp`. |
 | `zenoh.runtime.strand` | `src/runtime/strand.cppm` | `Strand<T>` — the per-subscriber bounded queue (`ordered` / `last_value` conflation), `StrandMode`. Header-only template. |
-| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`, `Sample`, `Publisher`, `Subscriber`, `Queryable`/`IncomingQuery`, `Getter`/`GetReply`, `Batch`, `PeerId`, and the option structs (`PutOptions`, `PublisherOptions`, `GetOptions`, `SubscriberOptions`, `QueryableOptions`). Endpoint parsing, the 4-way handshake, `put`/`try_put`/`batch`/`get`/`close`, `declare_publisher`, and the receive pump (`declare_subscriber`/`declare_queryable`, `run`/`run_once`, `Subscriber::recv`). |
+| `zenoh.session` | `src/runtime/session.{cppm,cpp}` | `Session`, `ZError`, `Sample`, `Publisher`, `Subscriber`, `Queryable`/`IncomingQuery`, `Getter`/`GetReply`, `Computation`/`Eval`, `Evaluator`, `Batch`, `PeerId`, and the option structs (`PutOptions`, `PublisherOptions`, `GetOptions`, `SubscriberOptions`, `QueryableOptions`, `ComputationOptions`, `EvalOptions`). Endpoint parsing, the 4-way handshake, `put`/`try_put`/`batch`/`get`/`eval`/`close`, `declare_publisher`, and the receive pump (`declare_subscriber`/`declare_queryable`/`declare_computation`, `run`/`run_once`, `Subscriber::recv`). |
 | `zenoh` | `src/zenoh.cppm` | Public umbrella; re-exports `zenoh.session`. **Import this for the client API.** |
 
 ## Connecting (the handshake)
@@ -302,8 +302,166 @@ permanently** (a byte stream can't resync): every later `recv`/`run` returns
 publishing through an undeclared `Publisher`), `io_error`, `protocol_error` (malformed
 handshake or data stream), `encode_error` (message exceeds a batch — including a key
 expression too long for one), `bad_endpoint` (unparseable/unresolvable locator),
-`already_subscribed` (second subscriber on a session). `declare_publisher` adds no
-error of its own.
+`already_subscribed` (second subscriber on a session), `invalid_key_expr`
+(`declare_computation` on a wild or non-canonical key). `declare_publisher` and
+`declare_evaluator` add no error of their own.
+
+## Evaluation (`Computation` / `Evaluator`)
+
+Evaluation is a second abstraction over the same Query/Reply transport, with
+deliberately different — and stronger — semantics:
+
+```
+Querier(key expr)   --get(  )------->  Queryable(key expr)  -->  Reply
+Evaluator(key expr) --eval(argument)->  Computation(key)     -->  Reply
+```
+
+A `Queryable` describes the ability to answer queries over a *region* of the key
+space. A `Computation` is **one computation registered at one concrete key**, and
+`eval` invokes **every** Computation whose key matches the evaluator's key expression:
+
+```cpp
+auto c1 = session->declare_computation("robot/r1/reset", [](zenoh::Eval e) {
+    reset_robot("r1");
+    (void)e.reply(as_bytes("ok"));          // keyed by "robot/r1/reset" automatically
+});
+
+auto replies = session->eval("robot/*/reset", as_bytes(""));   // r1, r2, r3 — all of them
+while (auto r = replies->recv()) {
+    if (!*r) break;                          // every computation finished
+    // (*r)->sample().key_expr() says which computation produced this result
+}
+```
+
+Nothing else in this runtime works that way, and that is the point. `get` may pick one
+queryable (`GetTarget::best_matching`, its default); an eval never may. A computation
+may *do* something — reset a robot, claim a job, acquire a lock, actuate hardware — so
+"pick a matching one arbitrarily" is not a meaningful thing to do to `robot/*/reset`,
+and neither is dropping replies to consolidate them. Every eval therefore uses
+`QueryTarget::all` and `ConsolidationMode::none` internally, and **neither is
+exposed**: they are the contract, not tuning knobs (`EvalOptions` carries only
+`timeout_ms`, `target_zid` and `congestion`).
+
+### The API
+
+| | Declared | Undeclared |
+| --- | --- | --- |
+| Serve | `declare_computation(key[, handler][, opts])` → `Computation` | — |
+| Invoke | `declare_evaluator(key_expr[, opts])` → `Evaluator`, then `evaluator->eval(argument)` | `session->eval(key_expr, argument[, opts])` |
+
+- **A Computation must be declared on a concrete, canonical key** — `robot/r1/reset`,
+  never `robot/*/reset` or `math/**`, which return `ZError::invalid_key_expr`. The
+  wildcard belongs on the evaluator's side.
+- **There is no per-session limit**, unlike `Subscriber`/`Queryable`: a session may
+  declare any number of computations, including **two at the same key**, in which case
+  both run on every matching eval (no deduplication by key — see the guarantees below).
+- **`Computation` consumes evals like a `Queryable` consumes queries**: pull with
+  `Computation::recv()`, or pass a `void(Eval)` handler and let `run()`/`run_once()`
+  deliver. `ComputationOptions` carries only `capacity`; the strand is always
+  `ordered`, because conflating away an eval that may have side effects is never right.
+- **`Evaluator` is to `eval` what `Publisher` is to `put`**: it binds its key
+  expression to a declared numeric id, so each eval sends the id instead of the text.
+  `Session::eval` is the undeclared convenience form, exactly as `get` is for a query.
+- **The argument is mandatory** (`eval(key_expr, argument)`, not
+  `eval(key_expr).payload(argument)`): it is the *argument of a computation*, not data
+  being stored. Pass an empty span for a computation that needs none. It travels as the
+  `Query`'s value extension — the same field the reference's `get().payload(..)` uses.
+- **An `Eval` never asks the callback for a key.** `eval.reply(value)` is keyed by that
+  computation's own concrete key; `Query::reply` needs an explicit key only because an
+  ordinary queryable may itself be declared on a wildcard. `Eval` also exposes
+  `argument()`, `key_expr()` (the evaluator's key expression) and `computation_key()`
+  (this computation's key), plus `reply_err(error)`. There is no `reply_del`: a
+  deletion is a data-centric notion with no meaning as the result of a computation.
+- **Replies are ordinary `GetReply`s** collected through an ordinary `Getter`, each
+  keyed by the concrete key of the computation that produced it. A computation may send
+  0..N ok replies and 0..N error replies; none of them are consolidated.
+
+Not modeled, following this runtime's existing scope rather than by choice: an eval's
+encoding and attachment (there is no public `Encoding` or attachment concept here at
+all — the same gap `Publisher` has), priority/express QoS, the reference's
+matching-status/matching-listener machinery, its `allowed_origin`/`allowed_destination`
+(both are `Locality` filters, and locality has no meaning for a client that reaches
+everything through a router — the zid filter `EvalOptions::target_zid` is a different
+thing and *is* modeled), and `background()` (a handle-lifetime idiom with no C++
+counterpart: a `Computation` handle is undeclared when it drops, like every other
+handle here). `complete` is absent for a different reason: it is a data-query notion,
+and a computation is not a query.
+
+The types live in `zenoh.session` alongside `Queryable`/`Getter` rather than in a
+module of their own: the computation registry is `Session` state, so a separate module
+would have to reach back into it, and this codebase's module graph is one folder per
+layer rather than one per abstraction. The separation the abstraction needs is in the
+vocabulary and the semantics, not the build graph.
+
+### Isolation from ordinary Query/Reply
+
+An eval must never invoke an ordinary `Queryable`, and an ordinary `get` must never
+invoke a `Computation` — including when both are declared on the very same key. Since
+both ride the same Query/Reply messages, the two are told apart by key space: a
+Computation is declared, queried and matched under a **reserved internal prefix**.
+
+```
+logical computation key      robot/r1/reset
+internal wire key            @eval/robot/r1/reset
+
+logical eval key expression  robot/*/reset
+internal wire key expression @eval/robot/*/reset
+```
+
+Prefixing both sides identically preserves key-expression matching exactly
+(`robot/*/reset` matches `robot/r1/reset` iff the prefixed forms match), so nothing
+about the application's key expressions changes. Two things then keep the namespace
+closed, and both are needed:
+
+1. `@eval` is a **verbatim chunk** (`zenoh.ke`): a chunk beginning with `@` is matched
+   only by an identical literal, never by `*` or `**` — so no *wildcard* an
+   application writes can reach a computation, `get("**")` included. The name sits in
+   Zenoh's reserved non-alphabetic-leading key space beside the reference's own
+   `@adv`, and deliberately *not* inside the `@/...` admin space, which the broker
+   refuses to route at all (`zenoh.broker.membership`'s `is_internal_key`).
+2. The namespace is **reserved at the API boundary**: `Session::get` and
+   `declare_queryable` reject a key expression whose first chunk is `@eval`
+   (`ZError::invalid_key_expr`), and the Evaluation API rejects it too, so it cannot be
+   nested inside itself. Without this, a caller who *typed* `get("@eval/robot/r1/reset")`
+   would match a Computation's wire declaration exactly — matching alone cannot stop a
+   literal. Only the query surface needs the guard: `put`/`declare_subscriber` route to
+   subscribers, and a Computation is never one.
+
+The second guard is an API-level reservation, not a protocol rule, so it binds this
+implementation's clients and not other people's: a `zenoh-rust` client is free to
+declare a queryable at `@eval/foo/a` and would then receive evals for it. That is the
+same status the reference's own `@adv` namespace has — a convention among
+implementations — and closing it properly would need the routing layer to distinguish
+the two kinds of declaration on the wire, which is exactly what this API-only design
+trades away.
+
+The mapping is entirely private (`session.cpp`'s `eval_prefix` /
+`to_eval_wire_key` / `from_eval_wire_key`) and never surfaces: `Eval::key_expr()`,
+`Eval::computation_key()`, `Evaluator::key_expr()` and every reply key are the logical,
+application-level ones. Because a reply's key is then disjoint from the request's, the
+underlying query carries the `_anyke` selector parameter — the reference's
+`ReplyKeyExpr::Any`, which it likewise transports as a parameter rather than a wire
+field. Note where that is enforced: **not** in the router (neither `zenohd` nor
+`zenohb` checks a reply's key against the query's), but in the *querying session* —
+`zenoh/src/api/session.rs` drops a reply whose key does not intersect the query's
+unless `_anyke` is set. So today it is inert, since both ends of an eval are this
+implementation and this `Getter` does no such filtering; it is what makes the exchange
+correct for a reference peer, not something a router run will exercise.
+
+### Fan-out, and what is *not* guaranteed
+
+One `Request` reaches a session however many of its computations match: the router
+matches per *face*, so the per-registration fan-out is done client-side by key-expression
+matching, and the request's single `ResponseFinal` goes out only once every `Eval` it
+produced has been dropped. Undeclaring a computation with evals still queued releases
+them the same way, so an evaluator is never left waiting on replies that are no longer
+coming.
+
+The guaranteed unit of fan-out is the matching **Computation registration**. The API
+does **not** promise exactly-once execution, at-most-once execution across failures,
+idempotence, transactionality, one execution per distinct key, or transparent
+replication. Two computations at one key both run, and `eval` is never safe to retry
+blindly.
 
 ## Example & manual interop test
 
@@ -411,6 +569,36 @@ zenohd -l tcp/127.0.0.1:7447 &                     # or this project's zenohb
 z_get -e tcp/127.0.0.1:7447 -s 'demo/example/**'   # from ../zenoh-rust
 z_queryable -e tcp/127.0.0.1:7447 &                # reference queryable, C++ getter
 ```
+
+### Evaluation
+
+`examples/z_computation.cpp` (`z_computation`) and `examples/z_eval.cpp` (`z_eval`) —
+the two sides of the Evaluation abstraction above. These are the only examples with no
+`zenoh-rust` counterpart (the abstraction is specific to this implementation), so their
+CLIs mirror their closest siblings here — `z_queryable`'s and `z_get`'s — rather than a
+reference binary's, and they take the same shared connection options as everything
+else. `z_computation [OPTIONS]` with `-k/--key` (concrete: a wild key is rejected) and
+`-p/--payload`; `z_eval [OPTIONS]` with `-k/--key` (any key expression), `-p/--payload`
+(the argument, which is mandatory and so has a default), `-o/--timeout` and
+`-d/--declare` (evaluate through a declared `Evaluator` — what `z_querier` is to
+`z_get`). There is no `-t/--target` on `z_eval`: an eval always reaches every matching
+registration.
+
+```sh
+zenohd -l tcp/127.0.0.1:7447 &                     # or this project's zenohb
+./build/clang/examples/z_computation -k demo/example/r1 -p 'r1 done' &
+./build/clang/examples/z_computation -k demo/example/r2 -p 'r2 done' &
+./build/clang/examples/z_eval -k 'demo/example/*' -p go
+# >> Received ('demo/example/r1': 'r1 done')
+# >> Received ('demo/example/r2': 'r2 done')   -- both, always, never one of them
+```
+
+Both ends are this implementation's (there is no reference eval API to talk to), but
+the *router* in between can be either: verified against a real `zenohd`, which is what
+proves the `_anyke` reply-key handling. The isolation is worth checking there too — a
+reference `z_get -s '**'` reaches a reference `z_queryable` on `demo/example/r1` and
+never the C++ computation registered at that same key, while `z_eval` reaches only the
+computation.
 
 ### Ping/pong (latency)
 

@@ -44,6 +44,8 @@ inline auto error_name(zenoh::ZError e) -> const char* {
         return "already_queryable";
     case zenoh::ZError::query_timeout:
         return "query_timeout";
+    case zenoh::ZError::invalid_key_expr:
+        return "invalid_key_expr";
     }
     return "unknown";
 }

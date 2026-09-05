@@ -12,6 +12,7 @@ add_executable(zenoh-tests
     test_transport.cpp
     test_query.cpp
     test_query_api.cpp
+    test_eval.cpp
     test_declare.cpp
     test_negative.cpp
     test_sweep.cpp

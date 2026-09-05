@@ -12,7 +12,8 @@ Three static libraries:
   `zenoh.ke` key-expression matching. No sockets, no allocation surprises, zero-copy
   decode via borrow-only views into the receive buffer.
 - **`zenoh`** — the user-facing client runtime (TCP transport + `Session`), built on top
-  of `zenoh-proto`. Put/get, subscribe/queryable — see `docs/RUNTIME.md`.
+  of `zenoh-proto`. Put/get, subscribe/queryable, and eval/computation (the
+  Evaluation abstraction) — see `docs/RUNTIME.md`.
 - **`zenoh-broker`** — `zenohb`, a multithreaded ASIO-based broker/router (accepts
   many client connections, routes pub/sub and query/reply between matching faces),
   built on `zenoh-proto` only (not `zenoh` — a from-scratch listener, not another
@@ -125,7 +126,11 @@ Test files are organized by layer, not 1:1 with modules: `test_varint.cpp`,
 `test_put.cpp`, `test_negative.cpp` (malformed input / error paths), `test_diff.cpp`
 (differential vectors, see below), `test_session.cpp`/`test_tcp.cpp`/
 `test_strand.cpp`/`test_subscriber.cpp`/`test_publisher.cpp`/`test_query_api.cpp`
-(client runtime, against a real `socketpair`/loopback), `test_broker.cpp` (the broker —
+(client runtime, against a real `socketpair`/loopback), `test_eval.cpp` (the
+Evaluation abstraction — `declare_computation`/`declare_evaluator`/`eval`, driven end
+to end against a real in-process `Broker`, since fan-out and Query/Eval isolation are
+properties of what crosses the wire; see `docs/RUNTIME.md`'s "Evaluation"),
+`test_broker.cpp` (the broker —
 a real `Broker` on loopback port 0, driven by real `Session` clients; see
 `docs/BROKER.md`'s "Testing"),
 `test_broker_stress.cpp` (broker scale/stress — `Tables`/`ResourceTable` at
@@ -222,7 +227,8 @@ buffer/  zenoh.buffer           ByteReader/ByteWriter (concrete cursors over std
 codec/   zenoh.varint           VLE u64 (1-9 byte LEB128-style), branch-lean encode/decode
          zenoh.codec            primitive codecs: u8/VLE-int/array<byte,N>/prefixed-or-remainder span & string_view/optional<T>
          zenoh.codec.ext        optional-field ("extension") header helpers: write/read_ext_{unit,u64,zbuf}, skip_ext
-ke/      zenoh.ke               key-expression matching: is_canon/canonize/intersects/includes (*/** only, v1 scope)
+ke/      zenoh.ke               key-expression matching: is_canon/canonize/intersects/includes
+                                (*/** and @-verbatim chunks; $* globbing is the v1 gap)
 proto/
   fields/     zenoh.proto.fields    ZenohId, WhatAmI, Reliability, WireExpr, QoS, Encoding, Resolution, ...
   exts/       zenoh.proto.exts      SourceInfo, Timestamp, Attachment, NodeId, QueryableInfo, ...
@@ -234,9 +240,10 @@ proto/
 runtime/
   tcp.{cppm,cpp}      zenoh.runtime.tcp     TcpLink (RAII POSIX socket), IoError; POSIX headers stay in the .cpp
   strand.cppm         zenoh.runtime.strand  Strand<T> per-subscriber bounded queue (ordered / last_value conflation)
-  session.{cppm,cpp}  zenoh.session         Session, ZError, Sample, Publisher, Subscriber, Queryable, Getter —
-                                            handshake, put/try_put/batch (with target_zid), declare_publisher
-                                            (declared keyexpr ids), get/declare_queryable, recv pump
+  session.{cppm,cpp}  zenoh.session         Session, ZError, Sample, Publisher, Subscriber, Queryable, Getter,
+                                            Computation/Eval, Evaluator — handshake, put/try_put/batch (with
+                                            target_zid), declare_publisher (declared keyexpr ids),
+                                            get/declare_queryable, eval/declare_computation, recv pump
 zenoh.cppm  zenoh   public umbrella; re-exports zenoh.session only (codec types are NOT re-exported)
 ```
 
@@ -343,6 +350,23 @@ id to a key expression (`DeclareKeyExpr` + the reference's `Interest`, refcounte
 key expression) so a `Publisher`'s `put`/`try_put`/`del` send the id instead of the
 text; unlike subscribers/queryables there is no per-session limit.
 
+**Evaluation** (`declare_computation`/`declare_evaluator`/`eval`, `docs/RUNTIME.md`)
+is a second abstraction over the same Query/Reply machinery, not an extension of it:
+a `Computation` is one computation at one *concrete* key, and an eval invokes **every**
+matching registration (`QueryTarget::all`, `ConsolidationMode::none`, neither
+exposed) because a computation may have side effects. It is isolated from ordinary
+Query/Reply by key space — a Computation is declared and queried under the reserved
+`@eval/...` prefix, a *verbatim* chunk, so not even `get("**")` reaches one, and
+`get`/`declare_queryable` refuse to name that namespace so a literal cannot reach in
+either — and that mapping is private: every key an application sees is the logical one.
+Do not "simplify" the prefix away, do not drop the API-boundary guard (matching alone
+does not close the namespace against a caller who types it), and do not add
+`target`/`consolidation` knobs to `EvalOptions`; all three are the contract of the
+abstraction. Several Computations may share a key, so their wire declaration is
+refcounted per key (`declare_comp_key`) — one `UndeclareQueryable` names a key, not a
+registration, so per-registration declarations would let the first undeclare stop
+routing to the survivors.
+
 ### Broker (`zenohb`) — see `docs/BROKER.md` for full detail
 
 The broker is a **separate, from-scratch** ASIO-based component, not built on the
@@ -364,14 +388,16 @@ this codebase's no-exceptions convention.
 `examples/*.cpp` are runnable C++ equivalents of the corresponding `zenoh-rust`
 example binaries, built by default (`ZENOH_EXAMPLES=ON`) into
 `build/<preset>/examples/`: `z_put`/`z_pub`/`z_put_float`/`z_pub_thr`/`z_sub`/
-`z_sub_thr` (pub/sub), `z_get`/`z_queryable`/`z_querier` (query/reply), and
-`z_ping`/`z_pong` (round-trip latency). `examples/zexample.hpp` holds what they
+`z_sub_thr` (pub/sub), `z_get`/`z_queryable`/`z_querier` (query/reply),
+`z_computation`/`z_eval` (evaluation), and `z_ping`/`z_pong` (round-trip latency). `examples/zexample.hpp` holds what they
 share — the `ZError` name mapping, byte-span/string conversions, and the CLI plumbing
 (`wants_help`, `option_value`, `parse_common`, `print_common_help`); include it
 *after* `import zenoh;`, since it names types that module exports.
 
 **Every example's CLI matches its reference counterpart's**, so a command line written
-for one runs against the other: `-h`/`--help` everywhere, and the reference's shared
+for one runs against the other (`z_computation`/`z_eval` are the exception that proves
+the rule: the Evaluation abstraction has no reference counterpart, so they mirror their
+closest siblings here — `z_queryable`'s and `z_get`'s CLIs — instead): `-h`/`--help` everywhere, and the reference's shared
 `CommonArgs` (`-e/--connect`, `-m/--mode`, `-c/--config`, `--cfg`, `-l/--listen`,
 `--no-multicast-scouting`, `--enable-shm`) is recognized by all of them. Only
 `-e/--connect` maps onto a capability this runtime has; `-m/--mode` accepts `client`

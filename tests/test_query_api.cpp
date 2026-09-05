@@ -452,6 +452,124 @@ TEST("get() with target_zid sets the dest extension on the wire") {
     }
 }
 
+TEST("eval() puts the whole Evaluation contract on the wire") {
+    // The one place the contract of §9/§11 is observable: everything below is either
+    // forced by the implementation or unreachable through `EvalOptions`, so a
+    // broker-level test cannot tell it from an ordinary query (this project's broker
+    // treats `best_matching` as `all` when every candidate is local, consolidates
+    // nothing, and never checks a reply key). Decode the Request instead.
+    bool req_ok = false;
+    std::string seen_suffix;
+    std::string seen_params;
+    std::string seen_argument;
+    QueryTarget seen_target = QueryTarget::best_matching;
+    ConsolidationMode seen_consolidation = ConsolidationMode::automatic;
+    bool body_present = false;
+
+    QueryRouter router([&](int fd) {
+        auto batch = recv_batch(fd);
+        if (!batch) return;
+        auto r = open_frame(*batch);
+        if (!r) return;
+        auto req = Request::decode(*r);
+        if (!req) return;
+        req_ok = true;
+        seen_suffix = std::string(req->wire_expr.suffix);
+        seen_target = req->target;
+        seen_params = std::string(req->payload.query.parameters);
+        seen_consolidation = req->payload.query.consolidation;
+        if (auto const& body = req->payload.query.body) {
+            body_present = true;
+            seen_argument = str(body->payload);
+        }
+
+        ResponseFinal rf{};
+        rf.rid = req->id;
+        send_batch(fd, build_frame(1, [&](ByteWriter& w) { (void)rf.encode(w); }));
+    });
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto evaluation = sess->eval("robot/*/reset", bytes("hard"));
+    CHECK(evaluation.has_value());
+    if (evaluation) {
+        auto r = evaluation->recv();
+        CHECK(r.has_value() && !r->has_value());
+    }
+    sess->close();
+    router.join();
+
+    CHECK(req_ok);
+    // The internal namespace, applied to the caller's key expression unchanged.
+    CHECK(seen_suffix == "@eval/robot/*/reset");
+    // Every matching Computation registration runs -- never a "best" one.
+    CHECK(seen_target == QueryTarget::all);
+    // No reply is consolidated away.
+    CHECK(seen_consolidation == ConsolidationMode::none);
+    // Replies keyed by the logical computation key are accepted even though they do
+    // not intersect the (namespaced) request key -- the reference's ReplyKeyExpr::Any.
+    CHECK(seen_params == "_anyke");
+    // The argument travels as the Query's value, the existing query payload mechanism.
+    CHECK(body_present);
+    CHECK(seen_argument == "hard");
+}
+
+TEST("get() sends no payload and keeps its own target/consolidation defaults") {
+    // The other half of the previous case: adding the eval path must not have changed
+    // what an ordinary `get` puts on the wire (spec §16).
+    bool req_ok = false;
+    bool body_present = true;
+    std::string seen_suffix;
+    std::string seen_params;
+    QueryTarget seen_target = QueryTarget::all;
+    ConsolidationMode seen_consolidation = ConsolidationMode::none;
+
+    QueryRouter router([&](int fd) {
+        auto batch = recv_batch(fd);
+        if (!batch) return;
+        auto r = open_frame(*batch);
+        if (!r) return;
+        auto req = Request::decode(*r);
+        if (!req) return;
+        req_ok = true;
+        seen_suffix = std::string(req->wire_expr.suffix);
+        seen_params = std::string(req->payload.query.parameters);
+        seen_target = req->target;
+        seen_consolidation = req->payload.query.consolidation;
+        body_present = req->payload.query.body.has_value();
+
+        ResponseFinal rf{};
+        rf.rid = req->id;
+        send_batch(fd, build_frame(1, [&](ByteWriter& w) { (void)rf.encode(w); }));
+    });
+
+    auto sess = Session::open(endpoint(router.port()));
+    CHECK(sess.has_value());
+    if (!sess) {
+        router.join();
+        return;
+    }
+    auto getter = sess->get("demo/example/**", "p=1");
+    CHECK(getter.has_value());
+    if (getter) {
+        auto r = getter->recv();
+        CHECK(r.has_value() && !r->has_value());
+    }
+    sess->close();
+    router.join();
+
+    CHECK(req_ok);
+    CHECK(seen_suffix == "demo/example/**"); // no namespace, no rewriting
+    CHECK(seen_params == "p=1");             // the caller's parameters, untouched
+    CHECK(seen_target == QueryTarget::best_matching);
+    CHECK(seen_consolidation == ConsolidationMode::automatic);
+    CHECK(!body_present);
+}
+
 TEST("declare_queryable pull: IncomingQuery exposes key/parameters/payload and replies") {
     std::string declared_key;
     bool declare_ok = false;

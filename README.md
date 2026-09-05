@@ -16,7 +16,7 @@ Three static libraries, built from one CMake project:
   (`zenoh.ke`). No sockets, no allocation surprises; messages decode as borrow-only
   views into the receive buffer. See [`docs/PROTO.md`](docs/PROTO.md).
 - **`zenoh`** — the client runtime (`Session`): connects to a router, put/get,
-  subscribe/queryable. See [`docs/RUNTIME.md`](docs/RUNTIME.md).
+  subscribe/queryable, eval/computation. See [`docs/RUNTIME.md`](docs/RUNTIME.md).
 - **`zenoh-broker`** — `zenohb`, a multithreaded ASIO router that also **federates
   into a clique** with other brokers. See [`docs/BROKER.md`](docs/BROKER.md) and
   [`docs/CLIQUE.md`](docs/CLIQUE.md).
@@ -27,6 +27,7 @@ Three static libraries, built from one CMake project:
 | --- | --- | --- |
 | Pub/sub | `put`, `try_put` (non-blocking), `batch()`, `declare_publisher` (declared key-expression id, fixed QoS), `declare_subscriber` (pull or callback, bounded queue with FIFO or last-value conflation) | fan-out to every matching face, wildcard `*`/`**` matching |
 | Query/reply | `get` (pull or callback, `GetTarget`, consolidation, timeout), `declare_queryable` | fan-out to matching queryables, fan-in with a synthesized `ResponseFinal` |
+| Evaluation | `eval` / `declare_evaluator` (declared key-expression id), `declare_computation` (pull or callback) — every matching computation runs, replies unconsolidated, isolated from ordinary queries | routes as ordinary Query/Reply under a reserved verbatim namespace |
 | Delivery | `Publisher::del` on the send path, `del` on the receive path | `Put` and `Del` relayed; a message that needs no rewrite is forwarded byte-for-byte |
 | QoS | `CongestionControl::{drop,block}` per operation, or fixed per `Publisher` | per-message: `block` traffic is queued past the watermark, `drop` traffic is shed |
 | Addressing | zid-targeting via `target_zid` on `put`/`try_put`/`get` | enforced as a **filter**, never a bypass — including across the clique |
@@ -41,7 +42,7 @@ are exercised against real `zenoh-rust` binaries (see the interop sections in
 **Deliberate gaps** (v1 scope, documented rather than hidden): no scouting or
 peer-to-peer — a client always talks through a broker; no `Fragment` reassembly, so a
 payload larger than the negotiated batch is not carried; no liveliness tokens; no
-`$*`/`@` key-expression syntax; no TLS/QUIC/UDP transports; no authentication, which
+`$*` key-expression syntax; no TLS/QUIC/UDP transports; no authentication, which
 is why inbound clique links are opt-in (see below). `docs/BROKER.md` keeps the full
 list.
 
@@ -80,6 +81,26 @@ each `pub->put(payload)` (and `pub->del()`) sends the id rather than the text.
 Query/reply is the same shape: `session->get(key, params, opts)` returns a `Getter`
 whose `recv()` yields each reply and then an empty result when the query completes,
 and `session->declare_queryable(key)` yields `IncomingQuery` objects to reply to.
+
+**Evaluation** is the other way to use that transport, for calling computations rather
+than querying data. A `Computation` is registered at one *concrete* key, and an eval
+runs **every** computation matching its key expression — never a "best" one, and with
+no reply consolidation, because a computation may have side effects:
+
+```cpp
+auto c = session->declare_computation("robot/r1/reset", [](zenoh::Eval e) {
+    reset_robot("r1");
+    (void)e.reply(as_bytes("ok"));       // keyed by "robot/r1/reset" automatically
+});
+
+auto replies = session->eval("robot/*/reset", as_bytes(""));   // r1, r2, r3 — all of them
+```
+
+Evals and ordinary queries never reach each other, even on the same key: computations
+live under a reserved namespace that no wildcard can match (`**` included) and that
+`get`/`declare_queryable` refuse to name. See
+[`docs/RUNTIME.md`](docs/RUNTIME.md)'s "Evaluation".
+
 Linking is `target_link_libraries(app PRIVATE zenoh)`. The runnable versions of all of
 this are in [`examples/`](examples) — see [Examples](#examples) below.
 
@@ -340,13 +361,16 @@ once, never the same message twice.
 
 Every preset builds runtime example programs under `build/<preset>/examples/`:
 `z_put`, `z_pub`, `z_put_float`, `z_pub_thr`, `z_sub`, `z_sub_thr` (pub/sub),
-`z_get`, `z_queryable`, `z_querier` (query/reply), and `z_ping`/`z_pong` (latency). See
+`z_get`, `z_queryable`, `z_querier` (query/reply), `z_computation`/`z_eval`
+(evaluation), and `z_ping`/`z_pong` (latency). See
 [`docs/RUNTIME.md`](docs/RUNTIME.md) for how to run them against a Zenoh router (this
 project's own `zenohb`, above, or a real `zenohd`). Protocol/codec internals are
 documented in [`docs/PROTO.md`](docs/PROTO.md).
 
 Each example's CLI mirrors its `zenoh-rust` counterpart's — same option names, short
-forms and defaults — so a command line written for one runs against the other. Options
+forms and defaults — so a command line written for one runs against the other
+(`z_computation`/`z_eval` have no reference counterpart, so they mirror `z_queryable`
+and `z_get` instead). Options
 the reference has but this runtime does not implement are parsed and then reported as
 `note: ... has no effect` rather than being silently accepted; anything that is not a
 reference option is rejected.
@@ -356,7 +380,7 @@ reference option is rejected.
 | Document | Covers |
 | --- | --- |
 | [`docs/PROTO.md`](docs/PROTO.md) | Wire format and codec internals: message layout, extensions, the strict-decoding rules, adding a message. |
-| [`docs/RUNTIME.md`](docs/RUNTIME.md) | The client `Session`: handshake, TCP framing and batch handling, `put` vs `try_put` commit semantics, declared publishers, subscriber strands, interop runs against `zenohd`. |
+| [`docs/RUNTIME.md`](docs/RUNTIME.md) | The client `Session`: handshake, TCP framing and batch handling, `put` vs `try_put` commit semantics, declared publishers, subscriber strands, the Evaluation abstraction (`Computation`/`Evaluator`), interop runs against `zenohd`. |
 | [`docs/BROKER.md`](docs/BROKER.md) | `zenohb`: routing semantics, the two-tier strand concurrency model, the `DestinationId` wire extension, congestion control, performance notes, documented v1 gaps. |
 | [`docs/CLIQUE.md`](docs/CLIQUE.md) | Broker-to-broker federation: the split-horizon invariant, gossip membership, aggregated declarations, partition detection, peer trust. |
 | [`docs/STYLE.md`](docs/STYLE.md) | The short form of the coding conventions. |

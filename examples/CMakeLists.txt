@@ -36,6 +36,14 @@ add_executable(z_querier z_querier.cpp)
 target_link_libraries(z_querier PRIVATE zenoh)
 target_compile_features(z_querier PRIVATE cxx_std_23)
 
+add_executable(z_computation z_computation.cpp)
+target_link_libraries(z_computation PRIVATE zenoh)
+target_compile_features(z_computation PRIVATE cxx_std_23)
+
+add_executable(z_eval z_eval.cpp)
+target_link_libraries(z_eval PRIVATE zenoh)
+target_compile_features(z_eval PRIVATE cxx_std_23)
+
 add_executable(z_ping z_ping.cpp)
 target_link_libraries(z_ping PRIVATE zenoh)
 target_compile_features(z_ping PRIVATE cxx_std_23)
