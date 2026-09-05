@@ -6,9 +6,7 @@
 
 import zenoh;
 
-auto read_speed() -> std::uint16_t {
-    return static_cast<unsigned short>(std::rand() % 200);
-}
+auto read_speed() -> std::uint16_t { return static_cast<unsigned short>(std::rand() % 200); }
 
 auto main(int argc, char** argv) -> int {
     if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447"); z) {

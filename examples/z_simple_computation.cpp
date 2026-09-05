@@ -13,7 +13,7 @@ auto unlock_doors() -> std::byte {
 }
 
 auto main() -> int {
-    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447"); z ) {
+    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447"); z) {
         auto c = z->declare_computation("vehicle/door/lock");
         while (c) {
             auto eval = c->recv();
