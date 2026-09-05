@@ -7,8 +7,8 @@ module;
 
 module zenoh.ke;
 
-// Chunk-based wildcard matching (`*`, `**`) for Zenoh key expressions. See
-// ke.cppm's file header for the non-`$*`/non-`@` v1 scope note.
+// Chunk-based wildcard matching (`*`, `**`, `@`-verbatim) for Zenoh key
+// expressions. See ke.cppm's file header for the non-`$*` v1 scope note.
 
 namespace zenoh::ke {
 
@@ -41,6 +41,16 @@ namespace {
 
 [[nodiscard]] auto is_star(std::string_view chunk) noexcept -> bool { return chunk == "*"; }
 [[nodiscard]] auto is_dstar(std::string_view chunk) noexcept -> bool { return chunk == "**"; }
+
+// A chunk beginning with '@' is *verbatim*: it denotes a Zenoh-reserved
+// namespace (`@/<zid>/...` admin, the reference's `@adv`, this project's
+// `@eval`) and may only be matched by an identical literal chunk -- never by
+// `*`, and never absorbed by `**`. Mirrors the reference's
+// `MayHaveVerbatim::has_direct_verbatim` (commons/zenoh-keyexpr). Without this
+// an application's `get("**")` would reach every reserved key in the system.
+[[nodiscard]] auto is_verbatim(std::string_view chunk) noexcept -> bool {
+    return chunk.starts_with('@');
+}
 
 // A chunk is a valid v1 wildcard chunk if it's a plain literal (no '*' at
 // all) or exactly "*"/"**". Any other use of '*' (e.g. "$*", "ab*cd") is
@@ -141,9 +151,11 @@ auto canonize(std::string& s) noexcept -> bool {
 // Recurrence (i < n, j < m):
 //   A[i] == "**": dp[j] = dp_next[j] || dp[j+1]      -- "**" matches zero
 //     chunks (drop it, f(i+1,j)) or eats one more chunk of B and stays
-//     (f(i,j+1)); symmetric if B[j] == "**" instead.
+//     (f(i,j+1)); symmetric if B[j] == "**" instead. The "eat one more chunk"
+//     branch is gated on that chunk not being verbatim.
 //   otherwise:     dp[j] = chunk_match(A[i],B[j]) && dp_next[j+1]
-//     where chunk_match is true for "*"/"*" or equal literals.
+//     where chunk_match is true for equal chunks, or for a "*" facing a
+//     non-verbatim chunk.
 // Base rows/columns: f(n,m)=true; f(n,j)=B[j]=="**" && f(n,j+1); symmetric
 // for f(i,m).
 auto intersects(std::string_view a, std::string_view b) noexcept -> bool {
@@ -166,12 +178,23 @@ auto intersects(std::string_view a, std::string_view b) noexcept -> bool {
 
     for (std::size_t i = n; i-- > 0;) {
         bool const a_dstar = is_dstar(ca[i]);
+        bool const a_verbatim = is_verbatim(ca[i]);
         dp[m] = a_dstar && dp_next[m];
         for (std::size_t j = m; j-- > 0;) {
-            if (a_dstar || is_dstar(cb[j])) {
+            bool const b_dstar = is_dstar(cb[j]);
+            bool const b_verbatim = is_verbatim(cb[j]);
+            if (a_dstar && b_dstar) {
+                // Neither "**" is verbatim, so both absorption branches stand.
                 dp[j] = dp_next[j] || dp[j + 1];
+            } else if (a_dstar) {
+                // dp[j+1] is A's "**" absorbing cb[j] -- forbidden if it is verbatim.
+                dp[j] = dp_next[j] || (!b_verbatim && dp[j + 1]);
+            } else if (b_dstar) {
+                // Mirror image: dp_next[j] is B's "**" absorbing ca[i].
+                dp[j] = (!a_verbatim && dp_next[j]) || dp[j + 1];
             } else {
-                bool const chunk_match = is_star(ca[i]) || is_star(cb[j]) || ca[i] == cb[j];
+                bool const chunk_match = (is_star(ca[i]) && !b_verbatim) ||
+                                         (is_star(cb[j]) && !a_verbatim) || ca[i] == cb[j];
                 dp[j] = chunk_match && dp_next[j + 1];
             }
         }
@@ -194,7 +217,9 @@ auto intersects(std::string_view a, std::string_view b) noexcept -> bool {
 //     side can expand to zero chunks, which neither a literal nor "*" on the
 //     container side (both mandate exactly one consumed chunk) can cover.
 //   A[i] == "*": dp[j] = dp_next[j+1]                -- "*" covers any single
-//     literal or "*" chunk on the contained side (both bind exactly one slot).
+//     literal or "*" chunk on the contained side (both bind exactly one slot),
+//     but never a verbatim one; likewise "**" may only absorb non-verbatim
+//     chunks.
 //   A[i] literal: dp[j] = (B[j] == A[i]) && dp_next[j+1] -- only an identical
 //     literal is covered; "*"/"**" on the contained side range over values a
 //     fixed literal cannot.
@@ -222,12 +247,13 @@ auto includes(std::string_view container, std::string_view contained) noexcept -
         bool const a_dstar = is_dstar(ca[i]);
         dp[m] = a_dstar && dp_next[m];
         for (std::size_t j = m; j-- > 0;) {
+            bool const b_verbatim = is_verbatim(cb[j]);
             if (a_dstar) {
-                dp[j] = dp_next[j] || dp[j + 1];
+                dp[j] = dp_next[j] || (!b_verbatim && dp[j + 1]);
             } else if (is_dstar(cb[j])) {
                 dp[j] = false;
             } else if (is_star(ca[i])) {
-                dp[j] = dp_next[j + 1];
+                dp[j] = !b_verbatim && dp_next[j + 1];
             } else {
                 dp[j] = (cb[j] == ca[i]) && dp_next[j + 1];
             }

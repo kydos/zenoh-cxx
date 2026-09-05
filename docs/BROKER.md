@@ -23,7 +23,7 @@ under federation — a peer-broker link is just another face, distinguished by
 
 | Module | Unit | Contents |
 | --- | --- | --- |
-| `zenoh.ke` | `src/ke/ke.cppm`/`.cpp` | Key-expression matching: `is_canon`, `canonize`, `intersects`, `includes`. Pure, no I/O — lives in `zenoh-proto`, not the broker library, since it's a codec-adjacent concern (matching `WireExpr` patterns), reused by both. `*`/`**` only (v1 scope); `$*`/`@` are an explicit gap. |
+| `zenoh.ke` | `src/ke/ke.cppm`/`.cpp` | Key-expression matching: `is_canon`, `canonize`, `intersects`, `includes`. Pure, no I/O — lives in `zenoh-proto`, not the broker library, since it's a codec-adjacent concern (matching `WireExpr` patterns), reused by both. `*`/`**` plus `@`-verbatim chunks (a chunk beginning with `@` is matched only by an identical literal, never by a wildcard — which is what keeps the reserved `@/...`, `@adv` and `@eval` namespaces out of reach of an application's `**`); `$*` sub-chunk globbing is the v1 gap. |
 | `zenoh.broker.resource` | `broker/src/resource.cppm`/`.cpp` | `ResourceTable`, `FaceCtx`, `FaceId`. Declared subscriber/queryable patterns and `matching_subscribers`/`matching_queryables` lookups (via `zenoh.ke::intersects`). Pure logic, no ASIO, no I/O. |
 | `zenoh.broker.membership` | `broker/src/membership.cppm`/`.cpp` | `MemberInfo`, `Membership` — clique membership, the gossip payload codec, endpoint validation, and the mutual-dial tie-break. Pure logic, no ASIO. See `docs/CLIQUE.md`. |
 | `zenoh.broker.tables` | `broker/src/tables.cppm`/`.cpp` | `Tables` — the broker's global routing state: face registry, `ResourceTable`, and query fan-out/fan-in bookkeeping, all serialized on one `asio::strand`. `FaceHandle`/`RoutedPush`/`RoutedRequest`/`RoutedResponse` are the owned, strand-crossing-safe shapes routing operates on. |
@@ -259,9 +259,13 @@ clang+libstdc++ toolchain already set up for named modules.)
   connection to one broker. Broker-to-broker federation exists (`docs/CLIQUE.md`) but
   assumes a full mesh: there is no multi-hop routing and no link-state, so a dropped
   peer link partitions that pair rather than rerouting.
-- **`$*` sub-chunk globbing and `@`-verbatim key-expression chunks** are out of scope
-  for `zenoh.ke` (v1: `*`/`**` only) — matches what this project's own `WireExpr`
-  usage and its interop targets actually produce.
+- **`$*` sub-chunk globbing** is out of scope for `zenoh.ke` (v1: `*`/`**` plus
+  `@`-verbatim chunks) — matches what this project's own `WireExpr` usage and its
+  interop targets actually produce. `@`-verbatim chunks *are* implemented, and they
+  matter to routing rather than only to the client: a chunk beginning with `@` names a
+  reserved namespace and is matched only by an identical literal, so `matching_*`
+  never routes an application's `**` to `@/...`, `@adv`, or the `@eval` namespace the
+  client runtime's Evaluation abstraction uses (`docs/RUNTIME.md`).
 
 ## Why `Face` isn't its own module (a toolchain constraint, not a design choice)
 

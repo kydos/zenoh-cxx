@@ -6,12 +6,13 @@ import zenoh.ke;
 
 using namespace zenoh::ke;
 
-// Vectors below are the non-`$*`/non-`@` subset ported verbatim from the
-// reference implementation's
+// Vectors below are the non-`$*` subset ported verbatim from the reference
+// implementation's
 // ../zenoh-rust/commons/zenoh-keyexpr/src/key_expr/{tests.rs,canon.rs}
-// (`$*`/`@`-verbatim forms are an explicit v1 gap, see ke.cppm).
+// (`$*` sub-chunk globbing is an explicit v1 gap, see ke.cppm; `@`-verbatim
+// chunks are implemented and have their own cases at the end of this file).
 
-TEST("intersects: reference vectors (non-$*/@ subset)") {
+TEST("intersects: reference vectors (non-$* subset)") {
     CHECK(intersects("a", "a"));
     CHECK(intersects("a/b", "a/b"));
     CHECK(intersects("*", "abc"));
@@ -41,7 +42,7 @@ TEST("intersects is symmetric on the reference vectors") {
     CHECK(intersects("**", "a/b/c") == intersects("a/b/c", "**"));
 }
 
-TEST("includes: reference vectors (non-$*/@ subset)") {
+TEST("includes: reference vectors (non-$* subset)") {
     CHECK(includes("a", "a"));
     CHECK(includes("a/b", "a/b"));
     CHECK(includes("*", "abc"));
@@ -188,4 +189,79 @@ TEST("exactly max_ke_chunks chunks is accepted; one more is rejected") {
     CHECK(!is_canon(over_bound));
     CHECK(!intersects(over_bound, over_bound));
     CHECK(!includes(over_bound, over_bound));
+}
+
+// --- Verbatim ('@'-leading) chunks ------------------------------------------------
+//
+// A verbatim chunk names a Zenoh-reserved namespace -- `@/<zid>/...` (admin), the
+// reference's `@adv`, this project's `@eval` (docs/RUNTIME.md) -- and is matched only
+// by an identical literal chunk, never by a wildcard. Vectors ported from the same
+// reference file as the ones above, minus its `$*` forms.
+
+TEST("intersects: verbatim chunks are matched only by themselves (reference vectors)") {
+    CHECK(intersects("@a", "@a"));
+    CHECK(!intersects("@a", "@ab"));
+    CHECK(!intersects("@a", "@a/b"));
+    CHECK(!intersects("@a", "@a/*"));
+    CHECK(!intersects("@a", "@a/*/**"));
+    CHECK(intersects("@a", "@a/**"));
+    CHECK(intersects("@a/**/c/**/e", "@a/b/b/b/c/d/d/d/e"));
+    CHECK(!intersects("@a/**/c/**/e", "@a/@b/b/b/c/d/d/d/e"));
+    CHECK(intersects("@a/**/@c/**/e", "@a/b/b/b/@c/d/d/d/e"));
+    CHECK(intersects("@a/**/e", "@a/b/b/d/d/d/e"));
+    CHECK(intersects("@a/**/e", "@a/b/b/b/d/d/d/e"));
+    CHECK(intersects("@a/**/e", "@a/b/b/c/d/d/d/e"));
+    CHECK(!intersects("@a/**/e", "@a/b/b/@c/b/d/d/d/e"));
+    CHECK(!intersects("@a/*", "@a/@b"));
+    CHECK(!intersects("@a/**", "@a/@b"));
+    CHECK(intersects("@a/**/@b", "@a/@b"));
+    CHECK(intersects("@a/@b/**", "@a/@b"));
+    CHECK(intersects("@a/**/@c/**/@b", "@a/**/@c/@b"));
+    CHECK(intersects("@a/**/@c/**/@b", "@a/@c/**/@b"));
+    CHECK(intersects("@a/**/@c/@b", "@a/@c/**/@b"));
+    CHECK(!intersects("@a/**/@b", "@a/**/@c/**/@b"));
+    CHECK(intersects("@a", "**/@a"));
+}
+
+TEST("intersects: a wildcard alone never reaches a reserved namespace") {
+    // The property the Evaluation abstraction's isolation rests on (session.cpp's
+    // `eval_prefix`): an application key expression, however wild, cannot name a key
+    // in the `@eval` namespace -- while an evaluation, which prefixes both sides
+    // identically, matches exactly as it would have unprefixed.
+    CHECK(!intersects("**", "@eval/robot/r1/reset"));
+    CHECK(!intersects("*/robot/r1/reset", "@eval/robot/r1/reset"));
+    CHECK(!intersects("**/reset", "@eval/robot/r1/reset"));
+    CHECK(intersects("@eval/robot/*/reset", "@eval/robot/r1/reset"));
+    CHECK(intersects("@eval/**", "@eval/robot/r1/reset"));
+    CHECK(intersects("robot/*/reset", "robot/r1/reset")); // ... same match, unprefixed
+    CHECK(!intersects("@eval/robot/*/reset", "@eval/robot/r1/stop"));
+    // The admin space and the reference's `@adv` are equally out of reach, and
+    // distinct from `@eval`.
+    CHECK(!intersects("**", "@/router/gossip"));
+    CHECK(!intersects("@eval/**", "@adv/pub/x"));
+}
+
+TEST("includes: verbatim chunks are covered only by themselves (reference vectors)") {
+    CHECK(includes("@a", "@a"));
+    CHECK(!includes("@a", "@ab"));
+    CHECK(!includes("@a", "@a/b"));
+    CHECK(!includes("@a", "@a/*"));
+    CHECK(!includes("@a", "@a/*/**"));
+    CHECK(!includes("@a", "@a/**"));
+    CHECK(includes("@a/**", "@a"));
+    CHECK(includes("@a/**/c/**/e", "@a/b/b/b/c/d/d/d/e"));
+    CHECK(!includes("@a/*", "@a/@b"));
+    CHECK(!includes("@a/**", "@a/@b"));
+    CHECK(includes("@a/**/@b", "@a/@b"));
+    CHECK(includes("@a/@b/**", "@a/@b"));
+    CHECK(!includes("**", "@eval/robot/r1/reset"));
+}
+
+TEST("is_canon and canonize treat a verbatim chunk as the plain literal it is") {
+    CHECK(is_canon("@eval/robot/r1/reset"));
+    CHECK(is_canon("@eval/robot/*/reset"));
+    CHECK(!is_canon("@eval//robot"));
+    std::string s = "@eval/a/**/**/b";
+    CHECK(canonize(s));
+    CHECK(s == "@eval/a/**/b");
 }

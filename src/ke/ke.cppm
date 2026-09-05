@@ -8,10 +8,14 @@ export module zenoh.ke;
 
 // Zenoh key-expression matching: canonical-form validation and wildcard
 // intersection/inclusion over the `*` (single chunk) and `**` (zero-or-more
-// chunks) forms. `$*` sub-chunk globbing and `@`-verbatim chunks (the rest of
-// the full spec's wildcard vocabulary) are an explicit, documented v1 gap:
+// chunks) forms, plus `@`-verbatim chunks (a chunk beginning with '@' is only
+// ever matched by an identical literal, never by a wildcard -- the reference's
+// `MayHaveVerbatim` rule, which is what keeps Zenoh's reserved namespaces
+// `@/<zid>/...` (admin), `@adv` and this project's `@eval` (docs/RUNTIME.md)
+// out of reach of an application's `**`). `$*` sub-chunk globbing (the rest of
+// the full spec's wildcard vocabulary) remains an explicit, documented v1 gap:
 // neither this project's own `WireExpr` usage nor its interop targets
-// (docs/BROKER.md) produce them, and a chunk using them is treated as
+// (docs/BROKER.md) produce it, and a chunk using it is treated as
 // non-canonical rather than silently mishandled.
 export namespace zenoh::ke {
 
@@ -39,7 +43,9 @@ inline constexpr std::size_t max_ke_chunks = 512;
 [[nodiscard]] auto canonize(std::string& s) noexcept -> bool;
 
 /// True if there exists at least one concrete (wildcard-free) key matched by
-/// both `a` and `b`. Both must already be canonical (callers canonicalize
+/// both `a` and `b`. A chunk beginning with '@' is *verbatim*: no `*`/`**` on
+/// the other side matches it, so `**` does not intersect `@eval/x` and only an
+/// identical `@eval` chunk does. Both must already be canonical (callers canonicalize
 /// once at declare time — e.g. the broker's resource table — not per
 /// incoming message), though `intersects` itself is verified order-invariant
 /// (branches on chunk content at each position rather than assuming a
@@ -50,6 +56,8 @@ inline constexpr std::size_t max_ke_chunks = 512;
 
 /// True if every concrete key matched by `contained` is also matched by
 /// `container` (i.e. `container`'s pattern is a superset of `contained`'s).
+/// Verbatim ('@'-leading) chunks obey the same rule as in `intersects`: a
+/// `*`/`**` on the container side never covers one on the contained side.
 /// Both **must** already be canonical (per `is_canon`, including the `**/*`
 /// -> `*/**` ordering): unlike `intersects`, this DP's correctness genuinely
 /// depends on that normalized order — a `**` immediately followed by a `*`
