@@ -51,3 +51,11 @@ target_compile_features(z_ping PRIVATE cxx_std_23)
 add_executable(z_pong z_pong.cpp)
 target_link_libraries(z_pong PRIVATE zenoh)
 target_compile_features(z_pong PRIVATE cxx_std_23)
+
+add_executable(z_simple_sub z_simple_sub.cpp)
+target_link_libraries(z_simple_sub PRIVATE zenoh)
+target_compile_features(z_simple_sub PRIVATE cxx_std_23)
+
+add_executable(z_simple_pub z_simple_pub.cpp)
+target_link_libraries(z_simple_pub PRIVATE zenoh)
+target_compile_features(z_simple_pub PRIVATE cxx_std_23)
