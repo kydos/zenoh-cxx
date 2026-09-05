@@ -59,3 +59,11 @@ target_compile_features(z_simple_sub PRIVATE cxx_std_23)
 add_executable(z_simple_pub z_simple_pub.cpp)
 target_link_libraries(z_simple_pub PRIVATE zenoh)
 target_compile_features(z_simple_pub PRIVATE cxx_std_23)
+
+add_executable(z_simple_computation z_simple_computation.cpp)
+target_link_libraries(z_simple_computation PRIVATE zenoh)
+target_compile_features(z_simple_computation PRIVATE cxx_std_23)
+
+add_executable(z_simple_eval z_simple_eval.cpp)
+target_link_libraries(z_simple_eval PRIVATE zenoh)
+target_compile_features(z_simple_eval PRIVATE cxx_std_23)
