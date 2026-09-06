@@ -8,26 +8,24 @@ auto lock_doors() -> std::byte {
 }
 
 auto unlock_doors() -> std::byte {
-    std::println(">> Doors Unocked");
+    std::println(">> Doors Unlocked");
     return std::byte{0};
 }
 
 auto main() -> int {
-    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447"); z) {
-        auto c = z->declare_computation("vehicle/door/lock");
-        while (c) {
-            auto eval = c->recv();
-            auto arg = eval->argument();
-            std::byte ret;
-            if (arg[0] == std::byte(0)) {
-                ret = unlock_doors();
-            } else {
-                ret = lock_doors();
+    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447")) {
+        if (auto c = z->declare_computation("vehicle/door/lock")) {
+            // recv() ends the loop when the link to the broker goes away.
+            while (auto eval = c->recv()) {
+                // An eval's argument may legally be empty -- that is "no command".
+                auto arg = eval->argument();
+                auto ret = arg.empty() || arg[0] == std::byte{0} ? unlock_doors() : lock_doors();
+                std::ignore = eval->reply(std::span{&ret, 1});
             }
-            auto result = std::span{&ret, 1};
-            std::ignore = eval->reply(result);
+            return 0;
         }
         std::println("Unable to declare computation");
+        return 1;
     }
     std::println("Please start zenohb before running this example");
     return 1;

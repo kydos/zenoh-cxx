@@ -151,7 +151,14 @@ auto TcpLink::writev_all(std::span<const std::byte> first,
     int idx = 0; // index of the first not-yet-fully-written iovec
 
     while (idx < 2) {
-        ssize_t const n = ::writev(fd_, &iov[idx], 2 - idx);
+        // `sendmsg`, not `writev`: the gathering write must be as signal-free as
+        // `write_all`'s `send`. `writev` has no MSG_NOSIGNAL, so writing the payload
+        // of a put to a peer that has gone away would raise SIGPIPE and kill the
+        // process before the caller ever saw `connection_closed`.
+        ::msghdr msg{};
+        msg.msg_iov = &iov[idx];
+        msg.msg_iovlen = static_cast<decltype(msg.msg_iovlen)>(2 - idx);
+        ssize_t const n = ::sendmsg(fd_, &msg, MSG_NOSIGNAL);
         if (n > 0) {
             auto left = static_cast<std::size_t>(n);
             while (idx < 2 && left >= iov[idx].iov_len) {

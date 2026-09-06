@@ -10,6 +10,7 @@ import zenoh.runtime.tcp;
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <thread>
 #include <vector>
@@ -62,6 +63,13 @@ auto read_n(int fd, std::span<std::byte> out) -> bool {
 auto byte(int v) -> std::byte { return static_cast<std::byte>(v); }
 auto i(std::byte b) -> int { return std::to_integer<int>(b); }
 
+/// Set by `count_sigpipe` when the process is actually signalled -- the whole point of
+/// the dead-peer write case below, which is why it cannot rely on the SIG_IGN every
+/// harness here installs.
+volatile std::sig_atomic_t sigpipe_seen = 0;
+
+extern "C" auto count_sigpipe(int) -> void { sigpipe_seen = 1; }
+
 } // namespace
 
 TEST("TcpLink::read_exact reports closed on peer EOF") {
@@ -111,6 +119,50 @@ TEST("TcpLink::writev_all gathers two spans and handles empty spans") {
 
     ::close(peer);
     ::close(lf);
+}
+
+// Regression: `writev_all` used ::writev, which -- unlike the ::send in `write_all`
+// and `write_some` -- has no MSG_NOSIGNAL. Writing the payload of a put to a router
+// that had gone away therefore raised SIGPIPE and killed the process outright,
+// before the caller could ever be handed `connection_closed`. Every test harness in
+// this suite installs SIG_IGN for SIGPIPE at construction, which is precisely why
+// none of them ever saw it; this case installs a counting handler of its own instead
+// and restores the previous disposition afterwards.
+TEST("TcpLink::writev_all reports closed on a dead peer without raising SIGPIPE") {
+    std::uint16_t port = 0;
+    int const lf = make_listener(port);
+    auto link = TcpLink::connect("127.0.0.1", port);
+    CHECK(link.has_value());
+    if (!link) {
+        ::close(lf);
+        return;
+    }
+    int const peer = ::accept(lf, nullptr, nullptr);
+    CHECK(peer >= 0);
+    ::close(peer); // peer hangs up: writes draw an RST, then EPIPE
+    ::close(lf);
+
+    sigpipe_seen = 0;
+    auto* const prev = std::signal(SIGPIPE, count_sigpipe);
+
+    // The first gathering write after the hangup usually still succeeds (it lands in
+    // the send buffer); the RST it provokes is what fails the ones after it.
+    std::array<std::byte, 3> a{byte(1), byte(2), byte(3)};
+    std::array<std::byte, 2> b{byte(4), byte(5)};
+    std::optional<IoError> err;
+    for (int n = 0; n < 100 && !err; ++n) {
+        if (auto r = link->writev_all(a, b); !r) {
+            err = r.error();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
+    std::signal(SIGPIPE, prev);
+
+    CHECK(err.has_value());
+    CHECK(err == IoError::closed);
+    CHECK(sigpipe_seen == 0);
 }
 
 TEST("TcpLink::write_some yields would_block when the send buffer is full") {

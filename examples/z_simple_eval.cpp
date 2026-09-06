@@ -3,15 +3,15 @@
 import zenoh;
 
 auto main(int argc, char** argv) -> int {
-    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447"); z) {
-        auto e = z->declare_evaluator("vehicle/door/lock");
-        auto lock = std::byte{0};
-        if (argc > 1) {
-            lock = std::byte{1};
+    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447")) {
+        if (auto e = z->declare_evaluator("vehicle/door/lock")) {
+            // Any argument on the command line means "lock", none means "unlock".
+            auto lock = argc > 1 ? std::byte{1} : std::byte{0};
+            std::ignore = e->eval(std::span{&lock, 1});
+            return 0;
         }
-        auto arg = std::span{&lock, 1};
-        std::ignore = e->eval(arg);
-        return 0;
+        std::println("Unable to declare evaluator");
+        return 1;
     }
     std::println("Please start zenohb before running this example");
     return 1;

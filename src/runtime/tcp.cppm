@@ -43,9 +43,10 @@ class TcpLink {
     [[nodiscard]] auto write_all(std::span<const std::byte> data) noexcept
         -> std::expected<void, IoError>;
 
-    /// Write all of `first` then `second` as one scatter-gather sequence (`writev`),
+    /// Write all of `first` then `second` as one scatter-gather sequence (`sendmsg`),
     /// blocking as needed. Lets a caller emit a header plus a borrowed payload without
-    /// first copying them into one contiguous buffer.
+    /// first copying them into one contiguous buffer. Like the other writes here it
+    /// never raises SIGPIPE: a peer that has gone away is reported as `IoError::closed`.
     [[nodiscard]] auto writev_all(std::span<const std::byte> first,
                                   std::span<const std::byte> second) noexcept
         -> std::expected<void, IoError>;

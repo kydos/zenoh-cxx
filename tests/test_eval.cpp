@@ -703,6 +703,38 @@ TEST("a pull-based Computation delivers evals through recv()") {
     CHECK(replies.ok.size() == 1 && replies.ok[0].second == "pulled");
 }
 
+// What a Ctrl-C on the broker does to a pull-based computation sitting in recv():
+// the failure must be *reported*, so that the idiomatic `while (auto e = c->recv())`
+// loop ends instead of spinning (or worse, dereferencing an errored expected -- the
+// bug this pins down on the example side).
+TEST("Computation::recv reports connection_closed once the broker goes away") {
+    auto tb = TestBroker::start();
+    if (!tb.broker) return;
+
+    auto responder = Session::open(tb.endpoint());
+    CHECK(responder.has_value());
+    if (!responder) return;
+
+    auto comp = responder->declare_computation("foo/a"); // pull-based, nothing pending
+    CHECK(comp.has_value());
+    if (!comp) return;
+    settle();
+
+    // Drop the whole broker (not just stop the accept loop): destroying it closes the
+    // face's socket, which is the EOF a dying zenohb hands its clients.
+    tb.broker->stop();
+    if (tb.runner.joinable()) tb.runner.join();
+    tb.broker.reset();
+
+    auto e = comp->recv();
+    CHECK(!e.has_value());
+    CHECK(!e.has_value() && e.error() == ZError::connection_closed);
+
+    // ... and the fault is sticky, so the loop ends rather than spinning on it.
+    auto again = comp->recv();
+    CHECK(!again.has_value() && again.error() == ZError::connection_closed);
+}
+
 TEST("undeclaring a Computation with an eval still queued finalizes it") {
     auto tb = TestBroker::start();
     if (!tb.broker) return;
