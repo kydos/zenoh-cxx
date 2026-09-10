@@ -215,6 +215,18 @@ rather than changing the repo.
   format, differential vectors (see `tools/vector-gen`/`test_diff.cpp` above); new
   runtime/session behavior needs a `tests/test_*.cpp` case exercising it over a real
   `socketpair`/loopback, matching the existing test files' granularity.
+- **Keep the module declarations regular.** A downstream project (`zenohe`, the
+  embedded node for PX5/GCC 10.2) mechanically rewrites this repo's codec modules
+  into plain C++20 headers, because GCC 10 supports neither C++23 nor modules. That
+  generator relies on the shape every `.cppm` here already has:
+  `module;` + global-module-fragment includes, `export module X;`, `import`s, then
+  exactly **one** `export namespace` block — with no module partitions, no
+  `module :private;`, and no per-declaration `export`. Implementation units are
+  `module;` + includes + `module X;` + `import`s. Departing from that is fine if
+  there is a reason, but it breaks the generator, so flag it rather than doing it
+  incidentally. Every violation fails loudly there rather than silently.
+- **Avoid 64-bit-host-only constructs in the codec.** The same downstream builds it
+  for 32-bit ARM. `unsigned __int128` in particular is a hard compile error there.
 
 ## Architecture
 
