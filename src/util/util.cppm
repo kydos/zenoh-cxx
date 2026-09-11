@@ -13,7 +13,7 @@ export namespace zenoh {
 
 /// Error codes shared across the buffer and codec layers.
 ///
-/// A flat, payload-free enum (see PLAN.md D1): keeps `std::expected` small and the
+/// A flat, payload-free enum (see docs/PLAN.md D1): keeps `std::expected` small and the
 /// success path zero-cost. Diagnostic context, when wanted, lives behind a
 /// release-compiled-out logging hook rather than in this type.
 enum class CodecError : std::uint8_t {

@@ -2,7 +2,7 @@
 
 ## Functions
 Every function and member function uses **trailing return type**: `auto f(args) -> R`.
-Constructors/destructors are exempt. (See `RESTRUCTURE.md`/memory.)
+Constructors/destructors are exempt. (See `docs/RESTRUCTURE.md`/memory.)
 
 ## Module / file organization
 - One **folder per functional area** under `src/` (`util/`, `buffer/`, `codec/`,

@@ -9,7 +9,7 @@ module;
 export module zenoh.runtime.tcp;
 
 // A thin, blocking-or-non-blocking POSIX TCP link (Linux/macOS). This is the I/O
-// seam of the vertically-integrated runtime (PLAN.md D8): the session owns one of
+// seam of the vertically-integrated runtime (docs/PLAN.md D8): the session owns one of
 // these and drives encode->send / recv->decode directly. POSIX headers stay in the
 // implementation unit (tcp.cpp) — none leak through this interface.
 export namespace zenoh {

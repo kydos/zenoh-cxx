@@ -44,13 +44,16 @@ validate behavior and to test this codebase:
   `z_get`/`z_queryable` binaries connecting to this project's own `zenohb` broker —
   see `docs/BROKER.md`'s "Manual interop test" for the exact invocation sequences.
 
-Read `PLAN.md` (architectural decisions D1–D8, with rationale) and `RESTRUCTURE.md`
+Read `docs/PLAN.md` (architectural decisions D1–D8, with rationale) and `docs/RESTRUCTURE.md`
 (module folder layout, interface/impl split) before making structural changes — both
 are living design docs, not historical records. `docs/STYLE.md` is the short version.
 `docs/PROTO.md` documents wire-format/codec internals; `docs/RUNTIME.md` documents the
 session/handshake/framing/subscriber behavior in detail; `docs/BROKER.md` documents
 the broker's routing semantics, its two-tier ASIO strand concurrency model, and the
-`DestinationId` (zid-targeting) wire extension; `docs/CLIQUE.md` documents
+`DestinationId` (zid-targeting) wire extension; `docs/EVAL-CXX.md` is the normative
+contract for the Evaluation abstraction (`docs/EVAL.md` is the original,
+Rust-flavoured request behind it, kept for provenance -- do not read it as a
+description of what this repo does); `docs/CLIQUE.md` documents
 broker-to-broker federation (the split-horizon invariant, gossip membership,
 aggregated declarations, and QoS-driven congestion control).
 
@@ -284,7 +287,7 @@ depends on `zenoh-proto` but not vice versa. Tests import specific leaf modules
 
 ### Where code lives: interface (`.cppm`) vs implementation (`.cpp`)
 
-This split is deliberate and **not** "everything goes to `.cpp`" — see `RESTRUCTURE.md`
+This split is deliberate and **not** "everything goes to `.cpp`" — see `docs/RESTRUCTURE.md`
 Decision A for the full rationale. The short version:
 
 - **Stays `inline` in the `.cppm`** (hot, called per-field, or generic): `util`,
@@ -301,7 +304,7 @@ across the module boundary. For the byte-level primitives, inlining *is* the
 performance story (LTO is off in ASan/fuzz builds), so they stay in the interface
 unit; message bodies are large enough that this cost is negligible.
 
-### Codec design (see PLAN.md D1-D7 for full rationale)
+### Codec design (see docs/PLAN.md D1-D7 for full rationale)
 
 - **No exceptions on the codec path** — `std::expected<T, CodecError>`, short-circuited
   with the `ZTRY` macro (GNU statement-expression extension; requires
@@ -337,7 +340,7 @@ unit; message bodies are large enough that this cost is negligible.
 
 ### Runtime layer (client `Session`) — see `docs/RUNTIME.md` for full detail
 
-**Vertically integrated, not sans-IO** (PLAN.md D8): the deliberate divergence from
+**Vertically integrated, not sans-IO** (docs/PLAN.md D8): the deliberate divergence from
 the Rust reference's `zenoh-sansio` split. `Session` owns the socket, protocol state
 (zid, frame SN, keyexpr resmap), and encode/decode buffers directly, driving
 `recv → reassemble → decode → dispatch` and `encode → batch → send` as one

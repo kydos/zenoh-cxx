@@ -13,7 +13,7 @@ module;
 
 export module zenoh.runtime.strand;
 
-// A per-subscriber strand (SUBSCRIBER.md): a bounded queue that serializes a single
+// A per-subscriber strand (docs/SUBSCRIBER.md): a bounded queue that serializes a single
 // subscriber's samples. Templated on the value type so it unit-tests in isolation,
 // independent of the proto/Sample types. Two modes:
 //

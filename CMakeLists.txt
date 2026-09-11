@@ -3,7 +3,7 @@ project(zenoh CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# GNU extensions are required for the statement-expression form of ZTRY (PLAN.md D1).
+# GNU extensions are required for the statement-expression form of ZTRY (docs/PLAN.md D1).
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 # Emit compile_commands.json so clang-tidy (scripts/tidy.sh) can replay the exact
@@ -16,7 +16,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # asserts and disabling NDEBUG fast paths). Extra optimization is layered on below.
 
 # Link-time optimization recovers cross-module inlining for the message-layer
-# encode/decode bodies that live in .cpp implementation units (RESTRUCTURE.md A2).
+# encode/decode bodies that live in .cpp implementation units (docs/RESTRUCTURE.md A2).
 # Enabled for optimized configs; left off for Debug/sanitizer/fuzz builds.
 include(CheckIPOSupported)
 check_ipo_supported(RESULT ZENOH_IPO_OK OUTPUT ZENOH_IPO_MSG)
@@ -117,7 +117,7 @@ target_include_directories(zenoh-proto PUBLIC include)
 target_compile_features(zenoh-proto PUBLIC cxx_std_23)
 
 # The user-facing runtime: a vertically-integrated client (TCP transport + session)
-# built on the pure `zenoh-proto` codec (PLAN.md D8). This layer owns OS I/O, so it
+# built on the pure `zenoh-proto` codec (docs/PLAN.md D8). This layer owns OS I/O, so it
 # is kept separate from the I/O-free codec library.
 add_library(zenoh STATIC)
 target_sources(zenoh

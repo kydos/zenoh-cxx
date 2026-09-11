@@ -5,7 +5,7 @@ their encode/decode, with no I/O, transport, or runtime dependencies. It is buil
 entirely from C++23 named modules and is byte-for-byte compatible with the Rust
 reference (`../zenoh-nostd`), verified by differential tests.
 
-See `PLAN.md` for the design rationale and decision log.
+See `docs/PLAN.md` for the design rationale and decision log.
 
 ## Module map
 

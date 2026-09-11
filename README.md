@@ -383,6 +383,7 @@ reference option is rejected.
 | [`docs/RUNTIME.md`](docs/RUNTIME.md) | The client `Session`: handshake, TCP framing and batch handling, `put` vs `try_put` commit semantics, declared publishers, subscriber strands, the Evaluation abstraction (`Computation`/`Evaluator`), interop runs against `zenohd`. |
 | [`docs/BROKER.md`](docs/BROKER.md) | `zenohb`: routing semantics, the two-tier strand concurrency model, the `DestinationId` wire extension, congestion control, performance notes, documented v1 gaps. |
 | [`docs/CLIQUE.md`](docs/CLIQUE.md) | Broker-to-broker federation: the split-horizon invariant, gossip membership, aggregated declarations, partition detection, peer trust. |
+| [`docs/EVAL-CXX.md`](docs/EVAL-CXX.md) | The Evaluation (`Computation`/`Evaluator`) contract: semantics, the reserved namespace and its isolation guarantee, what is deliberately not guaranteed. [`docs/EVAL.md`](docs/EVAL.md) is the original Rust-flavoured request it came from. |
 | [`docs/STYLE.md`](docs/STYLE.md) | The short form of the coding conventions. |
 | [`CLAUDE.md`](CLAUDE.md) | Repository guide: layout, build/test workflow, conventions, toolchain constraints. |
-| [`PLAN.md`](PLAN.md) / [`RESTRUCTURE.md`](RESTRUCTURE.md) | Architectural decisions (D1–D8) and the module folder layout, with rationale. |
+| [`docs/PLAN.md`](docs/PLAN.md) / [`docs/RESTRUCTURE.md`](docs/RESTRUCTURE.md) | Architectural decisions (D1–D8) and the module folder layout, with rationale. |

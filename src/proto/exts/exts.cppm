@@ -15,7 +15,7 @@ import zenoh.codec;
 import zenoh.proto.fields;
 
 // Structured (ZStruct) extension bodies. Dependency direction is exts -> fields,
-// never the reverse (PLAN.md §5.7). `body_len`/`operator==` are inline here; the
+// never the reverse (docs/PLAN.md §5.7). `body_len`/`operator==` are inline here; the
 // `encode_body`/`decode_body` bodies live in exts.cpp.
 export namespace zenoh {
 

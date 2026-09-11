@@ -2,7 +2,7 @@
 
 The `zenoh` library is the user-facing runtime, layered on the I/O-free `zenoh.proto`
 codec. Its first slice is a **client** `Session`: a TCP transport to a Zenoh router
-plus `put` / `try_put`. It follows the vertically-integrated design (PLAN.md D8) — the
+plus `put` / `try_put`. It follows the vertically-integrated design (docs/PLAN.md D8) — the
 session owns the socket, the protocol state, and the encode buffers, and drives
 `encode → send` directly, with no sans-IO state machine in between.
 

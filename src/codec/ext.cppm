@@ -17,7 +17,7 @@ import zenoh.varint;
 import zenoh.codec;
 
 // Minimal helpers for the protocol's optional fields ("extensions"). NOT a
-// framework (PLAN.md D4): these just read/write the single extension-header byte
+// framework (docs/PLAN.md D4): these just read/write the single extension-header byte
 // and body for the three wire encodings. Kept inline (hot path).
 export namespace zenoh {
 

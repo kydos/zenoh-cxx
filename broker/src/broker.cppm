@@ -25,7 +25,7 @@ export import zenoh.broker.tables; // Tables is a public member (tests introspec
 // a handful of ordinary standard headers (`<string>` alone is enough), triggering a
 // clang/libc++ "cannot add 'abi_tag' attribute in a redeclaration" error -- the same
 // class of named-modules/libc++ fragility this project's docs already flag
-// elsewhere (PLAN.md's clang+libc++/gcc+libstdc++ toolchain notes), just via a
+// elsewhere (docs/PLAN.md's clang+libc++/gcc+libstdc++ toolchain notes), just via a
 // different trigger (confirmed empirically: the identical headers compile cleanly
 // outside of a module, and `zenoh.broker.tables`, whose GMF only needs
 // `<asio/strand.hpp>`/`<asio/any_io_executor.hpp>`, does not exhibit it). The fix is

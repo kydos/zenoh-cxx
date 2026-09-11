@@ -92,7 +92,7 @@ which `asio::strand` a given operation runs on — not from locking:
   for a Push, its outbound bytes already composed into a refcounted `SharedBuf`;
   never a borrowed view) on the Face's own strand *before* `asio::post`ing it to
   `Tables::strand()` — required because `zenoh.proto` messages are borrow-only views
-  into the receive buffer (PLAN.md D2), and that buffer is reused by the next read
+  into the receive buffer (docs/PLAN.md D2), and that buffer is reused by the next read
   before a posted cross-strand handler runs. Delivery back down to a target face is
   symmetric: `asio::post(target face's strand, ...)`. Both directions are **batched
   per inbound frame**: every consecutive Push in one frame travels up as a single

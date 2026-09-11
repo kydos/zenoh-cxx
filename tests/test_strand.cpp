@@ -1,4 +1,4 @@
-// Unit tests for the per-subscriber Strand (SUBSCRIBER.md): bounded ordered FIFO and
+// Unit tests for the per-subscriber Strand (docs/SUBSCRIBER.md): bounded ordered FIFO and
 // the last-value conflation discipline (overwrite most-recent + re-tail), exercised on
 // a plain value type so the structure is tested independently of Sample/proto.
 import zenoh.runtime.strand;

@@ -10,7 +10,7 @@ import zenoh.util;
 
 // The byte cursors the codec reads from and writes to. The codec operates on these
 // two concrete types (not a template) because the protocol decodes a *contiguous*
-// reassembled frame (PLAN.md D3); the `Readable`/`Writable` concepts remain as a
+// reassembled frame (docs/PLAN.md D3); the `Readable`/`Writable` concepts remain as a
 // documented contract the concrete types satisfy.
 export namespace zenoh {
 

@@ -4,7 +4,7 @@
 //
 // Relies on the GNU statement-expression extension (`({ ... })`), which clang and
 // gcc both support under -std=gnu++23. This is a deliberate, documented dependency
-// (see PLAN.md D1): it lets the codec read top-to-bottom without nesting.
+// (see docs/PLAN.md D1): it lets the codec read top-to-bottom without nesting.
 //
 //   auto value = ZTRY(decode_something(reader));   // binds the success value
 //   ZTRY(write_byte(writer, b));                    // discards (expected<void>)

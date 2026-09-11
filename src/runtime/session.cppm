@@ -19,7 +19,7 @@ import zenoh.proto;
 import zenoh.runtime.tcp;
 export import zenoh.runtime.strand; // StrandMode is part of the subscriber/queryable API
 
-// The user-facing API (PLAN.md D8): a vertically-integrated client `Session` that
+// The user-facing API (docs/PLAN.md D8): a vertically-integrated client `Session` that
 // opens a TCP transport to a Zenoh router, publishes data (put/batch), and receives
 // it (declare_subscriber + the run()/run_once() pump). It owns the link, the protocol
 // state (zid, frame SN, keyexpr resmap), and the encode/decode buffers, and drives
@@ -63,7 +63,7 @@ enum class SampleKind : std::uint8_t { put, del };
 
 /// A received sample: an owned snapshot of one `Push(Put|Del)`. The bytes are copied
 /// out of the session receive buffer at delivery time (the decoded proto messages are
-/// borrow-only views — PLAN.md D2), so a `Sample` is valid independently of the
+/// borrow-only views — docs/PLAN.md D2), so a `Sample` is valid independently of the
 /// session and outlives the next `recv`/`run`. Value type (copyable, movable).
 class Sample {
   public:

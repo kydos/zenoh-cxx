@@ -45,7 +45,7 @@ auto usage(const char* argv0) -> void {
 auto serialize_f64(double value) -> std::array<std::byte, sizeof(double)> {
     static_assert(sizeof(double) == 8, "f64 wire format assumes an 8-byte double");
     std::array<std::byte, sizeof(double)> out{};
-    std::memcpy(out.data(), &value, sizeof(double)); // host is little-endian (PLAN.md D7)
+    std::memcpy(out.data(), &value, sizeof(double)); // host is little-endian (docs/PLAN.md D7)
     return out;
 }
 

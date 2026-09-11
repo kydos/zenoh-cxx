@@ -1,5 +1,13 @@
 # Zenoh Evaluator / Computation API
 
+> **This is the original feature request, written against the Zenoh Rust API.** It
+> describes mechanics that do not exist in this repository (async builders, `ZBytes`,
+> a `zenoh::evaluation` module). Kept as the statement of intent it was.
+>
+> For what zenoh-cxx actually implements, and the C++ contract that is normative here,
+> see [`EVAL-CXX.md`](EVAL-CXX.md); [`RUNTIME.md`](RUNTIME.md)'s "Evaluation" section
+> is the narrative introduction.
+
 ## 1. Objective
 
 Introduce a new **Evaluator / Computation** abstraction in the Zenoh Rust API.

@@ -3,8 +3,8 @@
 import zenoh;
 
 auto main() -> int {
-    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447"); z) {
-        if (auto sub = z->declare_subscriber("vehicle/speed"); sub) {
+    if (auto z = zenoh::Session::open("tcp/127.0.0.1:7447")) {
+        if (auto sub = z->declare_subscriber("vehicle/speed")) {
             // recv() blocks until the next sample, and ends the loop when the link
             // to the broker goes away.
             while (auto sample = sub->recv()) {
